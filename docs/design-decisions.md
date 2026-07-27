@@ -72,6 +72,9 @@ modules rdk ships.
   small repos, but adds a `terraform init` network dependency and supply-chain
   surface. DD-1's determinism goal and the AI-friendly/offline goal lean toward
   (a); repo size leans toward (b). Pick deliberately.
+  **→ Ratified (PR-1):** option (a), vendored — modules are embedded in the rdk
+  binary (`go:embed`) and written into the managed dir by apply. Fully hermetic
+  and offline; module version ≡ rdk version.
 - **Address stability moved *inside* the module.** The DD-1 residual doesn't
   vanish — a module upgrade that renames internal resources still
   destroys/recreates unless the module authors `moved {}` blocks. Convention:
@@ -890,4 +893,5 @@ retrofitting external sets reshuffles nothing.
 | — Outside-files manifest (DD-4 residual) | Resolved by DD-14 (three-way hash comparison; hard errors; clean stale files deleted) — adds philosophy rule 13 |
 | — Bootstrap chicken-and-egg (DD-8 residual) | Resolved by DD-15 (generated per-env bootstrap TF + script; plan/apply role split; self-hosted state) |
 | — External policy sets (new, deferred) | Shaped as DD-16 (vendored, semver-tagged, hash-locked; never fetched at apply); v1 hooks only |
+| — Module distribution (DD-2 residual) | Ratified in PR-1: vendored via `go:embed`; module version ≡ rdk version |
 | All faults #1–#12 now have a decision | #12 traceability solved; broader AI-friendly output remains cross-cutting |
