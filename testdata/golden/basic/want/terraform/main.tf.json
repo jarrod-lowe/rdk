@@ -1,0 +1,9 @@
+{
+  "module": {
+    "assets": {
+      "description": "Static assets",
+      "name": "assets",
+      "source": "./modules/s3-bucket"
+    }
+  }
+}
