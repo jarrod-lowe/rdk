@@ -50,18 +50,30 @@ func Run(root, version string) (Result, error) {
 	// PR-1 plans no outside files; reconcile still runs so stale outside
 	// files from prior applies are handled per DD-14.
 	plannedOutside := map[string][]byte{}
+	var diskErr error
 	plan, err := manifest.Reconcile(prev, plannedOutside, func(p string) ([]byte, bool) {
-		b, err := os.ReadFile(filepath.Join(root, p))
-		if err != nil {
+		b, readErr := os.ReadFile(filepath.Join(root, p))
+		if readErr != nil {
+			// A genuine I/O or permission error must NOT be misread as
+			// "file absent" (rule 6): that could silently drop a tracked
+			// outside file from the manifest. Only true not-exist means absent.
+			if !os.IsNotExist(readErr) && diskErr == nil {
+				diskErr = fmt.Errorf("checking outside file %s: %w", p, readErr)
+			}
 			return nil, false
 		}
 		return b, true
 	})
+	if diskErr != nil {
+		return Result{}, diskErr
+	}
 	if err != nil {
 		return Result{}, err
 	}
 
 	// Wipe and rewrite the managed dir (rule 13: always write, never diff).
+	// The managed dir is wholly rdk-owned; a crash mid-write is self-healing —
+	// the next apply regenerates it from scratch.
 	if err := os.RemoveAll(managed); err != nil {
 		return Result{}, err
 	}

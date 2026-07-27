@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/jarrod-lowe/rdk/internal/manifest"
 )
 
 func setupRepo(t *testing.T) string {
@@ -66,5 +68,34 @@ func TestRunFailsWithoutDefinitions(t *testing.T) {
 	root := t.TempDir()
 	if _, err := Run(root, "test-version"); err == nil {
 		t.Error("want error when rdk/ is missing")
+	}
+}
+
+func TestRunSurfacesUnreadableOutsideFile(t *testing.T) {
+	root := setupRepo(t)
+	// First apply establishes rdk-managed/ and a manifest.
+	if _, err := Run(root, "v"); err != nil {
+		t.Fatal(err)
+	}
+	// Seed a manifest that tracks an outside path, then make that path a
+	// directory so os.ReadFile returns a non-NotExist error. That real error
+	// must surface — not be masked as "absent" (which would silently drop the
+	// tracked entry, violating rule 6).
+	m := manifest.Manifest{
+		RdkVersion:   "v",
+		OutsideFiles: map[string]string{"tracked-dir": manifest.Hash([]byte("x"))},
+	}
+	enc, err := m.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "rdk-managed", "manifest.json"), enc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "tracked-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(root, "v"); err == nil {
+		t.Error("want error when a tracked outside file cannot be read; got nil (masked as absent?)")
 	}
 }
