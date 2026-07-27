@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path"
+	"strings"
 
 	"github.com/jarrod-lowe/rdk/internal/parse"
 )
@@ -49,19 +50,28 @@ func Build(defs []parse.Definition) (Tree, error) {
 }
 
 func vendorModule(kind string, tree Tree) error {
+	return vendorModuleFS(moduleFS, kind, tree)
+}
+
+// vendorModuleFS walks the module source rooted at modules/<kind> in fsys and
+// writes each file into tree under terraform/modules/<kind>/, PRESERVING the
+// file's path relative to the module root (never flattening subdirectories —
+// a flatten would silently collide nested files that share a basename).
+func vendorModuleFS(fsys fs.FS, kind string, tree Tree) error {
 	src := "modules/" + kind
-	return fs.WalkDir(moduleFS, src, func(p string, d fs.DirEntry, err error) error {
+	return fs.WalkDir(fsys, src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return fmt.Errorf("embedded module %q: %w", kind, err)
 		}
 		if d.IsDir() {
 			return nil
 		}
-		content, err := moduleFS.ReadFile(p)
+		content, err := fs.ReadFile(fsys, p)
 		if err != nil {
 			return err
 		}
-		rel := path.Join("terraform/modules", kind, path.Base(p))
+		sub := strings.TrimPrefix(p, src+"/") // path relative to the module root
+		rel := path.Join("terraform/modules", kind, sub)
 		tree[rel] = content
 		return nil
 	})

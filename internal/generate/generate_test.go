@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+	"testing/fstest"
 
 	"github.com/jarrod-lowe/rdk/internal/parse"
 )
@@ -52,6 +53,35 @@ func TestTFJSONContent(t *testing.T) {
 	if assets["name"] != "assets" || assets["description"] != "Static assets" {
 		t.Errorf("inputs not mapped: %v", assets)
 	}
+}
+
+func TestVendorModulePreservesSubdirs(t *testing.T) {
+	fsys := fstest.MapFS{
+		"modules/demo/main.tf":      {Data: []byte("root")},
+		"modules/demo/sub/nested.tf": {Data: []byte("nested")},
+	}
+	tree := Tree{}
+	if err := vendorModuleFS(fsys, "demo", tree); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(tree["terraform/modules/demo/main.tf"]); got != "root" {
+		t.Errorf("root file = %q, want root", got)
+	}
+	nested, ok := tree["terraform/modules/demo/sub/nested.tf"]
+	if !ok {
+		t.Fatalf("nested file flattened or missing; tree keys: %v", keys(tree))
+	}
+	if string(nested) != "nested" {
+		t.Errorf("nested content = %q, want nested", string(nested))
+	}
+}
+
+func keys(tr Tree) []string {
+	var k []string
+	for key := range tr {
+		k = append(k, key)
+	}
+	return k
 }
 
 func TestBuildIsDeterministic(t *testing.T) {
