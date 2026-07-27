@@ -40,8 +40,13 @@ func Load(path string) (m Manifest, found bool, err error) {
 }
 
 // Encode renders the manifest deterministically (struct field order fixed;
-// encoding/json sorts the map keys).
+// encoding/json sorts the map keys). A nil OutsideFiles map is normalized to
+// an empty map so "no outside files" always serializes as {} (never null),
+// keeping the serialization stable regardless of construction path.
 func (m Manifest) Encode() ([]byte, error) {
+	if m.OutsideFiles == nil {
+		m.OutsideFiles = map[string]string{}
+	}
 	return json.MarshalIndent(m, "", "  ")
 }
 

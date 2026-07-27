@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestEncodeEmptyOutsideFilesIsObjectNotNull(t *testing.T) {
+	// A Manifest with a nil OutsideFiles map must still encode as {},
+	// not null, so the serialization of "no outside files" is stable
+	// regardless of how the Manifest was constructed.
+	enc, err := Manifest{RdkVersion: "x"}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(enc), "null") {
+		t.Errorf("nil OutsideFiles encoded with null:\n%s", enc)
+	}
+	if !strings.Contains(string(enc), `"outside_files": {}`) {
+		t.Errorf("want outside_files as {}, got:\n%s", enc)
+	}
+}
+
 // disk simulates the repo working tree outside the managed dir.
 func disk(files map[string]string) func(string) ([]byte, bool) {
 	return func(p string) ([]byte, bool) {
