@@ -84,3 +84,10 @@ func TestExactlyOneConfig(t *testing.T) {
 	_, err := Dir(dir)
 	errContains(t, err, "config")
 }
+
+func TestEmptyRequiredFieldRejected(t *testing.T) {
+	dir := writeDefs(t, map[string]string{"config.yaml": goodConfig,
+		"x.yaml": "kind: s3-bucket\nname: \"\"\ndescription: d\n"})
+	_, err := Dir(dir)
+	errContains(t, err, "x.yaml", "name", "empty")
+}

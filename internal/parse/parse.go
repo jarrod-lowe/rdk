@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/goccy/go-yaml"
 	"github.com/jarrod-lowe/rdk/internal/schema"
@@ -96,8 +97,12 @@ func parseFile(dir, name string) (Definition, error) {
 			}
 		}
 		if v, present := attrs[f.Name]; present && f.Type == schema.StringType {
-			if _, isStr := v.(string); !isStr {
+			s, isStr := v.(string)
+			if !isStr {
 				return Definition{}, fmt.Errorf("%s: field %q must be a string, got %T", name, f.Name, v)
+			}
+			if f.Required && strings.TrimSpace(s) == "" {
+				return Definition{}, fmt.Errorf("%s: required field %q must not be empty", name, f.Name)
 			}
 		}
 	}
