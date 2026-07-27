@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Manifest is persisted as manifest.json inside the managed dir.
@@ -56,11 +58,38 @@ type Plan struct {
 	Deletes []string
 }
 
+// validOutsidePath rejects any path that is absolute or escapes the repo root.
+// Outside-file paths must be clean, repo-relative locations (DD-14); a manifest
+// with "../x" or "/etc/x" must never let apply read/write/delete outside the repo.
+func validOutsidePath(p string) error {
+	if p == "" {
+		return fmt.Errorf("outside-file path is empty")
+	}
+	if filepath.IsAbs(p) {
+		return fmt.Errorf("outside-file path %q is absolute; must be repo-relative", p)
+	}
+	clean := filepath.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("outside-file path %q escapes the repository", p)
+	}
+	return nil
+}
+
 // Reconcile applies the DD-14 decision table. planned maps repo-relative
 // paths to the content rdk wants to write this apply; readDisk reports the
 // current on-disk content of a repo-relative path. Any detected user edit of
 // an rdk-owned file is a hard error — never a silent overwrite or delete.
 func Reconcile(prev Manifest, planned map[string][]byte, readDisk func(string) ([]byte, bool)) (Plan, error) {
+	for p := range planned {
+		if err := validOutsidePath(p); err != nil {
+			return Plan{}, err
+		}
+	}
+	for p := range prev.OutsideFiles {
+		if err := validOutsidePath(p); err != nil {
+			return Plan{}, err
+		}
+	}
 	var plan Plan
 
 	var paths []string

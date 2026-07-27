@@ -102,3 +102,27 @@ func TestStaleAlreadyGoneIsNoop(t *testing.T) {
 		t.Errorf("deletes = %v, want none for already-absent file", plan.Deletes)
 	}
 }
+
+func TestReconcileRejectsEscapingPlannedPath(t *testing.T) {
+	_, err := Reconcile(Manifest{}, map[string][]byte{"../evil": []byte("x")}, disk(nil))
+	if err == nil || !strings.Contains(err.Error(), "escape") {
+		t.Fatalf("want path-escape error, got %v", err)
+	}
+}
+
+func TestReconcileRejectsEscapingManifestPath(t *testing.T) {
+	// The dangerous case: a tracked (stale) path that escapes the repo must
+	// be rejected BEFORE the stale-delete branch could os.Remove it.
+	prev := Manifest{OutsideFiles: map[string]string{"../evil": Hash([]byte("x"))}}
+	_, err := Reconcile(prev, map[string][]byte{}, disk(map[string]string{"../evil": "x"}))
+	if err == nil || !strings.Contains(err.Error(), "escape") {
+		t.Fatalf("want path-escape error, got %v", err)
+	}
+}
+
+func TestReconcileRejectsAbsolutePath(t *testing.T) {
+	_, err := Reconcile(Manifest{}, map[string][]byte{"/etc/passwd": []byte("x")}, disk(nil))
+	if err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("want absolute-path error, got %v", err)
+	}
+}
