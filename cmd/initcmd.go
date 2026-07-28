@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/jarrod-lowe/rdk/internal/initialize"
+	"github.com/jarrod-lowe/rdk/internal/repofs"
 	"github.com/spf13/cobra"
 )
 
@@ -17,7 +18,11 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := initialize.Run(wd); err != nil {
+			store, err := repofs.New(wd)
+			if err != nil {
+				return err
+			}
+			if err := initialize.Run(store, wd); err != nil {
 				return err
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "rdk init: ready — edit rdk/config.yaml, then run 'rdk apply'")
