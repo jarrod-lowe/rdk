@@ -868,6 +868,30 @@ retrofitting external sets reshuffles nothing.
   platform-team preview story ("what would v15 do to repo X?") — the update-PR
   plan output covers consumers; producer-side preview is open.
 
+## DD-17 — rdk targets recent Go (itself and managed projects)
+
+**Decision.** rdk requires a recent Go toolchain and does not support trailing/EOL
+versions. `go.mod`'s `go` directive tracks the current toolchain rather than a low
+floor. This is a *policy*, not just a build detail: keeping the Go version current
+applies both to rdk's own build and — as something rdk actively manages — to the
+Go projects it generates.
+
+**Why.** Recent Go brings security fixes, performance, and language features;
+letting managed repos drift onto EOL toolchains is exactly the invisible, latent
+debt rdk exists to prevent (cf. Improved Defaults, DD-7). Supporting old
+toolchains would constrain rdk's own code and dilute the "keep repos current"
+value proposition. (Prompted by a reviewer suggesting we lower the floor to match
+a stale doc; the fix was to correct the doc, not lower the floor.)
+
+**Residual risk / still open.**
+
+- The advance cadence is unspecified — likely track Go's release cycle (support
+  the current and previous minor, drop older on each release). Decide deliberately.
+- Enforcing recent Go in *managed* projects (a generated toolchain policy/check)
+  is future feature work, not built yet.
+- Contributors/CI on trailing Go fail the build by design; state the minimum in
+  the repo README when one exists.
+
 ---
 
 ### Fault scorecard (see `alternatives.md`)
@@ -894,4 +918,5 @@ retrofitting external sets reshuffles nothing.
 | — Bootstrap chicken-and-egg (DD-8 residual) | Resolved by DD-15 (generated per-env bootstrap TF + script; plan/apply role split; self-hosted state) |
 | — External policy sets (new, deferred) | Shaped as DD-16 (vendored, semver-tagged, hash-locked; never fetched at apply); v1 hooks only |
 | — Module distribution (DD-2 residual) | Ratified in PR-1: vendored via `go:embed`; module version ≡ rdk version |
+| — Recent-Go policy (new) | DD-17: rdk targets recent Go for itself and managed projects; no old-toolchain support |
 | All faults #1–#12 now have a decision | #12 traceability solved; broader AI-friendly output remains cross-cutting |
