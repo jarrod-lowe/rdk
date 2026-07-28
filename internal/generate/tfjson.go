@@ -22,7 +22,21 @@ func tfJSON(defs []parse.Definition) ([]byte, error) {
 		}
 		modules[d.Name] = call
 	}
-	doc := map[string]any{"module": modules}
+	doc := map[string]any{
+		// Provider version pinning lives in the generated stack (root), not in
+		// the reusable modules: the module declares the provider source, the
+		// stack constrains its version. ~> 6.0 tracks the tested AWS provider
+		// major (v6.x) and blocks surprise major bumps.
+		"terraform": map[string]any{
+			"required_providers": map[string]any{
+				"aws": map[string]any{
+					"source":  "hashicorp/aws",
+					"version": "~> 6.0",
+				},
+			},
+		},
+		"module": modules,
+	}
 
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)

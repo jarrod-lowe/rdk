@@ -76,6 +76,26 @@ func TestVendorModulePreservesSubdirs(t *testing.T) {
 	}
 }
 
+func TestTFJSONPinsProviderInStack(t *testing.T) {
+	tree, err := Build(demoDefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(tree["terraform/main.tf.json"], &doc); err != nil {
+		t.Fatal(err)
+	}
+	tf, ok := doc["terraform"].(map[string]any)
+	if !ok {
+		t.Fatalf("no terraform block in stack: %v", doc)
+	}
+	rp, _ := tf["required_providers"].(map[string]any)
+	aws, _ := rp["aws"].(map[string]any)
+	if aws["source"] != "hashicorp/aws" || aws["version"] != "~> 6.0" {
+		t.Errorf("aws provider pin = %v, want source hashicorp/aws version ~> 6.0", aws)
+	}
+}
+
 func keys(tr Tree) []string {
 	var k []string
 	for key := range tr {

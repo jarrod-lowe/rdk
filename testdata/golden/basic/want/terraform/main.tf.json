@@ -5,5 +5,13 @@
       "name": "assets",
       "source": "./modules/s3-bucket"
     }
+  },
+  "terraform": {
+    "required_providers": {
+      "aws": {
+        "source": "hashicorp/aws",
+        "version": "~\u003e 6.0"
+      }
+    }
   }
 }
