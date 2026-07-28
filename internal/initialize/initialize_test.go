@@ -55,3 +55,37 @@ func TestInitDoesNotCommit(t *testing.T) {
 		}
 	}
 }
+
+func TestInitRejectsSymlinkedDefsDir(t *testing.T) {
+	dir := t.TempDir()
+	external := t.TempDir()
+	// rdk/ is a symlink to an external directory.
+	if err := os.Symlink(external, filepath.Join(dir, "rdk")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := Run(dir); err == nil {
+		t.Fatal("want error for a symlinked rdk/ dir, got nil")
+	}
+	if _, err := os.Stat(filepath.Join(external, "config.yaml")); err == nil {
+		t.Error("seed was written through a symlinked defs dir into an external location")
+	}
+}
+
+func TestInitDoesNotWriteThroughSymlinkedConfig(t *testing.T) {
+	dir := t.TempDir()
+	external := t.TempDir()
+	extTarget := filepath.Join(external, "target") // dangling: does not exist yet
+	if err := os.MkdirAll(filepath.Join(dir, "rdk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(extTarget, filepath.Join(dir, "rdk", "config.yaml")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	// Seeding must not follow the symlink and create the external target.
+	if err := Run(dir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, err := os.Stat(extTarget); err == nil {
+		t.Error("seed followed a symlinked config.yaml and wrote outside the repo")
+	}
+}
