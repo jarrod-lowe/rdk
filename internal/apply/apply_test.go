@@ -32,7 +32,7 @@ func setupRepo(t *testing.T) (repofs.Store, string) {
 
 func TestRunMaterializesManagedTree(t *testing.T) {
 	store, root := setupRepo(t)
-	res, err := Run(store, root, "test-version")
+	res, err := Run(store, "test-version")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -53,14 +53,14 @@ func TestRunMaterializesManagedTree(t *testing.T) {
 
 func TestRunReplacesStrayManagedFiles(t *testing.T) {
 	store, root := setupRepo(t)
-	if _, err := Run(store, root, "v"); err != nil {
+	if _, err := Run(store, "v"); err != nil {
 		t.Fatal(err)
 	}
 	stray := filepath.Join(root, "rdk-managed", "stray.txt")
 	if err := os.WriteFile(stray, []byte("junk"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Run(store, root, "v"); err != nil {
+	if _, err := Run(store, "v"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(stray); !os.IsNotExist(err) {
@@ -74,7 +74,7 @@ func TestRunFailsWithoutDefinitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Run(store, root, "v"); err == nil {
+	if _, err := Run(store, "v"); err == nil {
 		t.Error("want error when rdk/ is missing")
 	}
 }

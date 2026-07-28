@@ -3,12 +3,11 @@ package parse
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
+	"path"
 	"strings"
 
 	"github.com/goccy/go-yaml"
+	"github.com/jarrod-lowe/rdk/internal/repofs"
 	"github.com/jarrod-lowe/rdk/internal/schema"
 )
 
@@ -20,27 +19,23 @@ type Definition struct {
 	Attrs map[string]any // all fields except kind, validated against the schema
 }
 
-// Dir loads every *.yaml in dir (sorted by filename), validates each against
-// its kind schema, and enforces cross-file rules (unique names, exactly one
-// config).
-func Dir(dir string) ([]Definition, error) {
-	entries, err := os.ReadDir(dir)
+// Dir loads every *.yaml in dir (read through the store, sorted), validates each
+// against its kind schema, and enforces cross-file rules (unique names, exactly
+// one config).
+func Dir(store repofs.Store, dir string) ([]Definition, error) {
+	names, err := store.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("reading definitions dir %s: %w", dir, err)
 	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && filepath.Ext(e.Name()) == ".yaml" {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
 
 	var defs []Definition
 	seen := map[string]string{} // resource name -> file
 	configs := 0
 	for _, name := range names {
-		def, err := parseFile(dir, name)
+		if !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+		def, err := parseFile(store, dir, name)
 		if err != nil {
 			return nil, err
 		}
@@ -60,8 +55,8 @@ func Dir(dir string) ([]Definition, error) {
 	return defs, nil
 }
 
-func parseFile(dir, name string) (Definition, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, name))
+func parseFile(store repofs.Store, dir, name string) (Definition, error) {
+	raw, err := store.ReadFile(path.Join(dir, name))
 	if err != nil {
 		return Definition{}, fmt.Errorf("%s: %w", name, err)
 	}

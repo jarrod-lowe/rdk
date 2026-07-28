@@ -4,7 +4,6 @@ package apply
 
 import (
 	"fmt"
-	"path/filepath"
 
 	"github.com/jarrod-lowe/rdk/internal/generate"
 	"github.com/jarrod-lowe/rdk/internal/manifest"
@@ -26,10 +25,8 @@ type Result struct {
 
 // Run performs apply against the repo the store is rooted at. Pure generation:
 // definitions in, repo content out — no network, no cloud (rules 1-2).
-func Run(store repofs.Store, root, version string) (Result, error) {
-	// parse still uses plain os here (full path); Task 6 switches it to
-	// parse.Dir(store, DefsDir) and drops root from this signature.
-	defs, err := parse.Dir(filepath.Join(root, DefsDir))
+func Run(store repofs.Store, version string) (Result, error) {
+	defs, err := parse.Dir(store, DefsDir)
 	if err != nil {
 		return Result{}, err
 	}

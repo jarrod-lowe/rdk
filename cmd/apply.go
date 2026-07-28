@@ -23,7 +23,7 @@ func newApplyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			res, err := apply.Run(store, wd, version.Version)
+			res, err := apply.Run(store, version.Version)
 			if err != nil {
 				return err
 			}

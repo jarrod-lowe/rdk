@@ -69,7 +69,7 @@ func TestGolden(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := apply.Run(store, work, "golden"); err != nil {
+			if _, err := apply.Run(store, "golden"); err != nil {
 				t.Fatalf("apply: %v", err)
 			}
 			got := readTree(t, filepath.Join(work, apply.ManagedDir))
@@ -97,7 +97,7 @@ func TestGolden(t *testing.T) {
 			}
 
 			// Idempotence (DD-1): applying again must change nothing.
-			if _, err := apply.Run(store, work, "golden"); err != nil {
+			if _, err := apply.Run(store, "golden"); err != nil {
 				t.Fatalf("second apply: %v", err)
 			}
 			again := readTree(t, filepath.Join(work, apply.ManagedDir))
@@ -126,7 +126,7 @@ func TestTerraformValidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := apply.Run(store, work, "golden"); err != nil {
+	if _, err := apply.Run(store, "golden"); err != nil {
 		t.Fatal(err)
 	}
 	tfDir := filepath.Join(work, apply.ManagedDir, "terraform")
