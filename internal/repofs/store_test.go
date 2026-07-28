@@ -125,4 +125,12 @@ func TestSecurityRejectsEscapes(t *testing.T) {
 	if _, err := s.ReadFile("link/victim"); err == nil {
 		t.Error("read through escaping symlink should fail")
 	}
+	// Seeding through the escaping symlink must not create a file outside the
+	// repo (the scenario the removed initialize symlink tests covered).
+	if err := s.Seed("link/evil.yaml", []byte("x")); err == nil {
+		t.Error("seed through escaping symlink should fail")
+	}
+	if _, err := os.Stat(filepath.Join(external, "evil.yaml")); err == nil {
+		t.Error("seed wrote through an escaping symlink into an external dir")
+	}
 }
