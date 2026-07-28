@@ -112,7 +112,7 @@ func TestTerraformValidate(t *testing.T) {
 		tf, err = exec.LookPath("terraform")
 	}
 	if err != nil {
-		t.Skip("terraform/tofu not installed")
+		t.Fatal("neither tofu nor terraform is installed; rdk's suite validates generated Terraform and must not pass without it — install OpenTofu or Terraform")
 	}
 	work := t.TempDir()
 	os.MkdirAll(filepath.Join(work, "rdk"), 0o755)
