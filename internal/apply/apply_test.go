@@ -108,6 +108,34 @@ func TestRunDoesNotDeleteThroughSymlinkedDir(t *testing.T) {
 	}
 }
 
+func TestRunRecoversInterruptedSwap(t *testing.T) {
+	root := setupRepo(t)
+	if _, err := Run(root, "v"); err != nil {
+		t.Fatal(err)
+	}
+	managed := filepath.Join(root, "rdk-managed")
+	staging := filepath.Join(root, "rdk-managed.staging")
+	// Simulate a crash mid-swap: the old managed dir was removed and the fully
+	// staged replacement is present but not yet renamed into place.
+	if err := os.Rename(managed, staging); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(managed); !os.IsNotExist(err) {
+		t.Fatalf("precondition: managed should be absent")
+	}
+	// The next apply must recover (finish the swap) and succeed, leaving a
+	// valid managed dir with its manifest.
+	if _, err := Run(root, "v"); err != nil {
+		t.Fatalf("recovery apply: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(managed, "manifest.json")); err != nil {
+		t.Errorf("managed dir/manifest not restored after recovery: %v", err)
+	}
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Errorf("staging dir should be gone after a successful apply")
+	}
+}
+
 func TestRunSurfacesUnreadableOutsideFile(t *testing.T) {
 	root := setupRepo(t)
 	// First apply establishes rdk-managed/ and a manifest.

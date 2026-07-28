@@ -29,8 +29,10 @@ type Result struct {
 }
 
 // Run performs apply for the repo rooted at root. It is pure generation:
-// (definitions, version, previous manifest) in, repo content out — no
-// network, no cloud (rules 1-2).
+// (definitions, version, previous manifest) in, repo content out — no network,
+// no cloud (rules 1-2). The new managed tree is staged and swapped in
+// atomically, so a failure never destroys the previous managed dir or its
+// ownership manifest (crash-safety).
 func Run(root, version string) (Result, error) {
 	defs, err := parse.Dir(filepath.Join(root, DefsDir))
 	if err != nil {
@@ -43,13 +45,22 @@ func Run(root, version string) (Result, error) {
 	}
 
 	managed := filepath.Join(root, ManagedDir)
+	staging := filepath.Join(root, ManagedDir+".staging")
+
+	// Complete a swap interrupted by an earlier crash before doing anything:
+	// if the managed dir is gone but a fully-staged replacement remains, the
+	// crash landed between the old-dir removal and the rename — finish it.
+	if err := recoverInterruptedSwap(managed, staging); err != nil {
+		return Result{}, err
+	}
+
 	prev, _, err := manifest.Load(filepath.Join(managed, "manifest.json"))
 	if err != nil {
 		return Result{}, err
 	}
 
-	// PR-1 plans no outside files; reconcile still runs so stale outside
-	// files from prior applies are handled per DD-14.
+	// PR-1 plans no outside files; reconcile still runs so stale outside files
+	// from prior applies are handled per DD-14.
 	plannedOutside := map[string][]byte{}
 	var diskErr error
 	plan, err := manifest.Reconcile(prev, plannedOutside, func(p string) ([]byte, bool) {
@@ -62,9 +73,6 @@ func Run(root, version string) (Result, error) {
 		}
 		b, readErr := os.ReadFile(sp)
 		if readErr != nil {
-			// A genuine I/O or permission error must NOT be misread as
-			// "file absent" (rule 6): that could silently drop a tracked
-			// outside file from the manifest. Only true not-exist means absent.
 			if !os.IsNotExist(readErr) && diskErr == nil {
 				diskErr = fmt.Errorf("checking outside file %s: %w", p, readErr)
 			}
@@ -79,10 +87,18 @@ func Run(root, version string) (Result, error) {
 		return Result{}, err
 	}
 
-	// Wipe and rewrite the managed dir (rule 13: always write, never diff).
-	// The managed dir is wholly rdk-owned; a crash mid-write is self-healing —
-	// the next apply regenerates it from scratch.
-	if err := os.RemoveAll(managed); err != nil {
+	// Compute the new manifest's outside-file ownership up front so the staged
+	// manifest is complete before any destructive step.
+	outsideHashes := map[string]string{}
+	for _, p := range plan.Writes {
+		outsideHashes[p] = manifest.Hash(plannedOutside[p])
+	}
+
+	// Stage the entire new managed tree — including the manifest — in a temp
+	// dir. A failure here leaves the previous managed dir and its ownership
+	// manifest fully intact: the old state is never destroyed until a complete
+	// replacement is ready (rule 13 + crash-safety).
+	if err := os.RemoveAll(staging); err != nil {
 		return Result{}, err
 	}
 	var paths []string
@@ -91,7 +107,7 @@ func Run(root, version string) (Result, error) {
 	}
 	sort.Strings(paths)
 	for _, p := range paths {
-		dst := filepath.Join(managed, p)
+		dst := filepath.Join(staging, p)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return Result{}, err
 		}
@@ -99,9 +115,18 @@ func Run(root, version string) (Result, error) {
 			return Result{}, err
 		}
 	}
+	m := manifest.Manifest{RdkVersion: version, OutsideFiles: outsideHashes}
+	encoded, err := m.Encode()
+	if err != nil {
+		return Result{}, err
+	}
+	if err := os.WriteFile(filepath.Join(staging, "manifest.json"), encoded, 0o644); err != nil {
+		return Result{}, err
+	}
 
-	// Execute the outside-file plan.
-	outsideHashes := map[string]string{}
+	// Outside-file mutations (external to the managed dir). Done before the swap
+	// so a failure leaves the old managed dir intact and the apply retryable.
+	// Paths resolved symlink-safely (securejoin) so they cannot escape the repo.
 	for _, p := range plan.Writes {
 		dst, joinErr := securejoin.SecureJoin(root, p)
 		if joinErr != nil {
@@ -113,7 +138,6 @@ func Run(root, version string) (Result, error) {
 		if err := os.WriteFile(dst, plannedOutside[p], 0o644); err != nil {
 			return Result{}, err
 		}
-		outsideHashes[p] = manifest.Hash(plannedOutside[p])
 	}
 	for _, p := range plan.Deletes {
 		dst, joinErr := securejoin.SecureJoin(root, p)
@@ -125,12 +149,12 @@ func Run(root, version string) (Result, error) {
 		}
 	}
 
-	m := manifest.Manifest{RdkVersion: version, OutsideFiles: outsideHashes}
-	encoded, err := m.Encode()
-	if err != nil {
+	// Atomically swap staging into place. The RemoveAll+Rename window is closed
+	// on the next run by recoverInterruptedSwap.
+	if err := os.RemoveAll(managed); err != nil {
 		return Result{}, err
 	}
-	if err := os.WriteFile(filepath.Join(managed, "manifest.json"), encoded, 0o644); err != nil {
+	if err := os.Rename(staging, managed); err != nil {
 		return Result{}, err
 	}
 
@@ -139,6 +163,23 @@ func Run(root, version string) (Result, error) {
 		OutsideWrites:  plan.Writes,
 		OutsideDeletes: plan.Deletes,
 	}, nil
+}
+
+// recoverInterruptedSwap completes a swap left half-done by a crash: if the
+// managed dir is absent but a fully-staged replacement exists, the crash landed
+// between removing the old dir and renaming the new one, so finish the rename.
+// (Staging is only fully populated just before the swap, so this is safe.)
+func recoverInterruptedSwap(managed, staging string) error {
+	if _, err := os.Stat(managed); !os.IsNotExist(err) {
+		return nil // managed present (or a stat error) — nothing to recover
+	}
+	if _, err := os.Stat(staging); err != nil {
+		return nil // no staged replacement — nothing to recover
+	}
+	if err := os.Rename(staging, managed); err != nil {
+		return fmt.Errorf("completing interrupted apply swap: %w", err)
+	}
+	return nil
 }
 
 // Summary renders the loud one-line apply report.
