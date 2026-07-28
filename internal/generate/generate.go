@@ -45,7 +45,9 @@ func Build(defs []parse.Definition) (*repofs.FileSet, error) {
 }
 
 // vendorModule copies the embedded module source for kind into the set under
-// terraform/modules/<kind>/, preserving subdirectories.
+// terraform/modules/<kind>/, preserving subdirectories (TrimPrefix, not Base).
+// Subdir preservation is currently only exercised by flat modules (s3-bucket);
+// when a module first ships nested files, add a golden fixture covering them.
 func vendorModule(kind string, set *repofs.FileSet) error {
 	src := "modules/" + kind
 	return fs.WalkDir(moduleFS, src, func(p string, d fs.DirEntry, err error) error {
