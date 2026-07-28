@@ -65,6 +65,13 @@ func (m *Mem) ReadDir(dir string) ([]string, error) {
 		}
 		seen[rest] = true
 	}
+	// A directory with no entries doesn't exist in the in-memory model (dirs
+	// are implied by file paths). Match the real Store, which errors on a
+	// missing directory rather than returning an empty listing — otherwise a
+	// component test could pass on Mem but fail against os.Root.
+	if len(seen) == 0 {
+		return nil, fs.ErrNotExist
+	}
 	names := make([]string, 0, len(seen))
 	for n := range seen {
 		names = append(names, n)

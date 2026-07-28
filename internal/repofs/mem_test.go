@@ -1,6 +1,19 @@
 package repofs
 
-import "testing"
+import (
+	"errors"
+	"io/fs"
+	"testing"
+)
+
+func TestMemReadDirMissingErrors(t *testing.T) {
+	m := NewMem()
+	// A directory with no entries must error like the real Store, not return
+	// an empty listing (fake-vs-real fidelity).
+	if _, err := m.ReadDir("rdk"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("ReadDir(missing) err = %v, want fs.ErrNotExist", err)
+	}
+}
 
 func TestMemMaterializeAndReplace(t *testing.T) {
 	m := NewMem()
