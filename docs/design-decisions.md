@@ -892,6 +892,35 @@ a stale doc; the fix was to correct the doc, not lower the floor.)
 - Contributors/CI on trailing Go fail the build by design; state the minimum in
   the repo README when one exists.
 
+## DD-18 — All file handling goes through an injected `internal/repofs`
+
+**Decision.** Components never touch the filesystem directly. A single injected
+library, `internal/repofs`, performs the file *actions* rdk needs (materialize a
+managed tree atomically, seed a user file once, read within the repo), rooted at
+the repo via `os.Root` so confinement and symlink-safety are structural — not
+per-call-site guards. Components build an in-memory `FileSet` (`Bytes`, `JSON`)
+describing desired output; `repofs` owns directory creation, permissions,
+deterministic serialization (DD-1), the atomic staging/swap, and security. An
+in-memory fake makes component tests filesystem-free.
+
+**Why.** The escape/symlink/atomicity fixes had accreted at scattered call sites
+(securejoin, `O_EXCL`, lexical path checks, hand-rolled swap). Centralizing makes
+insecure file access unrepresentable in component code, deletes the
+`filepath-securejoin` dependency, and unifies the tf.json/manifest serialization
+that DD-1 depends on. Enabled by `os.Root` (DD-17's recent-Go policy paying off).
+
+**Scope.** Folded into PR-1 before merge. Only the actions PR-1 uses are built
+(`Materialize`, `Seed`, `ReadFile`, `ReadDir`; `FileSet.Bytes`/`JSON`);
+`WriteOutside`/`RemoveOutside`, `YAML`, and template entries are deferred to when
+a component needs them (YAGNI).
+
+**Full design:** `docs/superpowers/specs/2026-07-29-repofs-design.md`.
+
+**Residual risk / still open.** Golden churn if `repofs.JSON` doesn't byte-match
+the current encoders (manifest `MarshalIndent` vs tf.json `Encoder` trailing
+newline) — verify, don't blind-update. Error quality drops slightly where lexical
+path validation is removed (acceptable; rdk-generated paths).
+
 ---
 
 ### Fault scorecard (see `alternatives.md`)
@@ -919,4 +948,5 @@ a stale doc; the fix was to correct the doc, not lower the floor.)
 | — External policy sets (new, deferred) | Shaped as DD-16 (vendored, semver-tagged, hash-locked; never fetched at apply); v1 hooks only |
 | — Module distribution (DD-2 residual) | Ratified in PR-1: vendored via `go:embed`; module version ≡ rdk version |
 | — Recent-Go policy (new) | DD-17: rdk targets recent Go for itself and managed projects; no old-toolchain support |
+| — Injected file handling (new) | DD-18: all FS access via `internal/repofs` (os.Root-rooted, injected, faked); centralizes security/determinism/atomicity |
 | All faults #1–#12 now have a decision | #12 traceability solved; broader AI-friendly output remains cross-cutting |
