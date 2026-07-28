@@ -3,6 +3,7 @@ module github.com/jarrod-lowe/rdk
 go 1.26.1
 
 require (
+	github.com/cyphar/filepath-securejoin v0.7.0
 	github.com/goccy/go-yaml v1.19.2
 	github.com/google/go-cmp v0.7.0
 	github.com/spf13/cobra v1.10.2

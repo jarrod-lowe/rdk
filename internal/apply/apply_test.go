@@ -71,6 +71,43 @@ func TestRunFailsWithoutDefinitions(t *testing.T) {
 	}
 }
 
+func TestRunDoesNotDeleteThroughSymlinkedDir(t *testing.T) {
+	root := setupRepo(t)
+	if _, err := Run(root, "v"); err != nil {
+		t.Fatal(err)
+	}
+	// A victim file in an external directory, outside the repo.
+	external := t.TempDir()
+	victim := filepath.Join(external, "victim")
+	if err := os.WriteFile(victim, []byte("precious"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A symlink INSIDE the repo pointing at the external dir.
+	if err := os.Symlink(external, filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	// A manifest that tracks link/victim (lexically clean — passes the ..
+	// /absolute guard) with a hash matching the victim's content. Without
+	// symlink-safe resolution the stale-delete branch would os.Remove the
+	// external victim.
+	m := manifest.Manifest{RdkVersion: "v", OutsideFiles: map[string]string{
+		"link/victim": manifest.Hash([]byte("precious"))}}
+	enc, err := m.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "rdk-managed", "manifest.json"), enc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Apply may error or no-op; the ONLY invariant is the external file survives.
+	if _, err := Run(root, "v"); err != nil {
+		t.Logf("apply returned (acceptable): %v", err)
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("external victim was touched through a symlinked dir: %v", statErr)
+	}
+}
+
 func TestRunSurfacesUnreadableOutsideFile(t *testing.T) {
 	root := setupRepo(t)
 	// First apply establishes rdk-managed/ and a manifest.
