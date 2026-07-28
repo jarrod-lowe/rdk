@@ -1,16 +1,11 @@
 package generate
 
-import (
-	"bytes"
-	"encoding/json"
+import "github.com/jarrod-lowe/rdk/internal/parse"
 
-	"github.com/jarrod-lowe/rdk/internal/parse"
-)
-
-// tfJSON renders the root Terraform document: one module block per resource
-// definition, inputs mapped mechanically from validated attrs (DD-2).
-// encoding/json sorts map keys, giving deterministic output.
-func tfJSON(defs []parse.Definition) ([]byte, error) {
+// tfDoc builds the root Terraform document as a data structure: one module
+// block per resource definition, plus the stack-level provider pin. Serialized
+// to deterministic JSON by repofs (DD-1); this function no longer encodes.
+func tfDoc(defs []parse.Definition) map[string]any {
 	modules := map[string]any{}
 	for _, d := range defs {
 		if d.Kind == "config" {
@@ -22,11 +17,7 @@ func tfJSON(defs []parse.Definition) ([]byte, error) {
 		}
 		modules[d.Name] = call
 	}
-	doc := map[string]any{
-		// Provider version pinning lives in the generated stack (root), not in
-		// the reusable modules: the module declares the provider source, the
-		// stack constrains its version. ~> 6.0 tracks the tested AWS provider
-		// major (v6.x) and blocks surprise major bumps.
+	return map[string]any{
 		"terraform": map[string]any{
 			"required_providers": map[string]any{
 				"aws": map[string]any{
@@ -37,12 +28,4 @@ func tfJSON(defs []parse.Definition) ([]byte, error) {
 		},
 		"module": modules,
 	}
-
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(doc); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }

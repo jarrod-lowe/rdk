@@ -34,15 +34,9 @@ func Run(store repofs.Store, root, version string) (Result, error) {
 		return Result{}, err
 	}
 
-	tree, err := generate.Build(defs)
+	set, err := generate.Build(defs)
 	if err != nil {
 		return Result{}, err
-	}
-
-	// Adapter (removed in Task 5 when generate returns a FileSet directly).
-	set := repofs.NewFileSet()
-	for p, data := range tree {
-		set.Bytes(p, data)
 	}
 
 	// Fresh manifest: PR-1 has no outside files, so outside_files is always the
