@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/jarrod-lowe/rdk/internal/apply"
+	"github.com/jarrod-lowe/rdk/internal/repofs"
 	"github.com/jarrod-lowe/rdk/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -18,7 +19,11 @@ func newApplyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			res, err := apply.Run(wd, version.Version)
+			store, err := repofs.New(wd)
+			if err != nil {
+				return err
+			}
+			res, err := apply.Run(store, wd, version.Version)
 			if err != nil {
 				return err
 			}

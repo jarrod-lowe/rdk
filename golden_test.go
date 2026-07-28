@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/jarrod-lowe/rdk/internal/apply"
+	"github.com/jarrod-lowe/rdk/internal/repofs"
 )
 
 var update = flag.Bool("update", false, "rewrite golden 'want' trees from current output")
@@ -64,7 +65,11 @@ func TestGolden(t *testing.T) {
 
 			// Golden output must not depend on the dev's build, so the
 			// version is fixed.
-			if _, err := apply.Run(work, "golden"); err != nil {
+			store, err := repofs.New(work)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := apply.Run(store, work, "golden"); err != nil {
 				t.Fatalf("apply: %v", err)
 			}
 			got := readTree(t, filepath.Join(work, apply.ManagedDir))
@@ -92,7 +97,7 @@ func TestGolden(t *testing.T) {
 			}
 
 			// Idempotence (DD-1): applying again must change nothing.
-			if _, err := apply.Run(work, "golden"); err != nil {
+			if _, err := apply.Run(store, work, "golden"); err != nil {
 				t.Fatalf("second apply: %v", err)
 			}
 			again := readTree(t, filepath.Join(work, apply.ManagedDir))
@@ -117,7 +122,11 @@ func TestTerraformValidate(t *testing.T) {
 	work := t.TempDir()
 	os.MkdirAll(filepath.Join(work, "rdk"), 0o755)
 	copyDir(t, "testdata/golden/basic/rdk", filepath.Join(work, "rdk"))
-	if _, err := apply.Run(work, "golden"); err != nil {
+	store, err := repofs.New(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := apply.Run(store, work, "golden"); err != nil {
 		t.Fatal(err)
 	}
 	tfDir := filepath.Join(work, apply.ManagedDir, "terraform")
