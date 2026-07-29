@@ -3,6 +3,7 @@
 package initialize
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,11 +12,11 @@ import (
 	"github.com/jarrod-lowe/rdk/internal/repofs"
 )
 
-const seedConfig = `# rdk global configuration.
-# Docs: run 'rdk apply' after editing anything in this directory.
-kind: config
-name: my-project # TODO: set your project name
-`
+// seedConfig is the user-owned config seeded on first init. It lives on disk
+// under seed/ so it reads as the YAML it is: editable, lintable, diffable.
+
+//go:embed seed/config.yaml
+var seedConfig string
 
 // Run initialises dir as an rdk repository. The store must be rooted at dir.
 func Run(store repofs.Store, dir string) error {

@@ -1,0 +1,4 @@
+# rdk global configuration.
+# Docs: run 'rdk apply' after editing anything in this directory.
+kind: config
+name: my-project # TODO: set your project name
