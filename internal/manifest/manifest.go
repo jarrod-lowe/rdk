@@ -9,9 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 )
 
 // Manifest is persisted as manifest.json inside the managed dir.
@@ -41,38 +39,10 @@ func Load(path string) (m Manifest, found bool, err error) {
 	return m, true, nil
 }
 
-// Encode renders the manifest deterministically (struct field order fixed;
-// encoding/json sorts the map keys). A nil OutsideFiles map is normalized to
-// an empty map so "no outside files" always serializes as {} (never null),
-// keeping the serialization stable regardless of construction path.
-func (m Manifest) Encode() ([]byte, error) {
-	if m.OutsideFiles == nil {
-		m.OutsideFiles = map[string]string{}
-	}
-	return json.MarshalIndent(m, "", "  ")
-}
-
 // Plan is the outcome of Reconcile: what to write and what to delete.
 type Plan struct {
 	Writes  []string
 	Deletes []string
-}
-
-// validOutsidePath rejects any path that is absolute or escapes the repo root.
-// Outside-file paths must be clean, repo-relative locations (DD-14); a manifest
-// with "../x" or "/etc/x" must never let apply read/write/delete outside the repo.
-func validOutsidePath(p string) error {
-	if p == "" {
-		return fmt.Errorf("outside-file path is empty")
-	}
-	if filepath.IsAbs(p) {
-		return fmt.Errorf("outside-file path %q is absolute; must be repo-relative", p)
-	}
-	clean := filepath.Clean(p)
-	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("outside-file path %q escapes the repository", p)
-	}
-	return nil
 }
 
 // Reconcile applies the DD-14 decision table. planned maps repo-relative
@@ -80,16 +50,6 @@ func validOutsidePath(p string) error {
 // current on-disk content of a repo-relative path. Any detected user edit of
 // an rdk-owned file is a hard error — never a silent overwrite or delete.
 func Reconcile(prev Manifest, planned map[string][]byte, readDisk func(string) ([]byte, bool)) (Plan, error) {
-	for p := range planned {
-		if err := validOutsidePath(p); err != nil {
-			return Plan{}, err
-		}
-	}
-	for p := range prev.OutsideFiles {
-		if err := validOutsidePath(p); err != nil {
-			return Plan{}, err
-		}
-	}
 	var plan Plan
 
 	var paths []string

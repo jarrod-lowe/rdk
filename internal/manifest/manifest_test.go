@@ -5,22 +5,6 @@ import (
 	"testing"
 )
 
-func TestEncodeEmptyOutsideFilesIsObjectNotNull(t *testing.T) {
-	// A Manifest with a nil OutsideFiles map must still encode as {},
-	// not null, so the serialization of "no outside files" is stable
-	// regardless of how the Manifest was constructed.
-	enc, err := Manifest{RdkVersion: "x"}.Encode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(enc), "null") {
-		t.Errorf("nil OutsideFiles encoded with null:\n%s", enc)
-	}
-	if !strings.Contains(string(enc), `"outside_files": {}`) {
-		t.Errorf("want outside_files as {}, got:\n%s", enc)
-	}
-}
-
 // disk simulates the repo working tree outside the managed dir.
 func disk(files map[string]string) func(string) ([]byte, bool) {
 	return func(p string) ([]byte, bool) {
@@ -103,26 +87,3 @@ func TestStaleAlreadyGoneIsNoop(t *testing.T) {
 	}
 }
 
-func TestReconcileRejectsEscapingPlannedPath(t *testing.T) {
-	_, err := Reconcile(Manifest{}, map[string][]byte{"../evil": []byte("x")}, disk(nil))
-	if err == nil || !strings.Contains(err.Error(), "escape") {
-		t.Fatalf("want path-escape error, got %v", err)
-	}
-}
-
-func TestReconcileRejectsEscapingManifestPath(t *testing.T) {
-	// The dangerous case: a tracked (stale) path that escapes the repo must
-	// be rejected BEFORE the stale-delete branch could os.Remove it.
-	prev := Manifest{OutsideFiles: map[string]string{"../evil": Hash([]byte("x"))}}
-	_, err := Reconcile(prev, map[string][]byte{}, disk(map[string]string{"../evil": "x"}))
-	if err == nil || !strings.Contains(err.Error(), "escape") {
-		t.Fatalf("want path-escape error, got %v", err)
-	}
-}
-
-func TestReconcileRejectsAbsolutePath(t *testing.T) {
-	_, err := Reconcile(Manifest{}, map[string][]byte{"/etc/passwd": []byte("x")}, disk(nil))
-	if err == nil || !strings.Contains(err.Error(), "absolute") {
-		t.Fatalf("want absolute-path error, got %v", err)
-	}
-}
