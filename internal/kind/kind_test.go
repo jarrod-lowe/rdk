@@ -79,6 +79,16 @@ func TestValidateNilForRealRegistry(t *testing.T) {
 	}
 }
 
+func TestS3BucketIsAResource(t *testing.T) {
+	k, ok := Lookup("s3-bucket")
+	if !ok {
+		t.Fatal(`Lookup("s3-bucket"): not found`)
+	}
+	if _, ok := k.(Resource); !ok {
+		t.Error("s3-bucket must implement Resource")
+	}
+}
+
 // named is a minimal Kind stub for registry tests.
 type named string
 
