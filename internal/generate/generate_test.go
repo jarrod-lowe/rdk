@@ -26,7 +26,10 @@ func TestBuildFileSet(t *testing.T) {
 }
 
 func TestTFDocPinsProviderAndModules(t *testing.T) {
-	doc := tfDoc(demoDefs())
+	doc, err := tfDoc(demoDefs())
+	if err != nil {
+		t.Fatal(err)
+	}
 	b, _ := json.Marshal(doc)
 	var round map[string]any
 	json.Unmarshal(b, &round)
@@ -38,5 +41,11 @@ func TestTFDocPinsProviderAndModules(t *testing.T) {
 	assets := mods["assets"].(map[string]any)
 	if assets["source"] != "./modules/s3-bucket" || assets["name"] != "assets" {
 		t.Errorf("module call = %v", assets)
+	}
+	if len(mods) != 1 {
+		t.Errorf("want exactly one module block (config produces none), got %d: %v", len(mods), mods)
+	}
+	if _, ok := mods["demo"]; ok {
+		t.Error("config def must not produce a module block")
 	}
 }
