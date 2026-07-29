@@ -6,9 +6,7 @@ package manifest
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 )
 
@@ -22,21 +20,6 @@ type Manifest struct {
 func Hash(content []byte) string {
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:])
-}
-
-// Load reads a manifest; found=false (no error) when the file doesn't exist.
-func Load(path string) (m Manifest, found bool, err error) {
-	raw, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return Manifest{}, false, nil
-	}
-	if err != nil {
-		return Manifest{}, false, err
-	}
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return Manifest{}, false, fmt.Errorf("corrupt manifest %s: %w", path, err)
-	}
-	return m, true, nil
 }
 
 // Plan is the outcome of Reconcile: what to write and what to delete.
