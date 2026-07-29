@@ -31,6 +31,10 @@ func New(d Diagnostic) *Error { return &Error{Diagnostic: d} }
 // guessed a code would fabricate provenance, which is rule 11 backwards. An
 // error that reaches the top unwrapped is genuinely unanticipated, and says so
 // by exiting 2.
+//
+// Wrap is for a cause that is known non-nil — call it inside the caller's
+// `if err != nil`. It does not check, because returning a nil *Error here
+// would produce a non-nil error interface at the call site.
 func Wrap(err error, d Diagnostic) *Error {
 	return &Error{Diagnostic: d, Cause: err}
 }

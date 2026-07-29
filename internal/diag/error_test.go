@@ -34,6 +34,22 @@ func TestWrapPreservesErrorsIs(t *testing.T) {
 	}
 }
 
+// The positive case alone would still pass if matching were over-broad.
+func TestNewDoesNotMatchAnUnrelatedSentinel(t *testing.T) {
+	err := New(Diagnostic{Code: "unknown-kind", File: "rdk/x.yaml", Summary: "unknown kind"})
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Error("a causeless diagnostic matched an unrelated sentinel")
+	}
+}
+
+// A failure with no file to name still has to show its cause.
+func TestErrorWithoutFileStillShowsTheCause(t *testing.T) {
+	err := Wrap(errors.New("boom"), Diagnostic{Code: "internal", Summary: "cannot read the definitions directory"})
+	if got, want := err.Error(), "cannot read the definitions directory: boom"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
 // Diagnostics bubble up through fmt.Errorf wrapping in intermediate packages.
 func TestErrorsAsFindsADeeplyWrappedDiagnostic(t *testing.T) {
 	inner := New(Diagnostic{Code: "unknown-kind", File: "rdk/x.yaml", Summary: "unknown kind"})
