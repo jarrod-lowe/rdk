@@ -40,6 +40,8 @@ func Dir(store repofs.Store, dir string) ([]Definition, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The "exactly one config" cardinality rule is config-specific and not
+		// yet modeled by the kind registry, so it names the kind directly here.
 		if def.Kind == "config" {
 			configs++
 		} else {
