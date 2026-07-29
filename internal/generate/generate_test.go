@@ -49,3 +49,26 @@ func TestTFDocPinsProviderAndModules(t *testing.T) {
 		t.Error("config def must not produce a module block")
 	}
 }
+
+func TestModuleCallFlattensInputs(t *testing.T) {
+	call, err := newModuleCall("./modules/s3-bucket", map[string]any{"name": "assets"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inputs sit alongside source in one object: Terraform's JSON syntax has no
+	// nesting for module arguments.
+	if got, want := string(b), `{"name":"assets","source":"./modules/s3-bucket"}`; got != want {
+		t.Errorf("moduleCall JSON = %s, want %s", got, want)
+	}
+}
+
+func TestNewModuleCallRejectsSourceInput(t *testing.T) {
+	_, err := newModuleCall("./modules/s3-bucket", map[string]any{"source": "./modules/elsewhere"})
+	if err == nil {
+		t.Fatal("want error for an input colliding with the reserved source argument")
+	}
+}
