@@ -27,14 +27,15 @@ func TestLineOmitsField(t *testing.T) {
 }
 
 func TestTypedFieldConstructors(t *testing.T) {
-	fields := []Field{Str("dir", "rdk-managed"), Int("files", 4), Bool("dry", true)}
-	want := []any{"rdk-managed", 4, true}
+	fields := []Attr{Str("dir", "rdk-managed"), Int("files", 4), Bool("dry", true)}
+	wantKey := []string{"dir", "files", "dry"}
+	wantVal := []any{"rdk-managed", 4, true}
 	for i, f := range fields {
-		if f.Value() != want[i] {
-			t.Errorf("fields[%d].Value() = %v, want %v", i, f.Value(), want[i])
+		if f.Key != wantKey[i] {
+			t.Errorf("fields[%d].Key = %q, want %q", i, f.Key, wantKey[i])
 		}
-	}
-	if fields[0].Key != "dir" {
-		t.Errorf("Key = %q, want %q", fields[0].Key, "dir")
+		if f.Value() != wantVal[i] {
+			t.Errorf("fields[%d].Value() = %v, want %v", i, f.Value(), wantVal[i])
+		}
 	}
 }
