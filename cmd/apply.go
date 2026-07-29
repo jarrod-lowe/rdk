@@ -27,6 +27,11 @@ func newApplyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Warnings go to stderr so stdout stays the one-line summary that
+			// scripts read, and print before it so the summary lands last.
+			for _, w := range res.Warnings {
+				fmt.Fprintln(cmd.ErrOrStderr(), w)
+			}
 			fmt.Fprintln(cmd.OutOrStdout(), res.Summary())
 			return nil
 		},

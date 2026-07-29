@@ -95,16 +95,37 @@ func TestReadFileAndReadDir(t *testing.T) {
 	os.MkdirAll(filepath.Join(root, "rdk"), 0o755)
 	os.WriteFile(filepath.Join(root, "rdk", "b.yaml"), []byte("b"), 0o644)
 	os.WriteFile(filepath.Join(root, "rdk", "a.yaml"), []byte("a"), 0o644)
-	names, err := s.ReadDir("rdk")
+	entries, err := s.ReadDir("rdk")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(names) != 2 || names[0] != "a.yaml" || names[1] != "b.yaml" {
-		t.Errorf("ReadDir = %v, want sorted [a.yaml b.yaml]", names)
+	if len(entries) != 2 || entries[0].Name != "a.yaml" || entries[1].Name != "b.yaml" {
+		t.Errorf("ReadDir = %v, want sorted [a.yaml b.yaml]", entries)
 	}
 	data, err := s.ReadFile("rdk/a.yaml")
 	if err != nil || string(data) != "a" {
 		t.Errorf("ReadFile = %q, %v", data, err)
+	}
+}
+
+// Callers must be able to tell a nested directory from a file without a second
+// syscall, so rdk can reject one instead of trying to parse it.
+func TestReadDirReportsDirectories(t *testing.T) {
+	s, root := newTestStore(t)
+	os.MkdirAll(filepath.Join(root, "rdk", "nested"), 0o755)
+	os.WriteFile(filepath.Join(root, "rdk", "a.yaml"), []byte("a"), 0o644)
+	entries, err := s.ReadDir("rdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("got %d entries, want 2", len(entries))
+	}
+	if entries[0].Name != "a.yaml" || entries[0].IsDir {
+		t.Errorf("entries[0] = %+v, want a.yaml file", entries[0])
+	}
+	if entries[1].Name != "nested" || !entries[1].IsDir {
+		t.Errorf("entries[1] = %+v, want nested dir", entries[1])
 	}
 }
 

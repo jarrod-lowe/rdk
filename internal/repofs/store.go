@@ -18,10 +18,18 @@ type Store interface {
 	// Seed creates a user-owned file once: it never overwrites and never
 	// follows a symlink at the target. A pre-existing path is a no-op.
 	Seed(path string, data []byte) error
-	// ReadFile / ReadDir read within the repo root. ReadDir returns sorted
-	// entry names. Paths are repo-relative.
+	// ReadFile / ReadDir read within the repo root. ReadDir returns entries
+	// sorted by name. Paths are repo-relative.
 	ReadFile(path string) ([]byte, error)
-	ReadDir(path string) ([]string, error)
+	ReadDir(path string) ([]Entry, error)
+}
+
+// Entry is one directory entry. It carries IsDir rather than the full
+// fs.DirEntry because that is the only distinction rdk acts on, and keeping the
+// Store's surface small keeps Mem an honest stand-in for the real thing.
+type Entry struct {
+	Name  string
+	IsDir bool
 }
 
 type osStore struct {
@@ -91,15 +99,15 @@ func (s *osStore) ReadFile(name string) ([]byte, error) {
 	return s.root.ReadFile(name)
 }
 
-func (s *osStore) ReadDir(dir string) ([]string, error) {
+func (s *osStore) ReadDir(dir string) ([]Entry, error) {
 	entries, err := fs.ReadDir(s.root.FS(), dir)
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(entries))
+	out := make([]Entry, 0, len(entries))
 	for _, e := range entries {
-		names = append(names, e.Name())
+		out = append(out, Entry{Name: e.Name(), IsDir: e.IsDir()})
 	}
-	sort.Strings(names)
-	return names, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }

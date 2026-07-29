@@ -46,3 +46,46 @@ func TestInitThenApply(t *testing.T) {
 		t.Errorf("apply produced no terraform: %v", err)
 	}
 }
+
+// A parked definition still succeeds, but the user has to hear about it, or the
+// missing resource is a mystery at the far end.
+func TestApplyReportsIgnoredFiles(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "rdk", "logs.yaml.disabled"),
+		[]byte("kind: s3-bucket\nname: logs\ndescription: Logs\n"), 0o644)
+
+	out, err := run(t, dir, "apply")
+	if err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "logs.yaml.disabled") || !strings.Contains(out, "warning") {
+		t.Errorf("apply did not report the ignored file, got: %s", out)
+	}
+	if !strings.Contains(out, "rdk apply: wrote") {
+		t.Errorf("missing summary, got: %s", out)
+	}
+}
+
+// An unprocessable file fails the apply outright.
+func TestApplyRejectsStrayFile(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "rdk", "notes.txt"), []byte("scratch\n"), 0o644)
+
+	out, err := run(t, dir, "apply")
+	if err == nil {
+		t.Fatalf("apply succeeded despite a stray file, got: %s", out)
+	}
+	if !strings.Contains(err.Error(), "notes.txt") {
+		t.Errorf("error does not name the file: %v", err)
+	}
+}

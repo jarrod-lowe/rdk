@@ -52,18 +52,21 @@ func (m *Mem) ReadFile(name string) ([]byte, error) {
 	return append([]byte(nil), d...), nil
 }
 
-func (m *Mem) ReadDir(dir string) ([]string, error) {
+func (m *Mem) ReadDir(dir string) ([]Entry, error) {
 	prefix := dir + "/"
-	seen := map[string]bool{}
+	seen := map[string]bool{} // entry name -> is a directory
 	for p := range m.files {
 		if !strings.HasPrefix(p, prefix) {
 			continue
 		}
 		rest := p[len(prefix):]
+		// A remaining separator means the entry is a directory: this model has
+		// no directory objects, only the paths that imply them.
+		isDir := false
 		if i := strings.IndexByte(rest, '/'); i >= 0 {
-			rest = rest[:i]
+			rest, isDir = rest[:i], true
 		}
-		seen[rest] = true
+		seen[rest] = seen[rest] || isDir
 	}
 	// A directory with no entries doesn't exist in the in-memory model (dirs
 	// are implied by file paths). Match the real Store, which errors on a
@@ -72,10 +75,10 @@ func (m *Mem) ReadDir(dir string) ([]string, error) {
 	if len(seen) == 0 {
 		return nil, fs.ErrNotExist
 	}
-	names := make([]string, 0, len(seen))
-	for n := range seen {
-		names = append(names, n)
+	out := make([]Entry, 0, len(seen))
+	for n, isDir := range seen {
+		out = append(out, Entry{Name: n, IsDir: isDir})
 	}
-	sort.Strings(names)
-	return names, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }

@@ -21,12 +21,16 @@ const (
 // Result summarises an apply for the CLI (rule 6: loud).
 type Result struct {
 	FilesWritten int
+	// Warnings names entries in the definitions dir that were ignored. An
+	// ignored file is a resource that does not get generated, so the CLI
+	// reports these even though the apply succeeded.
+	Warnings []string
 }
 
 // Run performs apply against the repo the store is rooted at. Pure generation:
 // definitions in, repo content out — no network, no cloud (rules 1-2).
 func Run(store repofs.Store, version string) (Result, error) {
-	defs, err := parse.Dir(store, DefsDir)
+	defs, warnings, err := parse.Dir(store, DefsDir)
 	if err != nil {
 		return Result{}, err
 	}
@@ -47,7 +51,7 @@ func Run(store repofs.Store, version string) (Result, error) {
 	if err := store.Materialize(ManagedDir, set); err != nil {
 		return Result{}, err
 	}
-	return Result{FilesWritten: set.Len()}, nil
+	return Result{FilesWritten: set.Len(), Warnings: warnings}, nil
 }
 
 // Summary renders the loud one-line apply report.

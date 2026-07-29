@@ -43,11 +43,32 @@ func TestMemSeedAndReads(t *testing.T) {
 		t.Errorf("ReadFile = %q, %v", b, err)
 	}
 	m.Seed("rdk/a.yaml", []byte("a"))
-	names, err := m.ReadDir("rdk")
+	entries, err := m.ReadDir("rdk")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(names) != 2 || names[0] != "a.yaml" || names[1] != "config.yaml" {
-		t.Errorf("ReadDir = %v", names)
+	if len(entries) != 2 || entries[0].Name != "a.yaml" || entries[1].Name != "config.yaml" {
+		t.Errorf("ReadDir = %v", entries)
+	}
+}
+
+// Mem models directories implicitly, via paths; it must still report them, or a
+// component test would not see what the real Store sees.
+func TestMemReadDirReportsDirectories(t *testing.T) {
+	m := NewMem()
+	m.Seed("rdk/a.yaml", []byte("a"))
+	m.Seed("rdk/nested/b.yaml", []byte("b"))
+	entries, err := m.ReadDir("rdk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("got %d entries, want 2", len(entries))
+	}
+	if entries[0].Name != "a.yaml" || entries[0].IsDir {
+		t.Errorf("entries[0] = %+v, want a.yaml file", entries[0])
+	}
+	if entries[1].Name != "nested" || !entries[1].IsDir {
+		t.Errorf("entries[1] = %+v, want nested dir", entries[1])
 	}
 }
