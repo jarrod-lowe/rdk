@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/goccy/go-yaml"
+	"github.com/jarrod-lowe/rdk/internal/kind"
 	"github.com/jarrod-lowe/rdk/internal/repofs"
 	"github.com/jarrod-lowe/rdk/internal/schema"
 )
@@ -69,10 +70,11 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 	if !ok || kindVal == "" {
 		return Definition{}, fmt.Errorf("%s: missing 'kind' field; every definition starts with one (e.g. kind: s3-bucket)", name)
 	}
-	k, ok := schema.Lookup(kindVal)
+	ki, ok := kind.Lookup(kindVal)
 	if !ok {
 		return Definition{}, fmt.Errorf("%s: unknown kind %q", name, kindVal)
 	}
+	k := ki.Schema()
 
 	attrs := map[string]any{}
 	for key, val := range doc {
