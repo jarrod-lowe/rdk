@@ -47,7 +47,9 @@ carries them. Both want one output path with structure behind it.
 No dependencies, mirroring how `internal/schema` is types-only.
 
 ```go
-type Severity int // Debug, Info, Warn, Error
+type Severity int // SeverityDebug, SeverityInfo, SeverityWarn, SeverityError
+                  // — prefixed, because a bare Error constant would collide
+                  // with the Error type below
 
 // Field is an extra key/value for the JSONL form, built only by the typed
 // constructors diag.Str, diag.Int and diag.Bool — a closed set, so no call
@@ -74,7 +76,8 @@ type Error struct {
     Cause error       // the plain error being upgraded, if any
 }
 
-func (e *Error) Error() string { return e.Summary }
+func (d Diagnostic) Line() string { ... }  // "file: summary"
+func (e *Error) Error() string           // Line(), plus ": cause" when present
 func (e *Error) Unwrap() error { return e.Cause }
 
 // Wrap upgrades a plain error at the boundary that knows the user-facing
@@ -84,7 +87,15 @@ func Wrap(err error, d Diagnostic) *Error
 
 `Summary` must stand alone. `Fields` is a machine-readable duplicate of what the
 summary already says, never the only place a fact appears — otherwise text mode
-silently loses information.
+silently loses information. `Field` is machine-only for the same reason: the
+summary already names the offending field, so `Line()` composes `File` and
+`Summary` and nothing else.
+
+`Error()` returns the composed line rather than the bare summary, so that any
+consumer which merely prints the error still sees the file and the underlying
+cause. This is what keeps the existing `parse` tests — which assert on
+`err.Error()` containing both the filename and the YAML library's wording —
+passing through the migration.
 
 **There is deliberately no `FromError(err)`.** An automatic upgrade could only
 invent a code and fabricate provenance, which is rule 11 backwards. Errors are
@@ -203,8 +214,8 @@ Initial codes: `invalid-yaml`, `empty-file`, `missing-kind`, `kind-not-string`,
 `empty-kind`, `unknown-kind`, `unknown-field`, `missing-field`,
 `field-not-string`, `empty-field`, `multi-document`, `duplicate-name`,
 `config-cardinality`, `dir-in-defs`, `wrong-extension`, `unprocessable-file`,
-`set-aside`, `artifact`, `read-defs-dir`, `apply-complete`, `init-complete`,
-`version`, `internal`.
+`set-aside`, `artifact`, `read-defs-dir`, `read-file`, `git-init`,
+`apply-complete`, `init-complete`, `version`, `internal`.
 
 ### Enforcement
 
