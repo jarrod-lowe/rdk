@@ -47,28 +47,23 @@ carries them. Both want one output path with structure behind it.
 No dependencies, mirroring how `internal/schema` is types-only.
 
 ```go
-type Severity int // SeverityDebug, SeverityInfo, SeverityWarn, SeverityError
-                  // — prefixed, because a bare Error constant would collide
-                  // with the Error type below
-
-// Field is an extra key/value for the JSONL form, built only by the typed
+// Attr is an extra key/value for the JSONL form, built only by the typed
 // constructors diag.Str, diag.Int and diag.Bool — a closed set, so no call
 // site can smuggle an arbitrary value in.
-type Field struct {
+type Attr struct {
     Key string
     val any // unexported: only the constructors can set it
 }
 
-func (f Field) Value() any { return f.val } // how the logger reads it
+func (f Attr) Value() any { return f.val } // how the logger reads it
 
 type Diagnostic struct {
-    Severity Severity
     Code     string   // stable slug from codes.go, e.g. "unknown-kind"
     File     string   // repo-relative user file, when there is one
     Field    string   // yaml field, when known
     Summary  string   // self-contained: what is wrong and where
     Hint     string   // what to do next
-    Fields   []Field  // typed extras, emitted in JSONL only
+    Attrs    []Attr   // typed extras, emitted in JSONL only
 }
 
 type Error struct {
@@ -85,7 +80,7 @@ func (e *Error) Unwrap() error { return e.Cause }
 func Wrap(err error, d Diagnostic) *Error
 ```
 
-`Summary` must stand alone. `Fields` is a machine-readable duplicate of what the
+`Summary` must stand alone. `Attrs` is a machine-readable duplicate of what the
 summary already says, never the only place a fact appears — otherwise text mode
 silently loses information. `Field` is machine-only for the same reason: the
 summary already names the offending field, so `Line()` composes `File` and
@@ -132,7 +127,7 @@ A custom `slog.Handler` (~80 lines). Info prints the summary bare — `rdk versi
 0.1.0` should not read `INFO rdk version 0.1.0`. Warn and Error take a
 `warning:`/`error:` prefix, coloured yellow and red when colour is on. `File`
 and `Field` compose into the line, `Hint` follows it, `Cause` is appended once,
-and `Fields` is dropped because the summary already carries it.
+and `Attrs` is dropped because the summary already carries it.
 
 ```
 rdk apply: wrote 4 files to rdk-managed/
@@ -238,7 +233,7 @@ to output" decays on the first hurried commit.
 ## Testing
 
 - Table tests rendering a representative `Diagnostic` of each severity in all
-  three modes, including one with a `Cause` and one with `Fields`.
+  three modes, including one with a `Cause` and one with `Attrs`.
 - Colour resolution: TTY, non-TTY, `NO_COLOR`, `TERM=dumb`, `--color=always`
   into a buffer, and JSONL forcing colour off.
 - `Fail` with a `*diag.Error`, with a wrapped `*diag.Error` several layers deep,
