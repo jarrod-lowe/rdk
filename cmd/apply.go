@@ -32,7 +32,7 @@ func newApplyCmd() *cobra.Command {
 			for _, w := range res.Warnings {
 				fmt.Fprintln(cmd.ErrOrStderr(), "warning: "+w.Line())
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), res.Summary())
+			fmt.Fprintln(cmd.OutOrStdout(), res.Diagnostic().Line())
 			return nil
 		},
 	}

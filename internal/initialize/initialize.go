@@ -4,11 +4,12 @@ package initialize
 
 import (
 	_ "embed"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
+	"github.com/jarrod-lowe/rdk/internal/diag"
 	"github.com/jarrod-lowe/rdk/internal/repofs"
 )
 
@@ -24,7 +25,12 @@ func Run(store repofs.Store, dir string) error {
 		cmd := exec.Command("git", "init")
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("git init: %v\n%s", err, out)
+			return diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeGitInit,
+				File:    dir,
+				Summary: "git init failed",
+				Hint:    strings.TrimSpace(string(out)),
+			})
 		}
 	}
 	return store.Seed("rdk/config.yaml", []byte(seedConfig))

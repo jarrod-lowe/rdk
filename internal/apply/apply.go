@@ -55,7 +55,12 @@ func Run(store repofs.Store, version string) (Result, error) {
 	return Result{FilesWritten: set.Len(), Warnings: warnings}, nil
 }
 
-// Summary renders the loud one-line apply report.
-func (r Result) Summary() string {
-	return fmt.Sprintf("rdk apply: wrote %d files to %s/", r.FilesWritten, ManagedDir)
+// Diagnostic renders the loud one-line apply report (rule 6). The counts are
+// repeated as attrs so a JSONL consumer does not have to read the sentence.
+func (r Result) Diagnostic() diag.Diagnostic {
+	return diag.Diagnostic{
+		Code:    diag.CodeApplyComplete,
+		Summary: fmt.Sprintf("rdk apply: wrote %d files to %s/", r.FilesWritten, ManagedDir),
+		Attrs:   []diag.Attr{diag.Int("files", r.FilesWritten), diag.Str("dir", ManagedDir)},
+	}
 }
