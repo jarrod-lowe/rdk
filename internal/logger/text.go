@@ -28,38 +28,59 @@ type textHandler struct {
 	mu    *sync.Mutex
 }
 
+var _ slog.Handler = (*textHandler)(nil)
+
+// newTextHandler builds a handler for one stream. The mutex is shared with the
+// sibling handler rather than owned per-handler: stdout and stderr are usually
+// the same terminal, so serialising each stream alone would still let a result
+// line land between an error and its hint.
+func newTextHandler(w io.Writer, level slog.Level, color bool, mu *sync.Mutex) *textHandler {
+	return &textHandler{w: w, level: level, color: color, mu: mu}
+}
+
 func (h *textHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
 
-// The logger's API is closed and never calls these, so they return the handler
-// unchanged rather than carrying attrs no caller can set.
-func (h *textHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h *textHandler) WithGroup(string) slog.Handler      { return h }
+// The logger's API is closed: nothing constructs a derived handler, so these
+// are unreachable by design. Returning the receiver made that claim silently
+// false — WithAttrs dropped attrs, and WithGroup left the handler matching
+// "file" against what had become "g.file". A panic makes the claim enforceable
+// on a path no user input can reach.
+func (h *textHandler) WithAttrs([]slog.Attr) slog.Handler {
+	panic("logger: WithAttrs is unsupported; the logger API is closed")
+}
+
+func (h *textHandler) WithGroup(string) slog.Handler {
+	panic("logger: WithGroup is unsupported; the logger API is closed")
+}
 
 func (h *textHandler) Handle(_ context.Context, r slog.Record) error {
 	var file, hint, cause string
 	r.Attrs(func(a slog.Attr) bool {
 		switch a.Key {
 		case "file":
-			file = a.Value.String()
+			file = a.Value.Resolve().String()
 		case "hint":
-			hint = a.Value.String()
+			hint = a.Value.Resolve().String()
 		case "cause":
-			cause = a.Value.String()
+			cause = a.Value.Resolve().String()
 		}
 		return true
 	})
 
+	parts := make([]string, 0, 3)
+	if file != "" {
+		parts = append(parts, file)
+	}
+	if r.Message != "" {
+		parts = append(parts, r.Message)
+	}
+	if cause != "" {
+		parts = append(parts, cause)
+	}
+
 	var b strings.Builder
 	b.WriteString(h.prefix(r.Level))
-	if file != "" {
-		b.WriteString(file)
-		b.WriteString(": ")
-	}
-	b.WriteString(r.Message)
-	if cause != "" {
-		b.WriteString(": ")
-		b.WriteString(cause)
-	}
+	b.WriteString(strings.Join(parts, ": "))
 	b.WriteByte('\n')
 	if hint != "" {
 		b.WriteString("  ")

@@ -9,7 +9,7 @@ import (
 )
 
 func newTextLogger(w *bytes.Buffer, colour bool) *slog.Logger {
-	return slog.New(&textHandler{w: w, level: slog.LevelDebug, color: colour, mu: &sync.Mutex{}})
+	return slog.New(newTextHandler(w, slog.LevelDebug, colour, &sync.Mutex{}))
 }
 
 func logOne(t *testing.T, colour bool, level slog.Level, msg string, attrs ...slog.Attr) string {
@@ -69,11 +69,12 @@ func TestAttrsAreNotPrintedInText(t *testing.T) {
 }
 
 // Timestamps would make every line differ from the last, for no reader's
-// benefit (rule 1).
+// benefit (rule 1). An exact match is what proves their absence: any format
+// one might take would break it.
 func TestNoTimestamps(t *testing.T) {
 	got := logOne(t, false, slog.LevelWarn, "something", slog.String("file", "a.yaml"))
-	if bytes.Contains([]byte(got), []byte("time")) || bytes.Contains([]byte(got), []byte("20")) {
-		t.Errorf("output looks like it carries a timestamp: %q", got)
+	if want := "warning: a.yaml: something\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -94,7 +95,7 @@ func TestErrorColourIsRed(t *testing.T) {
 
 func TestLevelFiltering(t *testing.T) {
 	var buf bytes.Buffer
-	l := slog.New(&textHandler{w: &buf, level: slog.LevelWarn, mu: &sync.Mutex{}})
+	l := slog.New(newTextHandler(&buf, slog.LevelWarn, false, &sync.Mutex{}))
 	l.LogAttrs(context.Background(), slog.LevelInfo, "a result")
 	if buf.Len() != 0 {
 		t.Errorf("info survived a warn threshold: %q", buf.String())
@@ -102,5 +103,44 @@ func TestLevelFiltering(t *testing.T) {
 	l.LogAttrs(context.Background(), slog.LevelWarn, "a warning")
 	if buf.Len() == 0 {
 		t.Error("warn was filtered out at a warn threshold")
+	}
+}
+
+// An empty message must not leave the separators dangling.
+func TestEmptyMessageDoesNotStrandSeparators(t *testing.T) {
+	got := logOne(t, false, slog.LevelError, "",
+		slog.String("file", "a.yaml"), slog.String("cause", "boom"))
+	if want := "error: a.yaml: boom\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// The handler must resolve lazy values, as the slog.Handler contract requires.
+func TestLogValuerIsResolved(t *testing.T) {
+	got := logOne(t, false, slog.LevelError, "invalid YAML", slog.Any("cause", lazyValue{}))
+	if want := "error: invalid YAML: resolved\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+type lazyValue struct{}
+
+func (lazyValue) LogValue() slog.Value { return slog.StringValue("resolved") }
+
+// The closed API means these are unreachable; the panic is what keeps that true.
+func TestDerivedHandlersPanic(t *testing.T) {
+	h := newTextHandler(&bytes.Buffer{}, slog.LevelDebug, false, &sync.Mutex{})
+	for name, call := range map[string]func(){
+		"WithAttrs": func() { h.WithAttrs(nil) },
+		"WithGroup": func() { h.WithGroup("g") },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s did not panic", name)
+				}
+			}()
+			call()
+		}()
 	}
 }
