@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/jarrod-lowe/rdk/internal/apply"
@@ -10,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func newApplyCmd() *cobra.Command {
+func (a *app) applyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply",
 		Short: "Regenerate all rdk-managed files from the definitions in rdk/",
@@ -27,12 +26,12 @@ func newApplyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Warnings go to stderr so stdout stays the one-line summary that
-			// scripts read, and print before it so the summary lands last.
+			// Warnings print before the summary so the summary lands last, and
+			// on stderr so stdout stays the answer a script reads.
 			for _, w := range res.Warnings {
-				fmt.Fprintln(cmd.ErrOrStderr(), "warning: "+w.Line())
+				a.log.Warn(w)
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), res.Diagnostic().Line())
+			a.log.Result(res.Diagnostic())
 			return nil
 		},
 	}

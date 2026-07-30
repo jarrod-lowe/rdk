@@ -2,13 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func run(t *testing.T, dir string, args ...string) (string, error) {
+func runSplit(t *testing.T, dir string, args ...string) (string, string, error) {
 	t.Helper()
 	wd, _ := os.Getwd()
 	if err := os.Chdir(dir); err != nil {
@@ -16,12 +17,18 @@ func run(t *testing.T, dir string, args ...string) (string, error) {
 	}
 	defer os.Chdir(wd)
 	root := NewRootCmd()
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	root.SetOut(&out)
-	root.SetErr(&out)
+	root.SetErr(&errOut)
 	root.SetArgs(args)
 	err := root.Execute()
-	return out.String(), err
+	return out.String(), errOut.String(), err
+}
+
+func run(t *testing.T, dir string, args ...string) (string, error) {
+	t.Helper()
+	out, errOut, err := runSplit(t, dir, args...)
+	return out + errOut, err
 }
 
 func TestInitThenApply(t *testing.T) {
@@ -87,5 +94,84 @@ func TestApplyRejectsStrayFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "notes.txt") {
 		t.Errorf("error does not name the file: %v", err)
+	}
+}
+
+// The summary is the command's answer and belongs on stdout; the warning is
+// commentary and belongs on stderr, so `rdk apply | tail -1` still works.
+func TestApplySplitsStreams(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "rdk", "logs.yaml.disabled"),
+		[]byte("kind: s3-bucket\nname: logs\ndescription: Logs\n"), 0o644)
+
+	out, errOut, err := runSplit(t, dir, "apply")
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !strings.Contains(out, "rdk apply: wrote") {
+		t.Errorf("stdout missing the summary: %q", out)
+	}
+	if strings.Contains(out, "warning") {
+		t.Errorf("stdout carries a warning: %q", out)
+	}
+	if !strings.Contains(errOut, "warning: logs.yaml.disabled") {
+		t.Errorf("stderr missing the warning: %q", errOut)
+	}
+}
+
+func TestJSONLModeEmitsOneObjectPerLine(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+
+	out, _, err := runSplit(t, dir, "apply", "--log-format=jsonl")
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); err != nil {
+		t.Fatalf("stdout is not JSON: %v (%q)", err, out)
+	}
+	if rec["code"] != "apply-complete" {
+		t.Errorf("code = %v, want apply-complete", rec["code"])
+	}
+}
+
+func TestQuietModeSuppressesTheSummary(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+
+	out, _, err := runSplit(t, dir, "apply", "--log-level=warn")
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("stdout = %q, want empty", out)
+	}
+}
+
+func TestBadFlagValueIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	_, _, err := runSplit(t, dir, "version", "--log-format=yaml")
+	if err == nil {
+		t.Fatal("want an error for an unknown log format")
+	}
+	if !strings.Contains(err.Error(), "yaml") {
+		t.Errorf("error does not name the bad value: %v", err)
 	}
 }
