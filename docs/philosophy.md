@@ -105,7 +105,10 @@ who must act on it: what's wrong, where, and what to do next, citing
 provenance. This is a design constraint, not a polish pass.
 *Therefore:* no error message that names an internal concept without naming
 the user's file/field that triggered it; a feature whose failures can't be
-explained clearly isn't finished. (GOAL.md "AI Friendly", DD-7)
+explained clearly isn't finished. Mechanically: everything rdk says is a
+`diag.Diagnostic` carrying a documented code, the user's file and field, and a
+hint; `internal/logger` is the only path to stdout or stderr, and a test
+enforces it. (GOAL.md "AI Friendly", DD-7)
 
 ## 12. Messiness is budgeted
 
