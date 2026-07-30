@@ -21,7 +21,7 @@ const (
 	CodeWrongExtension    = "wrong-extension"
 	CodeUnprocessableFile = "unprocessable-file"
 	CodeSetAside          = "set-aside"
-	CodeArtifact          = "artifact"
+	CodeEditorArtifact    = "editor-artifact"
 	CodeReadDefsDir       = "read-defs-dir"
 	CodeReadFile          = "read-file"
 	CodeGitInit           = "git-init"
@@ -31,13 +31,15 @@ const (
 	CodeInternal          = "internal"
 )
 
-// All lists every code so the documentation coverage test can check them.
-var All = []string{
+// all lists every code so the documentation coverage tests can check them.
+// Unexported: nothing outside this package's own tests reads it, and an
+// exported mutable slice would be shared state anyone could reorder.
+var all = []string{
 	CodeInvalidYAML, CodeEmptyFile, CodeMissingKind, CodeKindNotString,
 	CodeEmptyKind, CodeUnknownKind, CodeUnknownField, CodeMissingField,
 	CodeFieldNotString, CodeEmptyField, CodeMultiDocument, CodeDuplicateName,
 	CodeConfigCardinality, CodeDirInDefs, CodeWrongExtension,
-	CodeUnprocessableFile, CodeSetAside, CodeArtifact, CodeReadDefsDir,
+	CodeUnprocessableFile, CodeSetAside, CodeEditorArtifact, CodeReadDefsDir,
 	CodeReadFile, CodeGitInit, CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal,
 }

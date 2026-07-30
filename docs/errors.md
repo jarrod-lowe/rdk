@@ -8,12 +8,16 @@ way that matching on message text is not. The codes are defined in
 Codes never change meaning. A code may be retired, but it is never reused for
 something else.
 
-## Failures (exit 1)
+Exit status is a property of the run, not of a code: a failure exits 1, an
+unanticipated error exits 2, and warnings and results do not affect the exit
+status on their own — a run that warns and then fails still exits 1.
+
+## Failures
 
 | Code | Means | Fix |
 |---|---|---|
-| `invalid-yaml` | The file is not valid YAML. | Read the cause; it names the line. |
-| `empty-file` | A `.yaml` file in `rdk/` has no content. | Add a definition, or delete the file. |
+| `invalid-yaml` | The file is not a YAML mapping — either malformed, or a list or scalar where a single definition was expected. | Read the cause; it names the line. |
+| `empty-file` | A `.yaml` file in `rdk/` has no content, or no fields. | Add a definition, or delete the file. |
 | `missing-kind` | The definition has no `kind` field. | Add one, e.g. `kind: s3-bucket`. |
 | `kind-not-string` | `kind` is present but is not a string. | Quote it or remove the stray type, e.g. `kind: s3-bucket`. |
 | `empty-kind` | `kind` is an empty string. | Name a kind, e.g. `kind: s3-bucket`. |
@@ -25,21 +29,21 @@ something else.
 | `multi-document` | One file holds several `---`-separated documents. | Split them into one definition per file. |
 | `duplicate-name` | Two definitions share a resource name. | Rename one; the message names the other file. |
 | `config-cardinality` | The definitions dir does not hold exactly one `kind: config`. | Add the missing one, or remove the extras. |
-| `dir-in-defs` | `rdk/` contains a subdirectory. | Move the definitions up into `rdk/`. |
+| `dir-in-defs` | `rdk/` contains a subdirectory. | Move the definitions up into `rdk/`, or move the directory out of `rdk/` if it holds none. |
 | `wrong-extension` | A definition uses `.yml`. | Rename it to `.yaml`. |
 | `unprocessable-file` | A file in `rdk/` is not a definition. | Move it out, or park it with `.disabled`. |
 | `read-defs-dir` | The definitions directory could not be read. | Check it exists and is readable; run `rdk init` if not. |
 | `read-file` | A definition file could not be read. | Check its permissions. |
 | `git-init` | `git init` failed while initialising the repository. | Read the cause; check git is installed. |
 
-## Warnings (exit 0)
+## Warnings
 
 | Code | Means | Fix |
 |---|---|---|
-| `set-aside` | A definition is parked with `.disabled` or `.example`, so nothing is generated for it. | Intentional — rename to `.yaml` to enable it. |
-| `artifact` | An editor or merge leftover (`.orig`, `.rej`, `.bak`, `~`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
+| `set-aside` | A file is parked with `.disabled` or `.example`, so nothing is generated for it. | Intentional — rename to `.yaml` to enable it. |
+| `editor-artifact` | An editor or merge leftover (`.orig`, `.rej`, `.bak`, `~`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
 
-## Results (exit 0)
+## Results
 
 | Code | Means |
 |---|---|
