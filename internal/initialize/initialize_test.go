@@ -1,11 +1,13 @@
 package initialize
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/jarrod-lowe/rdk/internal/diag"
 	"github.com/jarrod-lowe/rdk/internal/repofs"
 )
 
@@ -63,5 +65,37 @@ func TestInitDoesNotCommit(t *testing.T) {
 	heads := filepath.Join(dir, ".git", "refs", "heads")
 	if entries, err := os.ReadDir(heads); err == nil && len(entries) != 0 {
 		t.Error("init created a commit")
+	}
+}
+
+// The failure path had no test, and it now has rendering worth pinning: git's
+// output is folded into the cause, and is absent entirely when git never ran.
+func TestGitInitFailureCarriesGitsOutput(t *testing.T) {
+	stub := t.TempDir()
+	script := "#!/bin/sh\necho 'fatal: cannot mkdir' >&2\necho 'hint: check perms' >&2\nexit 128\n"
+	if err := os.WriteFile(filepath.Join(stub, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stub)
+
+	dir := t.TempDir()
+	store, err := repofs.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Run(store, dir)
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeGitInit {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeGitInit)
+	}
+	// One line, so git's own "hint:" cannot masquerade as rdk's output.
+	if got := d.Error(); strings.Contains(got, "\n") {
+		t.Errorf("error spans several lines: %q", got)
+	}
+	if !strings.Contains(d.Error(), "cannot mkdir") || !strings.Contains(d.Error(), "check perms") {
+		t.Errorf("error does not carry git's output: %q", d.Error())
 	}
 }

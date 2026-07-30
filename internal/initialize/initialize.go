@@ -4,6 +4,7 @@ package initialize
 
 import (
 	_ "embed"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,11 +26,20 @@ func Run(store repofs.Store, dir string) error {
 		cmd := exec.Command("git", "init")
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
+			// Git's own output is the cause, not a next step, and docs/errors.md
+			// points the reader at the cause for this code. Fold it to one line:
+			// git often emits several, including its own "hint:" lines, which
+			// would otherwise land flush-left and read as rdk's output. It is
+			// empty exactly when git never ran, so only append it when there is
+			// something to say.
+			if detail := strings.Join(strings.Fields(string(out)), " "); detail != "" {
+				err = fmt.Errorf("%w: %s", err, detail)
+			}
 			return diag.Wrap(err, diag.Diagnostic{
 				Code:    diag.CodeGitInit,
-				File:    dir,
 				Summary: "git init failed",
-				Hint:    strings.TrimSpace(string(out)),
+				Hint:    "check that git is installed and the directory is writable",
+				Attrs:   []diag.Attr{diag.Str("dir", dir)},
 			})
 		}
 	}

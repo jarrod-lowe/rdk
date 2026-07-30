@@ -3,7 +3,6 @@ package apply
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
@@ -84,24 +83,24 @@ func TestRunFailsWithoutDefinitions(t *testing.T) {
 // The summary is a diagnostic like any other, so JSONL consumers get the
 // counts as attrs rather than having to parse the sentence.
 func TestResultDiagnosticCarriesCounts(t *testing.T) {
-	store, _ := setupRepo(t)
-	res, err := Run(store, "test-version")
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	d := res.Diagnostic()
+	d := Result{FilesWritten: 4}.Diagnostic()
 	if d.Code != diag.CodeApplyComplete {
 		t.Errorf("Code = %q, want %q", d.Code, diag.CodeApplyComplete)
 	}
-	if !strings.Contains(d.Summary, ManagedDir) {
-		t.Errorf("Summary = %q, want it to name %q", d.Summary, ManagedDir)
+	if want := "rdk apply: wrote 4 files to rdk-managed/"; d.Summary != want {
+		t.Errorf("Summary = %q, want %q", d.Summary, want)
+	}
+	// A run-wide result has no file to name; a File here would prefix the
+	// stdout line with a path that means nothing to the reader.
+	if d.File != "" {
+		t.Errorf("File = %q, want empty", d.File)
 	}
 	attrs := map[string]any{}
 	for _, a := range d.Attrs {
 		attrs[a.Key] = a.Value()
 	}
-	if attrs["files"] != res.FilesWritten {
-		t.Errorf("files attr = %v, want %d", attrs["files"], res.FilesWritten)
+	if attrs["files"] != 4 {
+		t.Errorf("files attr = %v, want 4", attrs["files"])
 	}
 	if attrs["dir"] != ManagedDir {
 		t.Errorf("dir attr = %v, want %q", attrs["dir"], ManagedDir)
