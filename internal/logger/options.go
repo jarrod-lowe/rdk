@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+
+	"github.com/jarrod-lowe/rdk/internal/diag"
 )
 
 // Format is how records are rendered.
@@ -46,18 +48,22 @@ type Options struct {
 func Resolve(flagFormat, flagLevel, flagColor string, env Env) (Options, error) {
 	o := Options{Format: FormatText, Level: slog.LevelInfo, Color: ColorAuto, Env: env}
 
-	if s := pick(flagFormat, "RDK_LOG_FORMAT", env); s != "" {
+	if s, origin := pick(flagFormat, "RDK_LOG_FORMAT", env); s != "" {
 		switch s {
 		case "text":
 			o.Format = FormatText
 		case "jsonl":
 			o.Format = FormatJSONL
 		default:
-			return Options{}, fmt.Errorf("unknown log format %q (valid: text, jsonl)", s)
+			return Options{}, diag.New(diag.Diagnostic{
+				Code:    diag.CodeInvalidFlag,
+				Summary: fmt.Sprintf("unknown log format %q%s", s, origin),
+				Hint:    "valid formats: text, jsonl",
+			})
 		}
 	}
 
-	if s := pick(flagLevel, "RDK_LOG_LEVEL", env); s != "" {
+	if s, origin := pick(flagLevel, "RDK_LOG_LEVEL", env); s != "" {
 		switch s {
 		case "debug":
 			o.Level = slog.LevelDebug
@@ -68,7 +74,11 @@ func Resolve(flagFormat, flagLevel, flagColor string, env Env) (Options, error) 
 		case "error":
 			o.Level = slog.LevelError
 		default:
-			return Options{}, fmt.Errorf("unknown log level %q (valid: debug, info, warn, error)", s)
+			return Options{}, diag.New(diag.Diagnostic{
+				Code:    diag.CodeInvalidFlag,
+				Summary: fmt.Sprintf("unknown log level %q%s", s, origin),
+				Hint:    "valid levels: debug, info, warn, error",
+			})
 		}
 	}
 
@@ -82,23 +92,30 @@ func Resolve(flagFormat, flagLevel, flagColor string, env Env) (Options, error) 
 	case "never":
 		o.Color = ColorNever
 	default:
-		return Options{}, fmt.Errorf("unknown colour mode %q (valid: auto, always, never)", flagColor)
+		return Options{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeInvalidFlag,
+			Summary: fmt.Sprintf("unknown colour mode %q", flagColor),
+			Hint:    "valid colour modes: auto, always, never",
+		})
 	}
 
 	return o, nil
 }
 
-// pick returns the flag value, else the environment value, else "".
-func pick(flag, envKey string, env Env) string {
+// pick returns the flag value, else the environment value, else "" — and where
+// it came from, because a bad value from a stale environment variable is
+// otherwise indistinguishable from a typo on the command line the user is
+// looking at.
+func pick(flag, envKey string, env Env) (value, origin string) {
 	if flag != "" {
-		return flag
+		return flag, ""
 	}
 	if env != nil {
 		if v, ok := env(envKey); ok {
-			return v
+			return v, " from " + envKey
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // useColor decides colour for one stream. NO_COLOR and TERM=dumb win over an
@@ -109,7 +126,7 @@ func useColor(mode ColorMode, w io.Writer, env Env) bool {
 		return false
 	}
 	if env != nil {
-		if _, ok := env("NO_COLOR"); ok {
+		if v, ok := env("NO_COLOR"); ok && v != "" {
 			return false
 		}
 		if v, _ := env("TERM"); v == "dumb" {

@@ -35,6 +35,7 @@ status on their own — a run that warns and then fails still exits 1.
 | `read-defs-dir` | The definitions directory could not be read. | Check it exists and is readable; run `rdk init` if not. |
 | `read-file` | A definition file could not be read. | Check its permissions. |
 | `git-init` | `git init` failed while initialising the repository. | Read the cause; check git is installed. |
+| `invalid-flag` | A `--log-format`, `--log-level` or `--color` value is not one of the accepted ones. | Use one of the values the message lists. |
 
 ## Warnings
 

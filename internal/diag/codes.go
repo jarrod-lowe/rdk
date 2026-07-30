@@ -29,6 +29,7 @@ const (
 	CodeInitComplete      = "init-complete"
 	CodeVersion           = "version"
 	CodeInternal          = "internal"
+	CodeInvalidFlag       = "invalid-flag"
 )
 
 // all lists every code so the documentation coverage tests can check them.
@@ -41,5 +42,5 @@ var all = []string{
 	CodeConfigCardinality, CodeDirInDefs, CodeWrongExtension,
 	CodeUnprocessableFile, CodeSetAside, CodeEditorArtifact, CodeReadDefsDir,
 	CodeReadFile, CodeGitInit, CodeApplyComplete, CodeInitComplete,
-	CodeVersion, CodeInternal,
+	CodeVersion, CodeInternal, CodeInvalidFlag,
 }
