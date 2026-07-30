@@ -2,6 +2,8 @@
 package cmd
 
 import (
+	"errors"
+	"io"
 	"os"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
@@ -55,16 +57,39 @@ func (a *app) rootCmd() *cobra.Command {
 }
 
 // Execute runs the CLI and returns the process exit status: 1 when the user's
-// definitions are at fault, 2 when rdk is.
-func Execute() int {
+// input is at fault, 2 when rdk is.
+func Execute() int { return execute(os.Args[1:], nil, nil) }
+
+// execute is Execute with the command line and streams injected, so the
+// exit-code mapping is testable without spawning a process.
+func execute(args []string, stdout, stderr io.Writer) int {
 	a := &app{}
-	err := a.rootCmd().Execute()
+	root := a.rootCmd()
+	root.SetArgs(args)
+	if stdout != nil {
+		root.SetOut(stdout)
+	}
+	if stderr != nil {
+		root.SetErr(stderr)
+	}
+	err := root.Execute()
 	if err == nil {
 		return 0
 	}
 	log := a.log
 	if log == nil {
-		// The failure happened before flags were parsed, so report it plainly.
+		// Nothing has run yet, so cobra rejected the command line itself: an
+		// unknown flag, command, or argument. That is the user's input being
+		// wrong, never rdk's fault, so it must not exit 2 as an rdk bug.
+		// Resolve's own failures are already diagnostics and keep their code.
+		var d *diag.Error
+		if !errors.As(err, &d) {
+			err = diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeInvalidFlag,
+				Summary: "invalid command line",
+				Hint:    "run 'rdk --help' for the accepted commands and flags",
+			})
+		}
 		log = logger.New(logger.Options{})
 	}
 	log.Fail(err)

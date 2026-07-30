@@ -175,3 +175,39 @@ func TestBadFlagValueIsRejected(t *testing.T) {
 		t.Errorf("error does not name the bad value: %v", err)
 	}
 }
+
+// The exit code is a contract: a script has to be able to tell "fix your
+// input" from "rdk is broken".
+func TestExitCodes(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "rdk", "notes.txt"), []byte("scratch\n"), 0o644)
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	cases := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"success", []string{"version"}, 0},
+		{"bad definition", []string{"apply"}, 1},
+		{"bad flag value", []string{"version", "--log-format=yaml"}, 1},
+		{"unknown flag", []string{"--bogus"}, 1},
+		{"unknown command", []string{"bogus"}, 1},
+	}
+	for _, c := range cases {
+		var out, errOut bytes.Buffer
+		if got := execute(c.args, &out, &errOut); got != c.want {
+			t.Errorf("%s: exit = %d, want %d (stderr: %s)", c.name, got, c.want, errOut.String())
+		}
+	}
+}
