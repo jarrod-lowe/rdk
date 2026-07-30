@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/goccy/go-yaml"
+	"github.com/jarrod-lowe/rdk/internal/diag"
 	"github.com/jarrod-lowe/rdk/internal/kind"
 	"github.com/jarrod-lowe/rdk/internal/repofs"
 	"github.com/jarrod-lowe/rdk/internal/schema"
@@ -28,27 +29,37 @@ type Definition struct {
 // one config). Entries rdk cannot process are errors, not clutter to step
 // around; the few that are ignorable come back as warnings for the caller to
 // report. Warnings inherit ReadDir's sorted order (DD-1).
-func Dir(store repofs.Store, dir string) ([]Definition, []string, error) {
+func Dir(store repofs.Store, dir string) ([]Definition, []diag.Diagnostic, error) {
 	entries, err := store.ReadDir(dir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading definitions dir %s: %w", dir, err)
+		return nil, nil, diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeReadDefsDir,
+			File:    dir,
+			Summary: "cannot read the definitions directory",
+			Hint:    "run 'rdk init' if this repository has not been initialised",
+		})
 	}
 
 	var defs []Definition
-	var warnings []string
+	var warnings []diag.Diagnostic
 	seen := map[string]string{} // resource name -> file
 	configs := 0
 	for _, e := range entries {
 		name := e.Name
 		if e.IsDir {
-			return nil, nil, fmt.Errorf("%s: rdk/ holds definition files, not directories — move the definitions in %s/ up into %s/", name, name, dir)
+			return nil, nil, diag.New(diag.Diagnostic{
+				Code:    diag.CodeDirInDefs,
+				File:    name,
+				Summary: "rdk/ holds definition files, not directories",
+				Hint:    fmt.Sprintf("move the definitions in %s/ up into %s/", name, dir),
+			})
 		}
 		if !strings.HasSuffix(name, ".yaml") {
-			w, err := classify(name)
+			w, ok, err := classify(name)
 			if err != nil {
 				return nil, nil, err
 			}
-			if w != "" {
+			if ok {
 				warnings = append(warnings, w)
 			}
 			continue
@@ -63,14 +74,25 @@ func Dir(store repofs.Store, dir string) ([]Definition, []string, error) {
 			configs++
 		} else {
 			if prev, dup := seen[def.Name]; dup {
-				return nil, nil, fmt.Errorf("%s: duplicate resource name %q (also defined in %s)", name, def.Name, prev)
+				return nil, nil, diag.New(diag.Diagnostic{
+					Code:    diag.CodeDuplicateName,
+					File:    name,
+					Field:   "name",
+					Summary: fmt.Sprintf("duplicate resource name %q (also defined in %s)", def.Name, prev),
+					Hint:    "resource names must be unique; rename one of them",
+				})
 			}
 			seen[def.Name] = name
 		}
 		defs = append(defs, def)
 	}
 	if configs != 1 {
-		return nil, nil, fmt.Errorf("expected exactly one 'kind: config' definition in %s, found %d", dir, configs)
+		return nil, nil, diag.New(diag.Diagnostic{
+			Code:    diag.CodeConfigCardinality,
+			File:    dir,
+			Summary: fmt.Sprintf("expected exactly one 'kind: config' definition in %s, found %d", dir, configs),
+			Hint:    "every repository has exactly one config definition",
+		})
 	}
 	return defs, warnings, nil
 }
@@ -78,7 +100,11 @@ func Dir(store repofs.Store, dir string) ([]Definition, []string, error) {
 func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 	raw, err := store.ReadFile(path.Join(dir, name))
 	if err != nil {
-		return Definition{}, fmt.Errorf("%s: %w", name, err)
+		return Definition{}, diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeReadFile,
+			File:    name,
+			Summary: "cannot read this definition file",
+		})
 	}
 	// Decode document-by-document rather than with yaml.Unmarshal, which reads
 	// only the first document and drops the rest without complaint. A file that
@@ -87,32 +113,69 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
-		return Definition{}, fmt.Errorf("%s: invalid YAML: %w", name, err)
+		return Definition{}, diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeInvalidYAML,
+			File:    name,
+			Summary: "invalid YAML",
+		})
 	}
 	var next map[string]any
 	if err := dec.Decode(&next); !errors.Is(err, io.EOF) {
-		return Definition{}, fmt.Errorf("%s: contains more than one YAML document (separated by '---'); rdk takes one definition per file — split them into separate files", name)
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeMultiDocument,
+			File:    name,
+			Summary: "contains more than one YAML document (separated by '---')",
+			Hint:    "rdk takes one definition per file — split them into separate files",
+		})
 	}
 
 	if len(doc) == 0 {
-		return Definition{}, fmt.Errorf("%s: file is empty; every definition starts with a 'kind' field (e.g. kind: s3-bucket)", name)
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeEmptyFile,
+			File:    name,
+			Summary: "file is empty",
+			Hint:    "every definition starts with a 'kind' field (e.g. kind: s3-bucket)",
+		})
 	}
 	rawKind, present := doc["kind"]
 	if !present {
-		return Definition{}, fmt.Errorf("%s: missing 'kind' field; every definition starts with one (e.g. kind: s3-bucket)", name)
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeMissingKind,
+			File:    name,
+			Field:   "kind",
+			Summary: "missing 'kind' field",
+			Hint:    "every definition starts with one (e.g. kind: s3-bucket)",
+		})
 	}
 	kindVal, isStr := rawKind.(string)
 	if !isStr {
-		return Definition{}, fmt.Errorf("%s: 'kind' must be a string, got %s (e.g. kind: s3-bucket)", name, yamlType(rawKind))
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeKindNotString,
+			File:    name,
+			Field:   "kind",
+			Summary: fmt.Sprintf("'kind' must be a string, got %s", yamlType(rawKind)),
+			Hint:    "e.g. kind: s3-bucket",
+		})
 	}
 	if kindVal == "" {
-		return Definition{}, fmt.Errorf("%s: 'kind' must not be empty (e.g. kind: s3-bucket)", name)
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeEmptyKind,
+			File:    name,
+			Field:   "kind",
+			Summary: "'kind' must not be empty",
+			Hint:    "e.g. kind: s3-bucket",
+		})
 	}
 	ki, ok := kind.Lookup(kindVal)
 	if !ok {
 		known := knownKinds()
-		return Definition{}, fmt.Errorf("%s: unknown kind %q%s (known kinds: %s)",
-			name, kindVal, didYouMean(kindVal, known), strings.Join(known, ", "))
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeUnknownKind,
+			File:    name,
+			Field:   "kind",
+			Summary: fmt.Sprintf("unknown kind %q%s", kindVal, didYouMean(kindVal, known)),
+			Hint:    "known kinds: " + strings.Join(known, ", "),
+		})
 	}
 	k := ki.Schema()
 
@@ -123,25 +186,46 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 		}
 		if _, ok := k.Field(key); !ok {
 			valid := fieldNames(k)
-			return Definition{}, fmt.Errorf("%s: unknown field %q for kind %q%s (valid fields: %s)",
-				name, key, kindVal, didYouMean(key, valid), strings.Join(valid, ", "))
+			return Definition{}, diag.New(diag.Diagnostic{
+				Code:    diag.CodeUnknownField,
+				File:    name,
+				Field:   key,
+				Summary: fmt.Sprintf("unknown field %q for kind %q%s", key, kindVal, didYouMean(key, valid)),
+				Hint:    "valid fields: " + strings.Join(valid, ", "),
+			})
 		}
 		attrs[key] = val
 	}
 	for _, f := range k.Fields {
 		if f.Required {
 			if _, present := attrs[f.Name]; !present {
-				return Definition{}, fmt.Errorf("%s: kind %q has required field %q — %s (example: %s)",
-					name, kindVal, f.Name, f.Description, f.Example)
+				return Definition{}, diag.New(diag.Diagnostic{
+					Code:    diag.CodeMissingField,
+					File:    name,
+					Field:   f.Name,
+					Summary: fmt.Sprintf("kind %q has required field %q — %s", kindVal, f.Name, f.Description),
+					Hint:    "example: " + f.Example,
+				})
 			}
 		}
 		if v, present := attrs[f.Name]; present && f.Type == schema.StringType {
 			s, isStr := v.(string)
 			if !isStr {
-				return Definition{}, fmt.Errorf("%s: field %q must be a string, got %s (example: %s)", name, f.Name, yamlType(v), f.Example)
+				return Definition{}, diag.New(diag.Diagnostic{
+					Code:    diag.CodeFieldNotString,
+					File:    name,
+					Field:   f.Name,
+					Summary: fmt.Sprintf("field %q must be a string, got %s", f.Name, yamlType(v)),
+					Hint:    "example: " + f.Example,
+				})
 			}
 			if f.Required && strings.TrimSpace(s) == "" {
-				return Definition{}, fmt.Errorf("%s: required field %q must not be empty", name, f.Name)
+				return Definition{}, diag.New(diag.Diagnostic{
+					Code:    diag.CodeEmptyField,
+					File:    name,
+					Field:   f.Name,
+					Summary: fmt.Sprintf("required field %q must not be empty", f.Name),
+				})
 			}
 		}
 	}

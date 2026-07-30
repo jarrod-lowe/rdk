@@ -3,6 +3,8 @@ package parse
 import (
 	"fmt"
 	"strings"
+
+	"github.com/jarrod-lowe/rdk/internal/diag"
 )
 
 // rdk/ is a definitions directory, not a general-purpose folder: a file rdk
@@ -20,31 +22,49 @@ var setAside = []string{".disabled", ".example"}
 var artifacts = []string{".orig", ".rej", ".bak", "~"}
 
 // classify decides what a non-.yaml entry means. It returns a warning to
-// report, "" to skip silently, or an error if the entry cannot be processed.
-func classify(name string) (string, error) {
+// report (ok true), nothing (ok false) for entries to skip silently, or an
+// error if the entry cannot be processed.
+func classify(name string) (w diag.Diagnostic, ok bool, err error) {
 	// Hidden files are machine-made, never an attempt at a definition:
 	// .DS_Store appears without anyone asking, vim writes .foo.yaml.swp while
 	// editing, and .gitignore/.gitkeep are how the directory is kept in git.
 	// Erroring would break apply for no reason; warning every time would train
 	// people to ignore warnings.
 	if strings.HasPrefix(name, ".") {
-		return "", nil
+		return diag.Diagnostic{}, false, nil
 	}
 	// A .yml file is an attempt to write a definition that would otherwise be
 	// dropped in full, so it names its own fix rather than warning.
 	if strings.HasSuffix(name, ".yml") {
-		return "", fmt.Errorf("%s: rdk definitions must use the .yaml extension — rename it to %s",
-			name, strings.TrimSuffix(name, ".yml")+".yaml")
+		return diag.Diagnostic{}, false, diag.New(diag.Diagnostic{
+			Code:    diag.CodeWrongExtension,
+			File:    name,
+			Summary: "rdk definitions must use the .yaml extension",
+			Hint:    "rename it to " + strings.TrimSuffix(name, ".yml") + ".yaml",
+		})
 	}
-	if suffix, ok := matchSuffix(name, setAside); ok {
-		return fmt.Sprintf("warning: %s: ignored (%s); rdk generates nothing for it", name, suffix), nil
+	if suffix, matched := matchSuffix(name, setAside); matched {
+		return diag.Diagnostic{
+			Code:    diag.CodeSetAside,
+			File:    name,
+			Summary: fmt.Sprintf("ignored (%s); rdk generates nothing for it", suffix),
+		}, true, nil
 	}
-	if suffix, ok := matchSuffix(name, artifacts); ok {
-		return fmt.Sprintf("warning: %s: ignored (%s leftover); delete it or move it out of the definitions dir", name, suffix), nil
+	if suffix, matched := matchSuffix(name, artifacts); matched {
+		return diag.Diagnostic{
+			Code:    diag.CodeEditorArtifact,
+			File:    name,
+			Summary: fmt.Sprintf("ignored (%s leftover)", suffix),
+			Hint:    "delete it or move it out of the definitions dir",
+		}, true, nil
 	}
-	return "", fmt.Errorf("%s: rdk cannot process this file; the definitions dir takes .yaml definitions only "+
-		"(to park one, suffix it %s; anything else belongs outside the definitions dir)",
-		name, strings.Join(setAside, " or "))
+	return diag.Diagnostic{}, false, diag.New(diag.Diagnostic{
+		Code:    diag.CodeUnprocessableFile,
+		File:    name,
+		Summary: "rdk cannot process this file; the definitions dir takes .yaml definitions only",
+		Hint: fmt.Sprintf("to park one, suffix it %s; anything else belongs outside the definitions dir",
+			strings.Join(setAside, " or ")),
+	})
 }
 
 // matchSuffix reports the first matching suffix, so the warning can name the

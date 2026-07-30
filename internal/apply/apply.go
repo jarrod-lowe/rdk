@@ -5,6 +5,7 @@ package apply
 import (
 	"fmt"
 
+	"github.com/jarrod-lowe/rdk/internal/diag"
 	"github.com/jarrod-lowe/rdk/internal/generate"
 	"github.com/jarrod-lowe/rdk/internal/manifest"
 	"github.com/jarrod-lowe/rdk/internal/parse"
@@ -24,7 +25,7 @@ type Result struct {
 	// Warnings names entries in the definitions dir that were ignored. An
 	// ignored file is a resource that does not get generated, so the CLI
 	// reports these even though the apply succeeded.
-	Warnings []string
+	Warnings []diag.Diagnostic
 }
 
 // Run performs apply against the repo the store is rooted at. Pure generation:

@@ -1,10 +1,12 @@
 package parse
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/jarrod-lowe/rdk/internal/diag"
 	"github.com/jarrod-lowe/rdk/internal/repofs"
 )
 
@@ -61,7 +63,15 @@ func TestUnknownKind(t *testing.T) {
 // already knows them, so there is no reason to make the author go looking.
 func TestUnknownKindListsKnownKinds(t *testing.T) {
 	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: volcano\nname: x\n"}), "rdk")
-	errContains(t, err, "known kinds", "config", "s3-bucket")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	for _, want := range []string{"known kinds", "config", "s3-bucket"} {
+		if !strings.Contains(d.Hint, want) {
+			t.Errorf("hint %q does not mention %q", d.Hint, want)
+		}
+	}
 }
 
 // A near-miss is the common case for an unknown kind, so say the likely fix.
@@ -77,7 +87,15 @@ func TestUnknownField(t *testing.T) {
 
 func TestUnknownFieldListsValidFields(t *testing.T) {
 	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: s3-bucket\nname: x\ndescription: d\ncolour: red\n"}), "rdk")
-	errContains(t, err, "valid fields", "name", "description")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	for _, want := range []string{"valid fields", "name", "description"} {
+		if !strings.Contains(d.Hint, want) {
+			t.Errorf("hint %q does not mention %q", d.Hint, want)
+		}
+	}
 }
 
 func TestUnknownFieldSuggestsNearMatch(t *testing.T) {
@@ -118,7 +136,14 @@ func TestWrongTypeNamesYAMLType(t *testing.T) {
 // exit 0. Extension typos fail loudly like any other malformed definition.
 func TestYmlExtensionRejected(t *testing.T) {
 	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "assets.yml": goodBucket}), "rdk")
-	errContains(t, err, "assets.yml", ".yaml", "assets.yaml")
+	errContains(t, err, "assets.yml", ".yaml")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if !strings.Contains(d.Hint, "assets.yaml") {
+		t.Errorf("hint %q does not name the corrected filename", d.Hint)
+	}
 }
 
 // rdk/ holds definitions and nothing else: a file rdk cannot process is a
@@ -155,8 +180,14 @@ func TestSetAsideFilesWarn(t *testing.T) {
 		if len(defs) != 2 {
 			t.Errorf("%s: got %d definitions, want 2", name, len(defs))
 		}
-		if len(warnings) != 1 || !strings.Contains(warnings[0], name) {
-			t.Errorf("%s: warnings = %v, want one naming the file", name, warnings)
+		if len(warnings) != 1 {
+			t.Fatalf("%s: got %d warnings, want 1", name, len(warnings))
+		}
+		if warnings[0].File != name {
+			t.Errorf("%s: warning names file %q", name, warnings[0].File)
+		}
+		if warnings[0].Code != diag.CodeSetAside {
+			t.Errorf("%s: code = %q, want %q", name, warnings[0].Code, diag.CodeSetAside)
 		}
 	}
 }
@@ -168,8 +199,14 @@ func TestEditorArtifactsWarn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: Dir: %v", name, err)
 		}
-		if len(warnings) != 1 || !strings.Contains(warnings[0], name) {
-			t.Errorf("%s: warnings = %v, want one naming the file", name, warnings)
+		if len(warnings) != 1 {
+			t.Fatalf("%s: got %d warnings, want 1", name, len(warnings))
+		}
+		if warnings[0].File != name {
+			t.Errorf("%s: warning names file %q", name, warnings[0].File)
+		}
+		if warnings[0].Code != diag.CodeEditorArtifact {
+			t.Errorf("%s: code = %q, want %q", name, warnings[0].Code, diag.CodeEditorArtifact)
 		}
 	}
 }
@@ -199,11 +236,18 @@ func TestWarningsAreSorted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dir: %v", err)
 	}
-	if len(warnings) != 3 {
-		t.Fatalf("got %d warnings, want 3: %v", len(warnings), warnings)
+	names := make([]string, len(warnings))
+	for i, w := range warnings {
+		names[i] = w.File
 	}
-	if !sort.SliceIsSorted(warnings, func(i, j int) bool { return warnings[i] < warnings[j] }) {
-		t.Errorf("warnings not sorted: %v", warnings)
+	want := []string{"a.yaml.disabled", "b.yaml.example", "c.yaml.disabled"}
+	if !sort.StringsAreSorted(names) {
+		t.Errorf("warnings are not sorted: %v", names)
+	}
+	for i := range want {
+		if i < len(names) && names[i] != want[i] {
+			t.Errorf("warnings[%d] = %q, want %q", i, names[i], want[i])
+		}
 	}
 }
 
@@ -227,7 +271,14 @@ func TestExactlyOneConfig(t *testing.T) {
 func TestMultiDocumentRejected(t *testing.T) {
 	multi := goodBucket + "---\nkind: s3-bucket\nname: logs\ndescription: Log storage\n"
 	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "multi.yaml": multi}), "rdk")
-	errContains(t, err, "multi.yaml", "one definition per file", "---")
+	errContains(t, err, "multi.yaml", "---")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if !strings.Contains(d.Hint, "one definition per file") {
+		t.Errorf("hint %q does not explain the fix", d.Hint)
+	}
 }
 
 // A leading separator is ordinary YAML style for a single document, not a second one.
@@ -255,4 +306,31 @@ func TestTrailingDocumentSeparatorAccepted(t *testing.T) {
 func TestEmptyRequiredFieldRejected(t *testing.T) {
 	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: s3-bucket\nname: \"\"\ndescription: d\n"}), "rdk")
 	errContains(t, err, "x.yaml", "name", "empty")
+}
+
+// The code is the part a machine can match on, so it has to be set at the
+// point of failure, not reconstructed later.
+func TestErrorsCarryTheirCode(t *testing.T) {
+	cases := []struct {
+		file, body, code string
+	}{
+		{"x.yaml", "kind: volcano\nname: x\n", diag.CodeUnknownKind},
+		{"x.yaml", "kind: s3-bucket\nname: x\ndescription: d\ncolour: red\n", diag.CodeUnknownField},
+		{"x.yaml", "", diag.CodeEmptyFile},
+		{"notes.txt", "scratch\n", diag.CodeUnprocessableFile},
+		{"assets.yml", goodBucket, diag.CodeWrongExtension},
+	}
+	for _, c := range cases {
+		_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, c.file: c.body}), "rdk")
+		var d *diag.Error
+		if !errors.As(err, &d) {
+			t.Fatalf("%s: error is not a diagnostic: %v", c.file, err)
+		}
+		if d.Code != c.code {
+			t.Errorf("%s: code = %q, want %q", c.file, d.Code, c.code)
+		}
+		if d.File != c.file {
+			t.Errorf("%s: file = %q", c.file, d.File)
+		}
+	}
 }
