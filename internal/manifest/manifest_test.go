@@ -86,4 +86,3 @@ func TestStaleAlreadyGoneIsNoop(t *testing.T) {
 		t.Errorf("deletes = %v, want none for already-absent file", plan.Deletes)
 	}
 }
-
