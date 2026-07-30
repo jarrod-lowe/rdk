@@ -23,8 +23,7 @@ type Logger struct {
 	err *slog.Logger // diagnostics
 }
 
-// New builds a logger from resolved options. Writers default to the process
-// streams; Env defaults to the real environment.
+// New builds a logger from resolved options.
 func New(o Options) *Logger {
 	if o.Stdout == nil {
 		o.Stdout = os.Stdout
@@ -47,9 +46,23 @@ func New(o Options) *Logger {
 
 func newHandler(o Options, w io.Writer, mu *sync.Mutex) slog.Handler {
 	if o.Format == FormatJSONL {
-		return slog.NewJSONHandler(w, &slog.HandlerOptions{Level: o.Level, ReplaceAttr: dropTime})
+		return slog.NewJSONHandler(&lockedWriter{mu: mu, w: w}, &slog.HandlerOptions{Level: o.Level, ReplaceAttr: dropTime})
 	}
 	return newTextHandler(w, o.Level, useColor(o.Color, w, o.Env), mu)
+}
+
+// lockedWriter lets the JSON handler share the text handlers' mutex. slog's
+// own handler locks per handler, which would leave the two streams
+// unsynchronised in JSONL mode alone.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // dropTime removes slog's timestamp: nothing consumes it, and its absence keeps
@@ -108,8 +121,17 @@ func emit(l *slog.Logger, level slog.Level, d diag.Diagnostic, cause error) {
 	if cause != nil {
 		attrs = append(attrs, slog.String("cause", cause.Error()))
 	}
+	// The promoted keys are the diagnostic's own. An attr reusing one would
+	// emit a duplicate key in JSONL and, worse, silently replace the file or
+	// inject a hint in text mode — so the diagnostic wins and the attr is
+	// dropped rather than quietly rewriting the record.
 	for _, a := range d.Attrs {
+		if reserved[a.Key] {
+			continue
+		}
 		attrs = append(attrs, slog.Any(a.Key, a.Value()))
 	}
 	l.LogAttrs(ctx, level, d.Summary, attrs...)
 }
+
+var reserved = map[string]bool{"code": true, "file": true, "field": true, "hint": true, "cause": true}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
@@ -167,5 +168,82 @@ func TestFailOnNilDoesNothing(t *testing.T) {
 	l.Fail(nil)
 	if out.Len() != 0 || errBuf.Len() != 0 {
 		t.Errorf("Fail(nil) wrote output: stdout=%q stderr=%q", out.String(), errBuf.String())
+	}
+}
+
+// The shared mutex is the most deliberate decision in this file, and nothing
+// exercised it. Run with -race.
+func TestConcurrentWritesDoNotInterleave(t *testing.T) {
+	for _, f := range []Format{FormatText, FormatJSONL} {
+		l, out, errBuf := newTestLogger(f)
+		var wg sync.WaitGroup
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				l.Result(diag.Diagnostic{Code: diag.CodeVersion, Summary: "a result"})
+				l.Warn(diag.Diagnostic{Code: diag.CodeSetAside, File: "a.yaml", Summary: "a warning"})
+			}()
+		}
+		wg.Wait()
+		for _, line := range strings.Split(strings.TrimSpace(out.String()+errBuf.String()), "\n") {
+			if line == "" {
+				t.Error("blank line in output")
+			}
+		}
+	}
+}
+
+// Nothing pinned Field reaching the record, so deleting its promotion stayed green.
+func TestJSONLCarriesTheField(t *testing.T) {
+	l, _, errBuf := newTestLogger(FormatJSONL)
+	l.Fail(diag.New(diag.Diagnostic{
+		Code: diag.CodeUnknownField, File: "rdk/x.yaml", Field: "colour",
+		Summary: `unknown field "colour"`, Hint: "valid fields: name, description",
+	}))
+	var rec map[string]any
+	if err := json.Unmarshal(errBuf.Bytes(), &rec); err != nil {
+		t.Fatalf("stderr is not JSON: %v", err)
+	}
+	if rec["field"] != "colour" {
+		t.Errorf("field = %v, want colour", rec["field"])
+	}
+	if rec["hint"] != "valid fields: name, description" {
+		t.Errorf("hint = %v", rec["hint"])
+	}
+}
+
+// A warning in JSONL has to be a warning, on stderr, with stdout untouched.
+func TestJSONLWarningGoesToStderrAtWarnLevel(t *testing.T) {
+	l, out, errBuf := newTestLogger(FormatJSONL)
+	l.Warn(diag.Diagnostic{Code: diag.CodeSetAside, File: "a.yaml.disabled", Summary: "ignored"})
+	if out.Len() != 0 {
+		t.Errorf("stdout = %q, want empty", out.String())
+	}
+	var rec map[string]any
+	if err := json.Unmarshal(errBuf.Bytes(), &rec); err != nil {
+		t.Fatalf("stderr is not JSON: %v", err)
+	}
+	if rec["level"] != "WARN" {
+		t.Errorf("level = %v, want WARN", rec["level"])
+	}
+}
+
+// An attr may not quietly rewrite the diagnostic that carries it.
+func TestReservedAttrKeysAreDropped(t *testing.T) {
+	l, _, errBuf := newTestLogger(FormatText)
+	l.Warn(diag.Diagnostic{
+		Code: diag.CodeSetAside, File: "real.yaml", Summary: "ignored",
+		Attrs: []diag.Attr{diag.Str("file", "attr.yaml"), diag.Str("hint", "invented")},
+	})
+	if got, want := errBuf.String(), "warning: real.yaml: ignored\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A caller-built zero Options must not panic; the zero values are the defaults.
+func TestZeroOptionsIsUsable(t *testing.T) {
+	if New(Options{}) == nil {
+		t.Error("New(Options{}) returned nil")
 	}
 }
