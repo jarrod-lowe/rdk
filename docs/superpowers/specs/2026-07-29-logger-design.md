@@ -209,7 +209,7 @@ Initial codes: `invalid-yaml`, `empty-file`, `missing-kind`, `kind-not-string`,
 `empty-kind`, `unknown-kind`, `unknown-field`, `missing-field`,
 `field-not-string`, `empty-field`, `multi-document`, `duplicate-name`,
 `config-cardinality`, `dir-in-defs`, `wrong-extension`, `unprocessable-file`,
-`set-aside`, `artifact`, `read-defs-dir`, `read-file`, `git-init`,
+`set-aside`, `editor-artifact`, `read-defs-dir`, `read-file`, `git-init`,
 `apply-complete`, `init-complete`, `version`, `internal`.
 
 ### Enforcement
