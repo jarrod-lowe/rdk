@@ -48,6 +48,7 @@ func classify(name string) (w diag.Diagnostic, ok bool, err error) {
 			Code:    diag.CodeSetAside,
 			File:    name,
 			Summary: fmt.Sprintf("ignored (%s); rdk generates nothing for it", suffix),
+			Hint:    "rename it to .yaml to enable it",
 		}, true, nil
 	}
 	if suffix, matched := matchSuffix(name, artifacts); matched {

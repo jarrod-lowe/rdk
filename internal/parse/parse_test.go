@@ -2,7 +2,7 @@ package parse
 
 import (
 	"errors"
-	"sort"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -189,24 +189,36 @@ func TestSetAsideFilesWarn(t *testing.T) {
 		if warnings[0].Code != diag.CodeSetAside {
 			t.Errorf("%s: code = %q, want %q", name, warnings[0].Code, diag.CodeSetAside)
 		}
+		if !strings.Contains(warnings[0].Summary, filepath.Ext(name)) {
+			t.Errorf("%s: summary %q does not name the suffix that matched", name, warnings[0].Summary)
+		}
 	}
 }
 
 // A stale .orig may hold work someone still wants; say it is there.
 func TestEditorArtifactsWarn(t *testing.T) {
-	for _, name := range []string{"assets.yaml.orig", "assets.yaml.rej", "assets.yaml.bak", "assets.yaml~"} {
-		_, warnings, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, name: goodBucket}), "rdk")
+	cases := []struct{ name, suffix string }{
+		{"assets.yaml.orig", ".orig"},
+		{"assets.yaml.rej", ".rej"},
+		{"assets.yaml.bak", ".bak"},
+		{"assets.yaml~", "~"},
+	}
+	for _, c := range cases {
+		_, warnings, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, c.name: goodBucket}), "rdk")
 		if err != nil {
-			t.Fatalf("%s: Dir: %v", name, err)
+			t.Fatalf("%s: Dir: %v", c.name, err)
 		}
 		if len(warnings) != 1 {
-			t.Fatalf("%s: got %d warnings, want 1", name, len(warnings))
+			t.Fatalf("%s: got %d warnings, want 1", c.name, len(warnings))
 		}
-		if warnings[0].File != name {
-			t.Errorf("%s: warning names file %q", name, warnings[0].File)
+		if warnings[0].File != c.name {
+			t.Errorf("%s: warning names file %q", c.name, warnings[0].File)
 		}
 		if warnings[0].Code != diag.CodeEditorArtifact {
-			t.Errorf("%s: code = %q, want %q", name, warnings[0].Code, diag.CodeEditorArtifact)
+			t.Errorf("%s: code = %q, want %q", c.name, warnings[0].Code, diag.CodeEditorArtifact)
+		}
+		if !strings.Contains(warnings[0].Summary, c.suffix) {
+			t.Errorf("%s: summary %q does not name the suffix that matched", c.name, warnings[0].Summary)
 		}
 	}
 }
@@ -241,11 +253,11 @@ func TestWarningsAreSorted(t *testing.T) {
 		names[i] = w.File
 	}
 	want := []string{"a.yaml.disabled", "b.yaml.example", "c.yaml.disabled"}
-	if !sort.StringsAreSorted(names) {
-		t.Errorf("warnings are not sorted: %v", names)
+	if len(names) != len(want) {
+		t.Fatalf("got %d warnings, want %d: %v", len(names), len(want), names)
 	}
 	for i := range want {
-		if i < len(names) && names[i] != want[i] {
+		if names[i] != want[i] {
 			t.Errorf("warnings[%d] = %q, want %q", i, names[i], want[i])
 		}
 	}

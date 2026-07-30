@@ -90,8 +90,8 @@ func Dir(store repofs.Store, dir string) ([]Definition, []diag.Diagnostic, error
 		return nil, nil, diag.New(diag.Diagnostic{
 			Code:    diag.CodeConfigCardinality,
 			File:    dir,
-			Summary: fmt.Sprintf("expected exactly one 'kind: config' definition in %s, found %d", dir, configs),
-			Hint:    "every repository has exactly one config definition",
+			Summary: fmt.Sprintf("expected exactly one 'kind: config' definition, found %d", configs),
+			Hint:    "add the missing one, or remove the extras",
 		})
 	}
 	return defs, warnings, nil
@@ -144,7 +144,7 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 			File:    name,
 			Field:   "kind",
 			Summary: "missing 'kind' field",
-			Hint:    "every definition starts with one (e.g. kind: s3-bucket)",
+			Hint:    "add one, e.g. kind: s3-bucket",
 		})
 	}
 	kindVal, isStr := rawKind.(string)
@@ -225,6 +225,7 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 					File:    name,
 					Field:   f.Name,
 					Summary: fmt.Sprintf("required field %q must not be empty", f.Name),
+					Hint:    "give it a value",
 				})
 			}
 		}
