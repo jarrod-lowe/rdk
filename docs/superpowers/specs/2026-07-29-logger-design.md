@@ -161,13 +161,30 @@ Precedence is flag > environment > default.
 |---|---|---|---|
 | `--log-format` | `RDK_LOG_FORMAT` | `text`, `jsonl` | `text` |
 | `--log-level` | `RDK_LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
-| `--color` | — | `auto`, `always`, `never` | `auto` |
+| `--color` | none, deliberately | `auto`, `always`, `never` | `auto` |
 
 `auto` is resolved per stream: the writer is an `*os.File` on a character
-device, `TERM` is not `dumb`, and `NO_COLOR` is unset. Test buffers are not
-files, so tests are colourless without special-casing. `NO_COLOR` is honoured
-because goal.md aims rdk at AI consumers as well as people, and that is the
-conventional signal for "no escape codes".
+device, `TERM` is not `dumb`, and `NO_COLOR` is unset or empty. Test buffers are
+not files, so tests are colourless without special-casing. `NO_COLOR` is
+honoured because goal.md aims rdk at AI consumers as well as people, and that is
+the conventional signal for "no escape codes" — including its rule that the
+variable counts only when non-empty, since `export NO_COLOR=` is how a user
+neutralises an inherited one.
+
+`--color` has no environment variable, and that asymmetry is deliberate (rule
+7). The two jobs such a variable would do are already taken: "off" belongs to
+`NO_COLOR`, a cross-tool standard strictly better than an rdk-specific name, and
+"auto" is the default. That leaves only "force colour on from the environment" —
+which this design refuses anyway, since `NO_COLOR` and `TERM=dumb` overrule an
+explicit `always`. `RDK_LOG_COLOR` would be a variable whose most interesting
+value the code ignores.
+
+A rejected flag or environment value is a `diag.Error` carrying
+`code: invalid-flag`, not a plain error. A plain error would reach the top
+unwrapped, exit 2, and be reported as an rdk bug — which is the wrong story to
+tell someone who mistyped `--log-format`. The message names the environment
+variable when the value came from one, because a stale export and a
+command-line typo are otherwise indistinguishable to the reader.
 
 Because results are Info, `--log-level=warn` is the quiet mode that suppresses
 the summary while keeping warnings, and `--log-level=error` is near-silent.
@@ -210,6 +227,7 @@ Initial codes: `invalid-yaml`, `empty-file`, `missing-kind`, `kind-not-string`,
 `field-not-string`, `empty-field`, `multi-document`, `duplicate-name`,
 `config-cardinality`, `dir-in-defs`, `wrong-extension`, `unprocessable-file`,
 `set-aside`, `editor-artifact`, `read-defs-dir`, `read-file`, `git-init`,
+`invalid-flag`,
 `apply-complete`, `init-complete`, `version`, `internal`.
 
 ### Enforcement
