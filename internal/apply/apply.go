@@ -63,12 +63,14 @@ func Run(store repofs.Store, version string) (Result, error) {
 			})
 		}
 		if errors.Is(err, repofs.ErrPublish) {
-			// rdk-managed/ is absent right now. Saying only "cannot write" at
-			// that moment invites the reader to assume they have lost the tree.
+			// rdk-managed/ is absent right now, which is alarming to look at.
+			// Both trees are still on disk under the scratch, so the honest
+			// reassurance is that nothing is lost — without sending the reader
+			// into rdk's own working directory to verify it.
 			return Result{}, diag.Wrap(err, diag.Diagnostic{
 				Code:    diag.CodePublishFailed,
 				Summary: fmt.Sprintf("built the tree but could not move it into %s/", ManagedDir),
-				Hint:    "the previous tree is safe under " + repofs.ScratchDir + "/old; re-run to restore it",
+				Hint:    "nothing is lost; clear the cause above, then re-run to publish it",
 			})
 		}
 		return Result{}, diag.Wrap(err, diag.Diagnostic{

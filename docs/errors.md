@@ -36,7 +36,7 @@ status on their own — a run that warns and then fails still exits 1.
 | `read-file` | A definition file could not be read. | Check its permissions. |
 | `git-init` | `git init` failed while initialising the repository. | Read the cause; check git is installed. |
 | `write-managed-dir` | The generated tree could not be written or published. | Read the cause; check permissions and free space, then re-run. |
-| `publish-failed` | The generated tree was built but could not be moved into place, so `rdk-managed/` is currently absent. | The previous tree is safe under `.rdk/old`. Read the cause, then re-run — a successful apply restores it. |
+| `publish-failed` | The generated tree was built but could not be moved into place, so `rdk-managed/` is currently absent. | Nothing is lost. Clear the cause, then re-run — a successful apply publishes it. |
 | `scratch-not-removed` | The tree was written correctly, but rdk could not remove its displaced copy under `.rdk/`. | The generated tree is correct. Clear `.rdk/old` — something is holding a file open — then re-run. |
 | `invalid-flag` | A flag, command, or flag value on the command line was not recognised. | Check the message; run `rdk --help` for the accepted commands and flags. |
 
