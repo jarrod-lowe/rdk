@@ -188,7 +188,10 @@ func (s *osStore) Seed(name string, data []byte) error {
 			if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 				return nil // already present (file or symlink) — leave it (DD-3)
 			}
-			return &seedTargetError{err: fmt.Errorf("%s is a %s, not a file", name, modeKind(info.Mode()))}
+			// The path itself isn't repeated here: the caller already has it
+			// (Store.Seed's argument, or diag's File field), so this only
+			// needs to say what's actually occupying it.
+			return &seedTargetError{err: fmt.Errorf("it is a %s", modeKind(info.Mode()))}
 		}
 		return err
 	}

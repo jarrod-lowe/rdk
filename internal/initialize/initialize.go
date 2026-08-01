@@ -72,7 +72,7 @@ func Run(store repofs.Store, dir string) error {
 			return diag.Wrap(err, diag.Diagnostic{
 				Code:    diag.CodeSeedNotAFile,
 				File:    "rdk/config.yaml",
-				Summary: "cannot seed the config: the path exists and is not a file",
+				Summary: "cannot seed the config",
 				Hint:    "remove or rename it, then re-run 'rdk init'",
 			})
 		}
