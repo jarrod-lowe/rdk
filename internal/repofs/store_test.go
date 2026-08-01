@@ -336,6 +336,54 @@ func TestMaterializeReportsAPublishFailureAndSaysWhereThePreviousTreeIs(t *testi
 	}
 }
 
+// The sequence that motivated keeping .rdk/old alive: a first apply
+// publishes, a second run displaces it and then fails at the publish rename
+// — ErrPublish's own scenario, left directly on disk here rather than driven
+// through a live failure — leaving managed absent and .rdk/old holding the
+// only copy. That failure's message promises nothing is lost: clear the
+// cause, then re-run to publish it. A third run (the retry) that fails at
+// the very same step must not have broken that promise. managedDir is still
+// absent, so nothing is going to be renamed onto .rdk/old's name this run;
+// the old unconditional clear would have destroyed the only recovery copy
+// for no gain, moments before failing again with nothing left to recover.
+func TestMaterializeKeepsDisplacedTreeAcrossARepeatedPublishFailure(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	add(t, first, Managed("f.txt"), []byte("old"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+	// Leave the state a failed publish leaves: managed absent, .rdk/old
+	// holding the previous tree.
+	if err := os.Rename(filepath.Join(root, "managed"), filepath.Join(root, ScratchDir, "old")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read-only root: everything inside .rdk (clearing, staging) only needs
+	// .rdk itself to be writable, so it all still succeeds — only creating
+	// the "managed" entry for the publish rename needs a writable root,
+	// which makes the retry fail at that same step again.
+	chmodUnwritable(t, root)
+
+	second := NewFileSet()
+	add(t, second, Managed("fresh.txt"), []byte("new"))
+	err := s.Materialize("managed", second)
+	if !errors.Is(err, ErrPublish) {
+		t.Fatalf("err = %v, want it to wrap ErrPublish", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, ScratchDir, "old", "f.txt"))
+	if err != nil {
+		t.Fatalf(".rdk/old lost the previous tree: %v", err)
+	}
+	if string(got) != "old" {
+		t.Errorf(".rdk/old/f.txt = %q, want the previous %q", got, "old")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "managed")); !os.IsNotExist(statErr) {
+		t.Error("managed should still be absent; nothing was published")
+	}
+}
+
 // os.Root confines symlinks to the repository but follows them inside it, so
 // a symlinked scratch would aim the .gitignore write and the scratch deletes
 // at whatever it points to — the user's own files.

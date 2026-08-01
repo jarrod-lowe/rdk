@@ -188,6 +188,20 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 
+	// Taken once, up front, because the answer drives two independent
+	// decisions below: whether .rdk/old needs to be cleared before staging
+	// even starts, and — using the very same result, not a second Stat —
+	// whether there is a tree to displace once staging succeeds. Its
+	// non-ENOENT error is returned rather than treated as "absent": not
+	// knowing whether there is a tree to displace is its own failure, and
+	// falling through would surface a confusing rename error instead of the
+	// real cause.
+	_, managedStatErr := s.root.Stat(managedDir)
+	managedExists := managedStatErr == nil
+	if managedStatErr != nil && !os.IsNotExist(managedStatErr) {
+		return managedStatErr
+	}
+
 	// Judged before MkdirAll, and by Lstat rather than Stat: MkdirAll succeeds
 	// whenever the path already resolves to a directory, including through a
 	// symlink, and by then the .gitignore write below would already be aimed
@@ -247,15 +261,27 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 
-	// The scratch is never trusted across runs, so both names are cleared
-	// unconditionally. This is what covers a hard kill, where the sweep at the
-	// end never ran at all — and unlike that sweep, it has to succeed, because
-	// the names are needed.
+	// .rdk/new is never trusted across runs, so it is cleared unconditionally.
+	// This is what covers a hard kill, where the sweep at the end never ran at
+	// all — and unlike that sweep, it has to succeed, because the name is
+	// needed a few lines down.
+	//
+	// .rdk/old gets the same treatment only when managedDir exists, i.e. only
+	// when the displacing rename below will actually run and needs the name
+	// free. When managedDir is absent that rename is skipped, so the name is
+	// not needed this run — and clearing it anyway would destroy whatever
+	// tree it holds for no gain. That tree is often the only copy left after
+	// an earlier run failed at the publish rename (ErrPublish): the message
+	// for that failure says the previous tree is safe at .rdk/old and re-
+	// running will fix it, and an unconditional clear here would make that
+	// promise false the moment the retry also fails.
 	if err := s.root.RemoveAll(scratchNew); err != nil {
 		return err
 	}
-	if err := s.root.RemoveAll(scratchOld); err != nil {
-		return err
+	if managedExists {
+		if err := s.root.RemoveAll(scratchOld); err != nil {
+			return err
+		}
 	}
 
 	for _, p := range set.sortedPaths() {
@@ -282,17 +308,12 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// Displace by rename, not RemoveAll: a rename is all-or-nothing, so there
 	// is no half-deleted tree to be mistaken for a healthy one on the next run.
 	// It also works on Windows, where renaming onto an existing directory does
-	// not.
-	switch _, err := s.root.Stat(managedDir); {
-	case err == nil:
+	// not. managedExists is the Stat taken up front, not a fresh one: nothing
+	// between there and here can have changed it.
+	if managedExists {
 		if err := s.root.Rename(managedDir, scratchOld); err != nil {
 			return err
 		}
-	case !os.IsNotExist(err):
-		// Not knowing whether there is a tree to displace is its own failure.
-		// Falling through would surface a confusing rename error instead of
-		// the real cause.
-		return err
 	}
 	if err := s.root.Rename(scratchNew, managedDir); err != nil {
 		// managedDir is absent right now; the caller has to say the previous
