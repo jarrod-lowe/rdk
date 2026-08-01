@@ -13,6 +13,7 @@ func (a *app) applyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply",
 		Short: "Regenerate all rdk-managed files from the definitions in rdk/",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			wd, err := os.Getwd()
 			if err != nil {

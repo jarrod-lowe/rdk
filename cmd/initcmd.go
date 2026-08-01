@@ -13,6 +13,7 @@ func (a *app) initCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
 		Short: "Initialise this directory as an rdk repository",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			wd, err := os.Getwd()
 			if err != nil {

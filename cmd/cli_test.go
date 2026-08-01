@@ -212,6 +212,20 @@ func TestExitCodes(t *testing.T) {
 	}
 }
 
+// Silently acting on a different directory than the one named is the failure
+// this guards: it used to succeed, exit 0, and initialise the wrong place.
+func TestCommandsRejectPositionalArguments(t *testing.T) {
+	for _, args := range [][]string{{"init", "/some/path"}, {"version", "extra"}, {"apply", "x"}} {
+		var out, errOut bytes.Buffer
+		if got := execute(args, &out, &errOut); got != 1 {
+			t.Errorf("%v: exit = %d, want 1", args, got)
+		}
+		if out.Len() != 0 {
+			t.Errorf("%v: stdout = %q, want empty", args, out.String())
+		}
+	}
+}
+
 // The fallback logger is built after cobra has already failed, so it is the
 // one most likely to be constructed without the injected writers — and a
 // diagnostic written to the real stderr is one no caller can act on.
