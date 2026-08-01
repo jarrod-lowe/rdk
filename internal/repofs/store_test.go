@@ -58,21 +58,91 @@ func TestMaterializeReplacesPriorContent(t *testing.T) {
 	}
 }
 
-func TestMaterializeRecoversInterruptedSwap(t *testing.T) {
+// Scratch lives inside an rdk-owned directory that ignores itself, so git
+// never sees it and the user's root .gitignore is never touched (DD-14).
+func TestMaterializeWritesTheScratchGitignore(t *testing.T) {
 	s, root := newTestStore(t)
 	set := NewFileSet()
 	set.Bytes("f.txt", []byte("x"))
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(filepath.Join(root, "managed"), filepath.Join(root, "managed.staging")); err != nil {
+	got, err := os.ReadFile(filepath.Join(root, ScratchDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("scratch .gitignore missing: %v", err)
+	}
+	if string(got) != "*\n" {
+		t.Errorf("scratch .gitignore = %q, want %q", got, "*\n")
+	}
+}
+
+// It is rdk's file, so a deleted one comes back (rule 13: always write).
+func TestMaterializeRestoresADeletedScratchGitignore(t *testing.T) {
+	s, root := newTestStore(t)
+	set := NewFileSet()
+	set.Bytes("f.txt", []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, ScratchDir, ".gitignore")); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Materialize("managed", set); err != nil {
-		t.Fatalf("recovery materialize: %v", err)
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "managed", "f.txt")); err != nil {
-		t.Errorf("managed not restored: %v", err)
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, ".gitignore")); err != nil {
+		t.Errorf("not restored: %v", err)
+	}
+}
+
+// The state a crash between displacing and publishing leaves behind. There is
+// no recovery step any more: the next run simply regenerates, which is
+// byte-identical because generation is a pure function (rule 1).
+func TestMaterializePublishesAfterAnInterruptedSwap(t *testing.T) {
+	s, root := newTestStore(t)
+	set := NewFileSet()
+	set.Bytes("f.txt", []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	// Leave the crash state directly: managed absent, old holding the tree.
+	if err := os.Rename(filepath.Join(root, "managed"), filepath.Join(root, ScratchDir, "old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatalf("materialize after interrupted swap: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "managed", "f.txt"))
+	if err != nil {
+		t.Fatalf("managed not published: %v", err)
+	}
+	if string(got) != "x" {
+		t.Errorf("managed/f.txt = %q, want %q", got, "x")
+	}
+}
+
+// Nothing may survive in the published tree that the FileSet did not describe,
+// and the displaced copy must not linger.
+func TestMaterializeLeavesNoScratchBehind(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	first.Bytes("stale.txt", []byte("old"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+	second := NewFileSet()
+	second.Bytes("fresh.txt", []byte("new"))
+	if err := s.Materialize("managed", second); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{
+		filepath.Join(ScratchDir, "old"),
+		filepath.Join(ScratchDir, "new"),
+		filepath.Join("managed", "stale.txt"),
+	} {
+		if _, err := os.Stat(filepath.Join(root, rel)); !os.IsNotExist(err) {
+			t.Errorf("%s still present", rel)
+		}
 	}
 }
 
