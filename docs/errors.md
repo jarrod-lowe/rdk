@@ -35,6 +35,7 @@ status on their own — a run that warns and then fails still exits 1.
 | `read-defs-dir` | The definitions directory could not be read. | Check it exists and is readable; run `rdk init` if not. |
 | `read-file` | A definition file could not be read. | Check its permissions. |
 | `git-init` | `git init` failed while initialising the repository. | Read the cause; check git is installed. |
+| `git-unusable` | `git init` reported success but git still cannot use the directory — most often "detected dubious ownership". | Read the cause; git names the command to run, then re-run `rdk init`. |
 | `write-managed-dir` | The generated tree could not be written or published. | Read the cause; check permissions and free space, then re-run. |
 | `publish-failed` | The generated tree was built but could not be moved into place, so `rdk-managed/` is currently absent. | Nothing is lost. Clear the cause, then re-run — a successful apply publishes it. |
 | `scratch-not-removed` | The tree was written correctly, but rdk could not remove its displaced copy under `.rdk/`. | The generated tree is correct. Clear `.rdk/old` — something is holding a file open — then re-run. |

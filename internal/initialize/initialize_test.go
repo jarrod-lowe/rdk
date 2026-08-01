@@ -100,6 +100,50 @@ func TestGitInitFailureCarriesGitsOutput(t *testing.T) {
 	}
 }
 
+// The dubious-ownership shape: rev-parse always fails (safe.directory
+// rejects the repo), but git documents that init on an existing repository
+// is safe, so init succeeds regardless. Without a recheck, rdk would seed the
+// config and report the repo ready while every later git command still
+// fails.
+func TestGitInitSucceedsButRepoStaysUnusable(t *testing.T) {
+	stub := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = rev-parse ]; then\n" +
+		"  echo 'fatal: detected dubious ownership in repository' >&2\n" +
+		"  echo 'hint: git config --global --add safe.directory /repo' >&2\n" +
+		"  exit 128\n" +
+		"fi\n" +
+		"if [ \"$1\" = init ]; then\n" +
+		"  echo 'Reinitialized existing Git repository'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(stub, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stub)
+
+	dir := t.TempDir()
+	store, err := repofs.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Run(store, dir)
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeGitUnusable {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeGitUnusable)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
+	}
+	if !strings.Contains(d.Error(), "dubious ownership") || !strings.Contains(d.Error(), "safe.directory") {
+		t.Errorf("error does not carry git's explanation: %q", d.Error())
+	}
+}
+
 // A .git that git cannot use was indistinguishable from a healthy one by
 // stat, so rdk seeded the config and reported success on a broken repo.
 func TestMalformedGitIsNotTreatedAsARepository(t *testing.T) {

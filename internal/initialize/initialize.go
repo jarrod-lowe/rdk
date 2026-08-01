@@ -20,6 +20,21 @@ import (
 //go:embed seed/config.yaml
 var seedConfig string
 
+// repoToplevel runs `git rev-parse --show-toplevel` and hands back git's raw
+// combined output alongside the result. isRepoRoot only ever needs the bool,
+// but the caller that must explain a directory git still can't use after
+// `git init` needs git's own words: git names the actionable fix (e.g. the
+// safe.directory command to run), and a bare bool would throw that away.
+func repoToplevel(dir string) (top string, out []byte, err error) {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = dir
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		return "", out, err
+	}
+	return strings.TrimSpace(string(out)), out, nil
+}
+
 // isRepoRoot asks git whether dir is itself the root of a working
 // repository, rather than inspecting the .git path directly: a worktree's
 // .git is a file, not a directory, and one that is malformed or unreadable
@@ -27,13 +42,11 @@ var seedConfig string
 // authority on what git can use. Comparing the toplevel keeps the existing
 // behaviour that a subdirectory of a repo still gets its own.
 func isRepoRoot(dir string) bool {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	top, _, err := repoToplevel(dir)
 	if err != nil {
 		return false
 	}
-	top, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	topReal, err := filepath.EvalSymlinks(top)
 	if err != nil {
 		return false
 	}
@@ -41,7 +54,7 @@ func isRepoRoot(dir string) bool {
 	if err != nil {
 		return false
 	}
-	return top == want
+	return topReal == want
 }
 
 // Run initialises dir as an rdk repository. The store must be rooted at dir.
@@ -63,6 +76,36 @@ func Run(store repofs.Store, dir string) error {
 				Code:    diag.CodeGitInit,
 				Summary: "git init failed",
 				Hint:    "check that git is installed and the directory is writable",
+				Attrs:   []diag.Attr{diag.Str("dir", dir)},
+			})
+		}
+		// git documents that running `git init` in an existing repository is
+		// safe — it just reinitializes it — so exit 0 here proves only that the
+		// git binary ran, not that git can actually use the directory. The
+		// common way that gap opens up is safe.directory: it rejects a repo
+		// owned by someone else with "detected dubious ownership" even though
+		// `git init` itself still exits 0. Prove usability instead of assuming
+		// it, or rdk seeds the config and reports the repo ready while every
+		// later git command keeps failing.
+		if !isRepoRoot(dir) {
+			_, out, err := repoToplevel(dir)
+			if err == nil {
+				// isRepoRoot can only be false here for a toplevel mismatch, not
+				// a rev-parse failure — repoToplevel just said as much.
+				err = fmt.Errorf("git toplevel for %s does not match it", dir)
+			}
+			// Same one-line folding as the git-init failure above, for the same
+			// reason: git's explanation is the actionable part — it names the
+			// exact `git config --global --add safe.directory …` to run — but it
+			// spans several lines, some starting "hint:", which would otherwise
+			// land flush-left and read as rdk's own output.
+			if detail := strings.Join(strings.Fields(string(out)), " "); detail != "" {
+				err = fmt.Errorf("%w: %s", err, detail)
+			}
+			return diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeGitUnusable,
+				Summary: "git init reported success, but the directory is still not a usable git repository",
+				Hint:    "read the cause; git names the command to run, then re-run 'rdk init'",
 				Attrs:   []diag.Attr{diag.Str("dir", dir)},
 			})
 		}
