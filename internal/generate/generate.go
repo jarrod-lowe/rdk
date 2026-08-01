@@ -23,13 +23,15 @@ var readme string
 // Build produces the managed file set for the given definitions.
 func Build(defs []parse.Definition) (*repofs.FileSet, error) {
 	set := repofs.NewFileSet()
-	set.Bytes("README.md", []byte(readme))
+	if err := set.Bytes(repofs.Managed("README.md"), []byte(readme)); err != nil {
+		return nil, err
+	}
 
 	doc, err := tfDoc(defs)
 	if err != nil {
 		return nil, err
 	}
-	if err := set.JSON("terraform/main.tf.json", doc); err != nil {
+	if err := set.JSON(repofs.Managed("terraform/main.tf.json"), doc); err != nil {
 		return nil, err
 	}
 
@@ -84,7 +86,6 @@ func vendorModule(name string, fsys fs.FS, set *repofs.FileSet) error {
 		if err != nil {
 			return err
 		}
-		set.Bytes(path.Join("terraform/modules", name, p), content)
-		return nil
+		return set.Bytes(repofs.Managed(path.Join("terraform/modules", name, p)), content)
 	})
 }

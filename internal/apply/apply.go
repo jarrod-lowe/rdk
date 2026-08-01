@@ -46,7 +46,7 @@ func Run(store repofs.Store, version string) (Result, error) {
 	// empty (non-nil) map, serializing as {}. No prev read / reconcile needed
 	// until outside files land (DD-14 machinery kept in manifest, unwired).
 	m := manifest.Manifest{RdkVersion: version, OutsideFiles: map[string]string{}}
-	if err := set.JSON("manifest.json", m); err != nil {
+	if err := set.JSON(repofs.Managed("manifest.json"), m); err != nil {
 		return Result{}, err
 	}
 

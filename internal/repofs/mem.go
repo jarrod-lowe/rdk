@@ -24,6 +24,11 @@ func NewMem() *Mem { return &Mem{files: map[string][]byte{}} }
 func (m *Mem) Files() map[string][]byte { return m.files }
 
 func (m *Mem) Materialize(managedDir string, set *FileSet) error {
+	// Mem must reject exactly what osStore rejects, or a component test could
+	// pass against the fake while misrepresenting what production does.
+	if err := set.checkNoOutsideEntries(); err != nil {
+		return err
+	}
 	prefix := managedDir + "/"
 	for p := range m.files {
 		if strings.HasPrefix(p, prefix) {
@@ -31,7 +36,7 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 		}
 	}
 	for _, p := range set.sortedPaths() {
-		m.files[path.Join(managedDir, p)] = append([]byte(nil), set.content[p]...)
+		m.files[path.Join(managedDir, p)] = append([]byte(nil), set.managedBytes(p)...)
 	}
 	return nil
 }

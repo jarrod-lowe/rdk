@@ -18,12 +18,12 @@ func TestMemReadDirMissingErrors(t *testing.T) {
 func TestMemMaterializeAndReplace(t *testing.T) {
 	m := NewMem()
 	first := NewFileSet()
-	first.Bytes("stale.txt", []byte("old"))
+	first.Bytes(Managed("stale.txt"), []byte("old"))
 	if err := m.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
 	second := NewFileSet()
-	second.Bytes("fresh.txt", []byte("new"))
+	second.Bytes(Managed("fresh.txt"), []byte("new"))
 	if err := m.Materialize("managed", second); err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +32,25 @@ func TestMemMaterializeAndReplace(t *testing.T) {
 	}
 	if string(m.Files()["managed/fresh.txt"]) != "new" {
 		t.Error("fresh entry missing")
+	}
+}
+
+// The fake must reject what the real store rejects, or every test using it
+// misrepresents production.
+func TestMemMaterializeRejectsAnOutsideEntry(t *testing.T) {
+	m := NewMem()
+	set := NewFileSet()
+	if err := set.Bytes(Managed("f.txt"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := set.Bytes(AtRepoRoot(".github/workflows/ci.yml"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Materialize("managed", set); err == nil {
+		t.Fatal("want an error for an outside entry")
+	}
+	if _, ok := m.Files()["managed/f.txt"]; ok {
+		t.Error("wrote a partial tree before rejecting")
 	}
 }
 

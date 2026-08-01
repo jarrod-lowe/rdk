@@ -181,6 +181,13 @@ func (s *osStore) checkPathComponents(p string) error {
 }
 
 func (s *osStore) Materialize(managedDir string, set *FileSet) error {
+	// Checked before any work: the store owns security, so it re-checks what
+	// FileSet already checked on add rather than trusting the caller passed a
+	// set that was never tampered with in between.
+	if err := set.checkNoOutsideEntries(); err != nil {
+		return err
+	}
+
 	// Judged before MkdirAll, and by Lstat rather than Stat: MkdirAll succeeds
 	// whenever the path already resolves to a directory, including through a
 	// symlink, and by then the .gitignore write below would already be aimed
@@ -256,7 +263,7 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		if err := s.root.MkdirAll(path.Dir(full), 0o755); err != nil {
 			return err
 		}
-		if err := s.root.WriteFile(full, set.content[p], 0o644); err != nil {
+		if err := s.root.WriteFile(full, set.managedBytes(p), 0o644); err != nil {
 			return err
 		}
 	}

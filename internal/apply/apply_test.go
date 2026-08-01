@@ -33,6 +33,17 @@ func setupRepo(t *testing.T) (repofs.Store, string) {
 	return s, root
 }
 
+// repofs cannot import apply (apply already imports repofs) to see
+// ManagedDir, so repofs.AtRepoRoot's guard against colliding with the managed
+// dir duplicates the name as an unexported constant. This is the one place
+// that can see both, so it is the one place that can catch drift between them.
+func TestRepofsManagedDirNameMatchesApplyManagedDir(t *testing.T) {
+	set := repofs.NewFileSet()
+	if err := set.Bytes(repofs.AtRepoRoot(ManagedDir+"/x.txt"), []byte("x")); err == nil {
+		t.Errorf("repofs.AtRepoRoot did not reject a path inside %q; its managedDirName constant has drifted from apply.ManagedDir", ManagedDir)
+	}
+}
+
 func TestRunMaterializesManagedTree(t *testing.T) {
 	store, root := setupRepo(t)
 	res, err := Run(store, "test-version")

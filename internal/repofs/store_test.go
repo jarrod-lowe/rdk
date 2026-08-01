@@ -20,8 +20,8 @@ func newTestStore(t *testing.T) (Store, string) {
 func TestMaterializeWritesTreeWithDirs(t *testing.T) {
 	s, root := newTestStore(t)
 	set := NewFileSet()
-	set.Bytes("a.txt", []byte("a"))
-	set.Bytes("sub/b.txt", []byte("b"))
+	set.Bytes(Managed("a.txt"), []byte("a"))
+	set.Bytes(Managed("sub/b.txt"), []byte("b"))
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
@@ -39,12 +39,12 @@ func TestMaterializeWritesTreeWithDirs(t *testing.T) {
 func TestMaterializeReplacesPriorContent(t *testing.T) {
 	s, root := newTestStore(t)
 	first := NewFileSet()
-	first.Bytes("stale.txt", []byte("old"))
+	first.Bytes(Managed("stale.txt"), []byte("old"))
 	if err := s.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
 	second := NewFileSet()
-	second.Bytes("fresh.txt", []byte("new"))
+	second.Bytes(Managed("fresh.txt"), []byte("new"))
 	if err := s.Materialize("managed", second); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestMaterializeReplacesPriorContent(t *testing.T) {
 func TestMaterializeWritesTheScratchGitignore(t *testing.T) {
 	s, root := newTestStore(t)
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestMaterializeWritesTheScratchGitignore(t *testing.T) {
 func TestMaterializeRestoresADeletedScratchGitignore(t *testing.T) {
 	s, root := newTestStore(t)
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestMaterializeRestoresADeletedScratchGitignore(t *testing.T) {
 func TestMaterializePublishesAfterAnInterruptedSwap(t *testing.T) {
 	s, root := newTestStore(t)
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
@@ -127,12 +127,12 @@ func TestMaterializePublishesAfterAnInterruptedSwap(t *testing.T) {
 func TestMaterializeLeavesNoScratchBehind(t *testing.T) {
 	s, root := newTestStore(t)
 	first := NewFileSet()
-	first.Bytes("stale.txt", []byte("old"))
+	first.Bytes(Managed("stale.txt"), []byte("old"))
 	if err := s.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
 	second := NewFileSet()
-	second.Bytes("fresh.txt", []byte("new"))
+	second.Bytes(Managed("fresh.txt"), []byte("new"))
 	if err := s.Materialize("managed", second); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestMaterializeReportsAnUnreadableManagedDir(t *testing.T) {
 	}
 	s, root := newTestStore(t)
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func chmodUnwritable(t *testing.T, dir string) {
 func TestMaterializeReportsASweepFailureAndKeepsTheTree(t *testing.T) {
 	s, root := newTestStore(t)
 	first := NewFileSet()
-	first.Bytes("sub/f.txt", []byte("old"))
+	first.Bytes(Managed("sub/f.txt"), []byte("old"))
 	if err := s.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestMaterializeReportsASweepFailureAndKeepsTheTree(t *testing.T) {
 	t.Cleanup(func() { os.Chmod(filepath.Join(root, ScratchDir, "old", "sub"), 0o700) })
 
 	second := NewFileSet()
-	second.Bytes("fresh.txt", []byte("new"))
+	second.Bytes(Managed("fresh.txt"), []byte("new"))
 	err := s.Materialize("managed", second)
 	if !errors.Is(err, ErrSweep) {
 		t.Fatalf("err = %v, want it to wrap ErrSweep", err)
@@ -231,7 +231,7 @@ func TestMaterializeReportsASweepFailureAndKeepsTheTree(t *testing.T) {
 func TestMaterializeLeavesTheTreeIntactWhenScratchCannotBeCleared(t *testing.T) {
 	s, root := newTestStore(t)
 	first := NewFileSet()
-	first.Bytes("f.txt", []byte("old"))
+	first.Bytes(Managed("f.txt"), []byte("old"))
 	if err := s.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestMaterializeLeavesTheTreeIntactWhenScratchCannotBeCleared(t *testing.T) 
 	chmodUnwritable(t, oldDir)
 
 	second := NewFileSet()
-	second.Bytes("fresh.txt", []byte("new"))
+	second.Bytes(Managed("fresh.txt"), []byte("new"))
 	if err := s.Materialize("managed", second); err == nil {
 		t.Fatal("want an error when the scratch cannot be cleared")
 	} else if errors.Is(err, ErrSweep) {
@@ -266,7 +266,7 @@ func TestMaterializeLeavesTheTreeIntactWhenScratchCannotBeCleared(t *testing.T) 
 func TestMaterializeLeavesTheTreeIntactWhenItCannotBeDisplaced(t *testing.T) {
 	s, root := newTestStore(t)
 	first := NewFileSet()
-	first.Bytes("f.txt", []byte("old"))
+	first.Bytes(Managed("f.txt"), []byte("old"))
 	if err := s.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestMaterializeLeavesTheTreeIntactWhenItCannotBeDisplaced(t *testing.T) {
 	chmodUnwritable(t, root)
 
 	second := NewFileSet()
-	second.Bytes("fresh.txt", []byte("new"))
+	second.Bytes(Managed("fresh.txt"), []byte("new"))
 	err := s.Materialize("managed", second)
 	if err == nil {
 		t.Fatal("want an error when the tree cannot be displaced")
@@ -298,7 +298,7 @@ func TestMaterializeLeavesTheTreeIntactWhenItCannotBeDisplaced(t *testing.T) {
 func TestMaterializeReportsAPublishFailureAndSaysWhereThePreviousTreeIs(t *testing.T) {
 	s, root := newTestStore(t)
 	first := NewFileSet()
-	first.Bytes("f.txt", []byte("old"))
+	first.Bytes(Managed("f.txt"), []byte("old"))
 	if err := s.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestMaterializeReportsAPublishFailureAndSaysWhereThePreviousTreeIs(t *testi
 	chmodUnwritable(t, root)
 
 	second := NewFileSet()
-	second.Bytes("fresh.txt", []byte("new"))
+	second.Bytes(Managed("fresh.txt"), []byte("new"))
 	err := s.Materialize("managed", second)
 	if err == nil {
 		t.Fatal("want an error when the tree cannot be published")
@@ -339,7 +339,7 @@ func TestMaterializeRefusesASymlinkedScratch(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	if err := s.Materialize("managed", set); !errors.Is(err, ErrScratchTarget) {
 		t.Fatalf("err = %v, want it to wrap ErrScratchTarget", err)
 	}
@@ -359,7 +359,7 @@ func TestMaterializeRefusesAFileWhereScratchBelongs(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	if err := s.Materialize("managed", set); !errors.Is(err, ErrScratchTarget) {
 		t.Fatalf("err = %v, want it to wrap ErrScratchTarget", err)
 	}
@@ -383,7 +383,7 @@ func TestMaterializeDoesNotFollowASymlinkedScratchGitignore(t *testing.T) {
 	}
 
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
@@ -558,13 +558,33 @@ func TestMaterializeRefusesASymlinkedManagedDirParent(t *testing.T) {
 	}
 
 	set := NewFileSet()
-	set.Bytes("f.txt", []byte("x"))
+	set.Bytes(Managed("f.txt"), []byte("x"))
 	err := s.Materialize("sub/managed", set)
 	if !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("err = %v, want it to wrap ErrUnsafePath", err)
 	}
 	if _, statErr := os.Lstat(filepath.Join(root, "docs", "managed")); statErr == nil {
 		t.Error("Materialize wrote through the symlinked parent into docs/managed")
+	}
+}
+
+// The store owns security: a set that somehow carries a bad entry must not be
+// written, whatever the FileSet already checked.
+func TestMaterializeRejectsAnOutsideEntry(t *testing.T) {
+	s, root := newTestStore(t)
+	set := NewFileSet()
+	if err := set.Bytes(Managed("f.txt"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := set.Bytes(AtRepoRoot(".github/workflows/ci.yml"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Materialize("managed", set); err == nil {
+		t.Fatal("want an error for an outside entry")
+	}
+	// Nothing partial: the managed tree must not appear either.
+	if _, err := os.Stat(filepath.Join(root, "managed")); !os.IsNotExist(err) {
+		t.Error("wrote a partial tree before rejecting")
 	}
 }
 
