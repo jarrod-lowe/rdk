@@ -62,6 +62,15 @@ func Run(store repofs.Store, version string) (Result, error) {
 				Hint: "the generated tree is correct; clear " + repofs.ScratchDir + "/old, then re-run",
 			})
 		}
+		if errors.Is(err, repofs.ErrPublish) {
+			// rdk-managed/ is absent right now. Saying only "cannot write" at
+			// that moment invites the reader to assume they have lost the tree.
+			return Result{}, diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodePublishFailed,
+				Summary: fmt.Sprintf("built the tree but could not move it into %s/", ManagedDir),
+				Hint:    "the previous tree is safe under " + repofs.ScratchDir + "/old; re-run to restore it",
+			})
+		}
 		return Result{}, diag.Wrap(err, diag.Diagnostic{
 			Code:    diag.CodeWriteManagedDir,
 			Summary: fmt.Sprintf("cannot write %s/", ManagedDir),

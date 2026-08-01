@@ -292,6 +292,40 @@ func TestMaterializeLeavesTheTreeIntactWhenItCannotBeDisplaced(t *testing.T) {
 	}
 }
 
+// managedDir absent is the alarming case: the reader looks and their tree
+// seems to be gone. The message has to say the previous tree is safe and
+// where.
+func TestMaterializeReportsAPublishFailureAndSaysWhereThePreviousTreeIs(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	first.Bytes("f.txt", []byte("old"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+	// Remove managedDir outright (not via rename) so the next Materialize finds
+	// nothing to displace and step 4 is skipped — step 5, the publish rename,
+	// is then the only remaining step that can fail.
+	if err := os.RemoveAll(filepath.Join(root, "managed")); err != nil {
+		t.Fatal(err)
+	}
+	// Read-only root: creating the "managed" entry for the publish rename needs
+	// a writable root, same as the displace rename in the test above.
+	chmodUnwritable(t, root)
+
+	second := NewFileSet()
+	second.Bytes("fresh.txt", []byte("new"))
+	err := s.Materialize("managed", second)
+	if err == nil {
+		t.Fatal("want an error when the tree cannot be published")
+	}
+	if !errors.Is(err, ErrPublish) {
+		t.Fatalf("err = %v, want it to wrap ErrPublish", err)
+	}
+	if errors.Is(err, ErrSweep) {
+		t.Errorf("reported as a sweep failure, but nothing was published: %v", err)
+	}
+}
+
 func TestSeedCreatesOnceAndDoesNotOverwrite(t *testing.T) {
 	s, root := newTestStore(t)
 	if err := s.Seed("rdk/config.yaml", []byte("first")); err != nil {

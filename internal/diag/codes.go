@@ -27,6 +27,7 @@ const (
 	CodeReadFile          = "read-file"
 	CodeGitInit           = "git-init"
 	CodeWriteManagedDir   = "write-managed-dir"
+	CodePublishFailed     = "publish-failed"
 	CodeScratchNotRemoved = "scratch-not-removed"
 	CodeApplyComplete     = "apply-complete"
 	CodeInitComplete      = "init-complete"
@@ -45,7 +46,7 @@ var all = []string{
 	CodeConfigCardinality, CodeDirInDefs, CodeWrongExtension,
 	CodeUnprocessableFile, CodeSetAside, CodeEditorArtifact, CodeMachineFile,
 	CodeReadDefsDir,
-	CodeReadFile, CodeGitInit, CodeWriteManagedDir, CodeScratchNotRemoved,
-	CodeApplyComplete, CodeInitComplete,
+	CodeReadFile, CodeGitInit, CodeWriteManagedDir, CodePublishFailed,
+	CodeScratchNotRemoved, CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal, CodeInvalidFlag,
 }

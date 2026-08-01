@@ -37,6 +37,19 @@ func (e *sweepError) Error() string        { return e.err.Error() }
 func (e *sweepError) Unwrap() error        { return e.err }
 func (e *sweepError) Is(target error) bool { return target == ErrSweep }
 
+// ErrPublish reports that the tree could not be moved into place. The managed
+// dir is absent when this happens, which is alarming to look at, so the caller
+// has to say where the previous tree went and that re-running fixes it.
+var ErrPublish = errors.New("tree not published")
+
+// publishError marks a failure of the publishing rename without contributing
+// to the message, for the same reason as sweepError.
+type publishError struct{ err error }
+
+func (e *publishError) Error() string        { return e.err.Error() }
+func (e *publishError) Unwrap() error        { return e.err }
+func (e *publishError) Is(target error) bool { return target == ErrPublish }
+
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
 type Store interface {
@@ -124,7 +137,10 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 	if err := s.root.Rename(scratchNew, managedDir); err != nil {
-		return err
+		// managedDir is absent right now; the caller has to say the previous
+		// tree is safe at scratchOld rather than let the reader assume it is
+		// gone.
+		return &publishError{err: err}
 	}
 
 	// Past this point the tree on disk is correct, so the caller must say so
