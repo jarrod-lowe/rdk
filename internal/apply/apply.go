@@ -51,6 +51,18 @@ func Run(store repofs.Store, version string) (Result, error) {
 	}
 
 	if err := store.Materialize(ManagedDir, set); err != nil {
+		if errors.Is(err, repofs.ErrScratchTarget) {
+			// The generic write-managed-dir hint ("check permissions and free
+			// space") would send the reader nowhere useful here: the fix is
+			// not a permission or disk problem, it's a specific path that has
+			// to be removed. Naming it is the whole point of a separate code.
+			return Result{}, diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeScratchTarget,
+				File:    repofs.ScratchDir,
+				Summary: "cannot use it as rdk's scratch space",
+				Hint:    "remove " + repofs.ScratchDir + ", then re-run",
+			})
+		}
 		if errors.Is(err, repofs.ErrSweep) {
 			// The tree is already correct here, so the summary leads with that.
 			// Swallowing this would only move the problem: the same locked file

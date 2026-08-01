@@ -29,6 +29,7 @@ const (
 	CodeWriteManagedDir   = "write-managed-dir"
 	CodePublishFailed     = "publish-failed"
 	CodeScratchNotRemoved = "scratch-not-removed"
+	CodeScratchTarget     = "scratch-target"
 	CodeSeedNotAFile      = "seed-not-a-file"
 	CodeSeedFailed        = "seed-failed"
 	CodeApplyComplete     = "apply-complete"
@@ -49,7 +50,7 @@ var all = []string{
 	CodeUnprocessableFile, CodeSetAside, CodeEditorArtifact, CodeMachineFile,
 	CodeReadDefsDir,
 	CodeReadFile, CodeGitInit, CodeWriteManagedDir, CodePublishFailed,
-	CodeScratchNotRemoved, CodeSeedNotAFile, CodeSeedFailed,
+	CodeScratchNotRemoved, CodeScratchTarget, CodeSeedNotAFile, CodeSeedFailed,
 	CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal, CodeInvalidFlag,
 }

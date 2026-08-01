@@ -326,6 +326,45 @@ func TestMaterializeReportsAPublishFailureAndSaysWhereThePreviousTreeIs(t *testi
 	}
 }
 
+// os.Root confines symlinks to the repository but follows them inside it, so
+// a symlinked scratch would aim the .gitignore write and the scratch deletes
+// at whatever it points to — the user's own files.
+func TestMaterializeRefusesASymlinkedScratch(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.Symlink(".", filepath.Join(root, ScratchDir)); err != nil {
+		t.Fatal(err)
+	}
+	guard := filepath.Join(root, ".gitignore")
+	if err := os.WriteFile(guard, []byte("theirs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set := NewFileSet()
+	set.Bytes("f.txt", []byte("x"))
+	if err := s.Materialize("managed", set); !errors.Is(err, ErrScratchTarget) {
+		t.Fatalf("err = %v, want it to wrap ErrScratchTarget", err)
+	}
+	got, err := os.ReadFile(guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "theirs\n" {
+		t.Errorf("the user's .gitignore was overwritten: %q", got)
+	}
+}
+
+// A file where the scratch belongs is the same problem in a plainer form.
+func TestMaterializeRefusesAFileWhereScratchBelongs(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.WriteFile(filepath.Join(root, ScratchDir), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set := NewFileSet()
+	set.Bytes("f.txt", []byte("x"))
+	if err := s.Materialize("managed", set); !errors.Is(err, ErrScratchTarget) {
+		t.Fatalf("err = %v, want it to wrap ErrScratchTarget", err)
+	}
+}
+
 func TestSeedCreatesOnceAndDoesNotOverwrite(t *testing.T) {
 	s, root := newTestStore(t)
 	if err := s.Seed("rdk/config.yaml", []byte("first")); err != nil {

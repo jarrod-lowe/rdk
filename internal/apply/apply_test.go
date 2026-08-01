@@ -128,6 +128,34 @@ func TestSweepFailureSaysTheApplySucceeded(t *testing.T) {
 	}
 }
 
+// A .rdk symlinked to the repo root would otherwise send the scratch
+// .gitignore write and the scratch deletes onto the user's own files (the bug
+// this diagnostic exists to report), so the message has to name .rdk and say
+// to remove it — a bare "cannot write rdk-managed/" leaves no way to act on it.
+func TestScratchTargetNamesRdkAndSaysToRemoveIt(t *testing.T) {
+	store, root := setupRepo(t)
+	if err := os.Symlink(".", filepath.Join(root, repofs.ScratchDir)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Run(store, "v")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeScratchTarget {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeScratchTarget)
+	}
+	if !strings.Contains(d.Line(), repofs.ScratchDir) {
+		t.Errorf("rendered message %q does not name %s", d.Line(), repofs.ScratchDir)
+	}
+	if !strings.Contains(d.Hint, "remove "+repofs.ScratchDir) {
+		t.Errorf("hint %q does not tell the user to remove %s", d.Hint, repofs.ScratchDir)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
+	}
+}
+
 // The summary is a diagnostic like any other, so JSONL consumers get the
 // counts as attrs rather than having to parse the sentence.
 func TestResultDiagnosticCarriesCounts(t *testing.T) {

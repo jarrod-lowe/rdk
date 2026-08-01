@@ -23,6 +23,22 @@ const (
 	scratchOld = ScratchDir + "/old"
 )
 
+// ErrScratchTarget reports that the scratch path exists as something other
+// than a real directory. os.Root confines symlinks to the repository but still
+// follows them inside it, so a .rdk symlinked to the repo root would send the
+// .gitignore write onto the user's own file and the scratch deletes onto their
+// directories — apply clobbering user-owned files, which rule 3 forbids.
+var ErrScratchTarget = errors.New("scratch path is not a directory")
+
+// scratchTargetError marks a failure to use the scratch dir because something
+// other than a directory occupies its path. It carries what's actually there,
+// since the caller's summary can't know that.
+type scratchTargetError struct{ err error }
+
+func (e *scratchTargetError) Error() string        { return e.err.Error() }
+func (e *scratchTargetError) Unwrap() error        { return e.err }
+func (e *scratchTargetError) Is(target error) bool { return target == ErrScratchTarget }
+
 // ErrSweep reports that the tree was published but the displaced copy could
 // not be removed. It is separated from every other Materialize failure because
 // the caller has to lead with the fact that the apply succeeded — anything
@@ -74,8 +90,11 @@ type Store interface {
 	// displaced by rename rather than deleted, and the new tree is renamed
 	// into place. A rename is all-or-nothing, so no step can leave managedDir
 	// half-written. ScratchDir is rdk-owned and git-ignores its own contents,
-	// so it never touches the user's root .gitignore. Parent dirs are
-	// created; files use 0o644, dirs 0o755. managedDir is repo-relative.
+	// so it never touches the user's root .gitignore — but only when it is
+	// actually a directory rdk made; if something else occupies that path
+	// (most dangerously a symlink) this refuses via ErrScratchTarget rather
+	// than writing and deleting through it. Parent dirs are created; files use
+	// 0o644, dirs 0o755. managedDir is repo-relative.
 	Materialize(managedDir string, set *FileSet) error
 	// Seed creates a user-owned file once: it never overwrites and never
 	// follows a symlink at the target. A pre-existing file or symlink is a
@@ -111,6 +130,27 @@ func New(repoRoot string) (Store, error) {
 }
 
 func (s *osStore) Materialize(managedDir string, set *FileSet) error {
+	// Judged before MkdirAll, and by Lstat rather than Stat: MkdirAll succeeds
+	// whenever the path already resolves to a directory, including through a
+	// symlink, and by then the .gitignore write below would already be aimed
+	// wherever that symlink points. Lstat sees the symlink itself rather than
+	// its target, so it catches what MkdirAll cannot refuse.
+	//
+	// scratchNew and scratchOld get no matching check: both are unconditionally
+	// RemoveAll'd a few lines down, and RemoveAll unlinks a symlink as itself
+	// rather than recursing through it (it only recurses on EISDIR, which a
+	// symlink never returns), so a symlink planted at either name is inert —
+	// removed, not followed. ScratchDir is different because nothing removes
+	// it first; MkdirAll and WriteFile walk straight through it.
+	switch info, err := s.root.Lstat(ScratchDir); {
+	case err == nil && !info.IsDir():
+		// The path itself isn't repeated here: the caller already has it
+		// (ScratchDir, or diag's File field), so this only needs to say what's
+		// actually occupying it — same reasoning as seedTargetError.
+		return &scratchTargetError{err: fmt.Errorf("it is a %s, not a directory", modeKind(info.Mode()))}
+	case err != nil && !os.IsNotExist(err):
+		return err
+	}
 	if err := s.root.MkdirAll(ScratchDir, 0o755); err != nil {
 		return err
 	}
@@ -206,6 +246,8 @@ func modeKind(mode fs.FileMode) string {
 	switch {
 	case mode.IsDir():
 		return "directory"
+	case mode&fs.ModeSymlink != 0:
+		return "symlink"
 	case mode&fs.ModeDevice != 0:
 		return "device"
 	case mode&fs.ModeSocket != 0:
