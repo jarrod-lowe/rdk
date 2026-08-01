@@ -85,7 +85,7 @@ write, never diff (rule 13) — so a deleted or edited one is restored.
 ```
 0. MkdirAll(.rdk) + write .rdk/.gitignore ("*")
 1. RemoveAll(.rdk/new)                mandatory: the name must be free
-2. RemoveAll(.rdk/old)                mandatory: the name must be free
+2. RemoveAll(.rdk/old)                only when the managed dir exists — see below
 3. write the FileSet into .rdk/new
 4. rename(rdk-managed → .rdk/old)     skipped when rdk-managed does not exist
 5. rename(.rdk/new → rdk-managed)     the publish
@@ -101,6 +101,16 @@ Steps 1 and 2 are not redundant with step 6. They are what covers a hard kill,
 where step 6 never runs at all, and a step 6 that failed on the previous run.
 Their job is different: 1 and 2 **must** succeed because the names are needed;
 6 is tidying.
+
+Step 2 is conditional for that same reason. `.rdk/old` is only needed as a name
+when step 4 is going to rename onto it, which happens only when the managed dir
+exists. When it does not — the state a failed publish leaves — clearing `old/`
+achieves nothing except destroying the only local copy of the previous tree,
+right before a retry that may fail again. So it is cleared when the name is
+needed and left alone when it is not. This does not weaken the invariant below:
+the scratch is still never *read*, only deleted. Not reading it and not
+needlessly deleting it are different properties, and only the first is what lets
+the recovery step go.
 
 The sweep cannot move earlier. `.rdk/old` exists only after step 4, so removing
 it before step 5 would put a recursive delete inside the window where

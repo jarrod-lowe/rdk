@@ -722,11 +722,16 @@ user's, and apply may not write to or delete it.
 | `rdk-managed/` | rdk | yes | deleted and wholly regenerated every apply |
 | `.rdk/` | rdk | no | scratch for the materialize swap; carries its own `.gitignore` of `*`, so git never sees it |
 
-`.rdk/` earns its place by holding no state that survives a run: `new/` and
-`old/` are both cleared unconditionally at the start of every apply, so nothing
-in it is ever read back. That is what lets rdk delete it on sight without
-validating it first — it is rdk's working space, not rdk's memory, and the
-manifest above remains rdk's only cross-apply state. It has to be a directory
+`.rdk/` earns its place by holding no state that is ever *read back*: `new/` is
+cleared at the start of every apply, and `old/` is cleared whenever a tree is
+about to be renamed onto that name. Neither is ever inspected, parsed, or
+promoted — the contents of a previous run can only be deleted, never trusted.
+That is what lets rdk clear it without validating it first: it is rdk's working
+space, not rdk's memory, and the manifest above remains rdk's only cross-apply
+state. (`old/` is deliberately *not* cleared when the managed dir is absent,
+since the name is not needed then and clearing it would destroy the only local
+copy of the previous tree after a failed publish. Not reading it and not
+needlessly deleting it are different properties; only the first is load-bearing.) It has to be a directory
 rather than siblings of `rdk-managed/` because a per-directory `.gitignore`
 governs only its own directory: nothing rdk owns could ignore a sibling, and the
 root `.gitignore` is the user's.
