@@ -124,6 +124,43 @@ func TestMalformedGitIsNotTreatedAsARepository(t *testing.T) {
 	}
 }
 
+// `rdk -> docs` in the checkout used to let MkdirAll resolve straight through
+// the symlink and seed config.yaml into docs/, reporting success while never
+// touching the rdk/ the user meant. init must now refuse instead, name the
+// symlink, and leave docs/ without a config.yaml.
+func TestInitRefusesASymlinkedDefsDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("docs", filepath.Join(dir, "rdk")); err != nil {
+		t.Fatal(err)
+	}
+	err := Run(newStore(t, dir), dir)
+	if err == nil {
+		t.Fatal("want an error when rdk/ is a symlink, got success")
+	}
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeUnsafePath {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeUnsafePath)
+	}
+	if !strings.Contains(d.Error(), "rdk") {
+		t.Errorf("rendered message %q does not name rdk", d.Error())
+	}
+	if !strings.Contains(d.Hint, "symlink") {
+		t.Errorf("hint %q does not say to remove the symlink", d.Hint)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
+	}
+	if _, statErr := os.Lstat(filepath.Join(dir, "docs", "config.yaml")); statErr == nil {
+		t.Error("init wrote through the symlink into docs/config.yaml")
+	}
+}
+
 // A directory at rdk/config.yaml is indistinguishable from an already-seeded
 // file by EEXIST alone, so without a mode check init would report success and
 // leave the failure for a later apply, far from its cause.

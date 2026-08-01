@@ -68,6 +68,18 @@ func Run(store repofs.Store, dir string) error {
 		}
 	}
 	if err := store.Seed("rdk/config.yaml", []byte(seedConfig)); err != nil {
+		if errors.Is(err, repofs.ErrUnsafePath) {
+			// The generic seed-failed hint ("check permissions") would send the
+			// reader nowhere useful: the fix is not permissions, it's a specific
+			// symlink somewhere above rdk/config.yaml that has to go. The cause
+			// names it.
+			return diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeUnsafePath,
+				File:    "rdk/config.yaml",
+				Summary: "cannot seed the config",
+				Hint:    "remove the symlink named above, then re-run 'rdk init'",
+			})
+		}
 		if errors.Is(err, repofs.ErrSeedTarget) {
 			return diag.Wrap(err, diag.Diagnostic{
 				Code:    diag.CodeSeedNotAFile,

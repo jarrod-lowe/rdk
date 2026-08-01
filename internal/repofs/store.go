@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strings"
 )
 
 // ScratchDir is rdk's own working directory inside the repo. It carries a
@@ -82,6 +83,22 @@ func (e *seedTargetError) Error() string        { return e.err.Error() }
 func (e *seedTargetError) Unwrap() error        { return e.err }
 func (e *seedTargetError) Is(target error) bool { return target == ErrSeedTarget }
 
+// ErrUnsafePath reports that a path rdk was about to write through passes
+// something that is not a real directory.
+var ErrUnsafePath = errors.New("path passes through a symlink")
+
+// unsafePathError marks a failure of checkPathComponents. The offending
+// component is folded into the message rather than carried as a separate
+// field: it is often a parent of the path the caller knows (Seed's directory
+// for a seed target, a managed dir's parent for a rename target), so the
+// caller cannot supply it the way it supplies File for ErrSeedTarget or
+// ErrScratchTarget.
+type unsafePathError struct{ err error }
+
+func (e *unsafePathError) Error() string        { return e.err.Error() }
+func (e *unsafePathError) Unwrap() error        { return e.err }
+func (e *unsafePathError) Is(target error) bool { return target == ErrUnsafePath }
+
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
 type Store interface {
@@ -93,13 +110,19 @@ type Store interface {
 	// so it never touches the user's root .gitignore — but only when it is
 	// actually a directory rdk made; if something else occupies that path
 	// (most dangerously a symlink) this refuses via ErrScratchTarget rather
-	// than writing and deleting through it. Parent dirs are created; files use
-	// 0o644, dirs 0o755. managedDir is repo-relative.
+	// than writing and deleting through it, and the scratch .gitignore itself
+	// is removed and recreated rather than truncated so a symlink planted
+	// there cannot redirect the write either. A symlinked parent directory
+	// component of managedDir is refused via ErrUnsafePath for the same
+	// reason. Parent dirs are created; files use 0o644, dirs 0o755. managedDir
+	// is repo-relative.
 	Materialize(managedDir string, set *FileSet) error
 	// Seed creates a user-owned file once: it never overwrites and never
-	// follows a symlink at the target. A pre-existing file or symlink is a
-	// no-op; anything else there (a directory, a device, a socket) is
-	// reported via ErrSeedTarget rather than treated as already seeded.
+	// follows a symlink at the target, and it refuses via ErrUnsafePath if any
+	// parent directory component of path is a symlink rather than creating
+	// through it. A pre-existing file or symlink at the target is a no-op;
+	// anything else there (a directory, a device, a socket) is reported via
+	// ErrSeedTarget rather than treated as already seeded.
 	Seed(path string, data []byte) error
 	// ReadFile / ReadDir read within the repo root. ReadDir returns entries
 	// sorted by name. Paths are repo-relative.
@@ -129,6 +152,34 @@ func New(repoRoot string) (Store, error) {
 	return &osStore{root: r}, nil
 }
 
+// checkPathComponents verifies that every directory component of p is a real
+// directory. os.Root confines symlinks to the repository but still follows
+// them inside it, so a checkout containing `rdk -> docs` would otherwise send
+// a write into a directory the user owns — apply clobbering user content,
+// which rule 3 forbids. Absent components are fine: they are about to be
+// created.
+func (s *osStore) checkPathComponents(p string) error {
+	p = path.Clean(p)
+	if p == "." {
+		return nil
+	}
+	prefix := ""
+	for _, part := range strings.Split(p, "/") {
+		if prefix == "" {
+			prefix = part
+		} else {
+			prefix = prefix + "/" + part
+		}
+		switch info, err := s.root.Lstat(prefix); {
+		case err == nil && !info.IsDir():
+			return &unsafePathError{err: fmt.Errorf("%s is a %s, not a directory", prefix, modeKind(info.Mode()))}
+		case err != nil && !os.IsNotExist(err):
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// Judged before MkdirAll, and by Lstat rather than Stat: MkdirAll succeeds
 	// whenever the path already resolves to a directory, including through a
@@ -136,12 +187,22 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// wherever that symlink points. Lstat sees the symlink itself rather than
 	// its target, so it catches what MkdirAll cannot refuse.
 	//
+	// This is not folded into checkPathComponents even though the condition is
+	// the same (Lstat, non-directory): ScratchDir is a single top-level path
+	// component, so checkPathComponents would Lstat exactly this one entry and
+	// nothing more — genuinely the same check, not a broader one. Kept
+	// separate because modeKind here can say "device"/"socket"/"named
+	// pipe"/"irregular file" as well as "symlink" or "file", where
+	// checkPathComponents' sentinel (ErrUnsafePath) is worded for the symlink
+	// case specifically; a bare file at .rdk deserves to be named as a file,
+	// not folded into "passes through a symlink".
+	//
 	// scratchNew and scratchOld get no matching check: both are unconditionally
 	// RemoveAll'd a few lines down, and RemoveAll unlinks a symlink as itself
 	// rather than recursing through it (it only recurses on EISDIR, which a
 	// symlink never returns), so a symlink planted at either name is inert —
 	// removed, not followed. ScratchDir is different because nothing removes
-	// it first; MkdirAll and WriteFile walk straight through it.
+	// it first; MkdirAll walks straight through it.
 	switch info, err := s.root.Lstat(ScratchDir); {
 	case err == nil && !info.IsDir():
 		// The path itself isn't repeated here: the caller already has it
@@ -154,7 +215,28 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	if err := s.root.MkdirAll(ScratchDir, 0o755); err != nil {
 		return err
 	}
-	if err := s.root.WriteFile(ScratchDir+"/.gitignore", []byte("*\n"), 0o644); err != nil {
+
+	// Remove-then-create rather than truncate: RemoveAll unlinks a symlink as
+	// itself, and O_EXCL then cannot follow one, so a planted link cannot aim
+	// this write at a file the user owns. The file is rdk's, so removing it is
+	// ours to do (rule 13: always write). This protects the leaf itself, which
+	// checkPathComponents cannot: ScratchDir is already known to be a real
+	// directory by this point, but .gitignore is the name inside it, and a
+	// component check only ever verifies directories, not the file being
+	// written.
+	gitignore := ScratchDir + "/.gitignore"
+	if err := s.root.RemoveAll(gitignore); err != nil {
+		return err
+	}
+	f, err := s.root.OpenFile(gitignore, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte("*\n")); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 
@@ -177,6 +259,17 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		if err := s.root.WriteFile(full, set.content[p], 0o644); err != nil {
 			return err
 		}
+	}
+
+	// Both renames below walk managedDir's parent chain the same way MkdirAll
+	// does, so an intermediate symlink would land the tree in whatever
+	// directory it points to, not managedDir. Every caller today passes a
+	// single top-level name (no parent to walk), so this never fires in
+	// practice — but managedDir is a parameter, not a constant, and the point
+	// of a shared guard is that the next caller who nests it doesn't have to
+	// remember to add this back.
+	if err := s.checkPathComponents(path.Dir(managedDir)); err != nil {
+		return err
 	}
 
 	// Displace by rename, not RemoveAll: a rename is all-or-nothing, so there
@@ -211,6 +304,14 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 
 func (s *osStore) Seed(name string, data []byte) error {
 	if dir := path.Dir(name); dir != "." {
+		// Checked before MkdirAll for the same reason as Materialize's scratch
+		// check: MkdirAll succeeds through a symlinked parent (e.g. `rdk ->
+		// docs`), and by then the create below would already be aimed at
+		// whatever the symlink points to. O_EXCL on the final component (below)
+		// protects the leaf; this protects everything above it.
+		if err := s.checkPathComponents(dir); err != nil {
+			return err
+		}
 		if err := s.root.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}

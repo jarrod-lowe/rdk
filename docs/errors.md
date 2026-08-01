@@ -39,6 +39,7 @@ status on their own — a run that warns and then fails still exits 1.
 | `publish-failed` | The generated tree was built but could not be moved into place, so `rdk-managed/` is currently absent. | Nothing is lost. Clear the cause, then re-run — a successful apply publishes it. |
 | `scratch-not-removed` | The tree was written correctly, but rdk could not remove its displaced copy under `.rdk/`. | The generated tree is correct. Clear `.rdk/old` — something is holding a file open — then re-run. |
 | `scratch-target` | `.rdk` exists but is not a directory — a symlink, a file, or something else occupies its path, so rdk refuses to use it as scratch space rather than write or delete through it. | Remove `.rdk`, then re-run. |
+| `unsafe-path` | A directory component of a path rdk needs to write through is a symlink (or something else that isn't a real directory), so rdk refuses to write through it rather than following it to wherever it points. | Read the cause; it names the offending path. Remove the symlink, then re-run. |
 | `seed-not-a-file` | The path a seeded file would occupy exists but is not a file — most often a directory of the same name. | Remove or rename it, then re-run `rdk init`. |
 | `seed-failed` | A seeded file could not be created. | Read the cause; check permissions and free space. |
 | `invalid-flag` | A flag, command, or flag value on the command line was not recognised. | Check the message; run `rdk --help` for the accepted commands and flags. |

@@ -365,6 +365,50 @@ func TestMaterializeRefusesAFileWhereScratchBelongs(t *testing.T) {
 	}
 }
 
+// The scratch .gitignore is rdk's own file, but it lives inside a directory
+// the FileSet writer walks straight through. A symlink planted there in place
+// of the .gitignore must not turn Materialize into a write against whatever
+// it points to — that write would land on a file the user owns.
+func TestMaterializeDoesNotFollowASymlinkedScratchGitignore(t *testing.T) {
+	s, root := newTestStore(t)
+	victim := filepath.Join(root, "README.md")
+	if err := os.WriteFile(victim, []byte("# mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "README.md"), filepath.Join(root, ScratchDir, ".gitignore")); err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	set.Bytes("f.txt", []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+
+	got, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# mine\n" {
+		t.Errorf("README.md = %q, want it untouched", got)
+	}
+	// The scratch .gitignore itself must still end up correct: rdk's own file
+	// comes back even though a symlink used to occupy its name.
+	gi, err := os.ReadFile(filepath.Join(root, ScratchDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("scratch .gitignore missing: %v", err)
+	}
+	if string(gi) != "*\n" {
+		t.Errorf("scratch .gitignore = %q, want %q", gi, "*\n")
+	}
+	if info, err := os.Lstat(filepath.Join(root, ScratchDir, ".gitignore")); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("scratch .gitignore is still a symlink")
+	}
+}
+
 func TestSeedCreatesOnceAndDoesNotOverwrite(t *testing.T) {
 	s, root := newTestStore(t)
 	if err := s.Seed("rdk/config.yaml", []byte("first")); err != nil {
@@ -389,6 +433,50 @@ func TestSeedRejectsADirectoryAtTheTarget(t *testing.T) {
 	err := s.Seed("rdk/config.yaml", []byte("x"))
 	if !errors.Is(err, ErrSeedTarget) {
 		t.Fatalf("err = %v, want it to wrap ErrSeedTarget", err)
+	}
+}
+
+// os.Root follows a symlinked parent directory, so `rdk -> docs` would
+// otherwise let MkdirAll resolve straight through it and land config.yaml in
+// a directory the user owns instead of the one they named.
+func TestSeedRefusesASymlinkedParentDirectory(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("docs", filepath.Join(root, "rdk")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.Seed("rdk/config.yaml", []byte("seeded"))
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want it to wrap ErrUnsafePath", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, "docs", "config.yaml")); statErr == nil {
+		t.Error("Seed wrote through the symlinked parent into docs/config.yaml")
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, "rdk")); statErr != nil {
+		t.Errorf("the rdk symlink itself was disturbed: %v", statErr)
+	} else if target, err := os.Readlink(filepath.Join(root, "rdk")); err != nil || target != "docs" {
+		t.Errorf("rdk symlink target = %q, %v, want it untouched", target, err)
+	}
+}
+
+// The guard must not reject a legitimate multi-level path where every
+// component really is a directory rdk (or the user) made — only a symlinked
+// one.
+func TestSeedStillWritesALegitimateDeepPath(t *testing.T) {
+	s, root := newTestStore(t)
+	err := s.Seed("a/b/c/config.yaml", []byte("deep"))
+	if err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "a", "b", "c", "config.yaml"))
+	if err != nil {
+		t.Fatalf("config.yaml missing: %v", err)
+	}
+	if string(got) != "deep" {
+		t.Errorf("config.yaml = %q, want %q", got, "deep")
 	}
 }
 
@@ -453,6 +541,30 @@ func TestReadDirReportsDirectories(t *testing.T) {
 	}
 	if entries[1].Name != "nested" || !entries[1].IsDir {
 		t.Errorf("entries[1] = %+v, want nested dir", entries[1])
+	}
+}
+
+// managedDir is a Store.Materialize parameter, not a hardcoded value: nothing
+// stops a future caller from nesting it, and if they do, a symlinked parent
+// component must be refused the same way Seed refuses one, rather than
+// renaming the managed tree into whatever the symlink points to.
+func TestMaterializeRefusesASymlinkedManagedDirParent(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("docs", filepath.Join(root, "sub")); err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	set.Bytes("f.txt", []byte("x"))
+	err := s.Materialize("sub/managed", set)
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want it to wrap ErrUnsafePath", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, "docs", "managed")); statErr == nil {
+		t.Error("Materialize wrote through the symlinked parent into docs/managed")
 	}
 }
 

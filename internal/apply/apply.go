@@ -51,6 +51,19 @@ func Run(store repofs.Store, version string) (Result, error) {
 	}
 
 	if err := store.Materialize(ManagedDir, set); err != nil {
+		if errors.Is(err, repofs.ErrUnsafePath) {
+			// Named for completeness with Store's contract: ManagedDir is a
+			// constant single path component today, so this cannot actually
+			// fire, but Materialize's signature takes an arbitrary
+			// repo-relative managedDir, and a caller that ever nests it hits
+			// this instead of a silent write through a symlinked parent.
+			return Result{}, diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeUnsafePath,
+				File:    ManagedDir,
+				Summary: "cannot write it",
+				Hint:    "remove the symlink named above, then re-run",
+			})
+		}
 		if errors.Is(err, repofs.ErrScratchTarget) {
 			// The generic write-managed-dir hint ("check permissions and free
 			// space") would send the reader nowhere useful here: the fix is
