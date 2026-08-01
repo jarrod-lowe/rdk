@@ -98,6 +98,29 @@ func TestUnknownFieldListsValidFields(t *testing.T) {
 	}
 }
 
+// Two unknown fields must always produce the same error, or a diagnostic is
+// not reproducible and anything automating against it is flaky.
+func TestUnknownFieldErrorIsDeterministic(t *testing.T) {
+	body := "kind: s3-bucket\nname: x\ndescription: d\nalpha: 1\nomega: 2\n"
+	first := ""
+	for i := 0; i < 20; i++ {
+		_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": body}), "rdk")
+		var d *diag.Error
+		if !errors.As(err, &d) {
+			t.Fatalf("want a diagnostic, got %v", err)
+		}
+		if first == "" {
+			first = d.Field
+		}
+		if d.Field != first {
+			t.Fatalf("run %d reported field %q, run 0 reported %q", i, d.Field, first)
+		}
+	}
+	if first != "alpha" {
+		t.Errorf("reported field %q, want the first in sorted order, %q", first, "alpha")
+	}
+}
+
 func TestUnknownFieldSuggestsNearMatch(t *testing.T) {
 	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: s3-bucket\nname: x\ndescriptoin: d\n"}), "rdk")
 	errContains(t, err, "descriptoin", "did you mean", "description")

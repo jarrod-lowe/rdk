@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -177,11 +178,21 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 	}
 	k := ki.Schema()
 
+	// Sorted, not map order: with two unknown fields, Go's randomised map
+	// iteration would report a different one each run, so identical input
+	// would produce different diagnostics (rule 1).
+	keys := make([]string, 0, len(doc))
+	for key := range doc {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
 	attrs := map[string]any{}
-	for key, val := range doc {
+	for _, key := range keys {
 		if key == "kind" {
 			continue
 		}
+		val := doc[key]
 		if _, ok := k.Field(key); !ok {
 			valid := fieldNames(k)
 			return Definition{}, diag.New(diag.Diagnostic{
