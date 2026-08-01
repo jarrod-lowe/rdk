@@ -211,3 +211,21 @@ func TestExitCodes(t *testing.T) {
 		}
 	}
 }
+
+// The fallback logger is built after cobra has already failed, so it is the
+// one most likely to be constructed without the injected writers — and a
+// diagnostic written to the real stderr is one no caller can act on.
+func TestCommandLineErrorsReachTheInjectedStream(t *testing.T) {
+	for _, args := range [][]string{{"--bogus"}, {"bogus"}} {
+		var out, errOut bytes.Buffer
+		if got := execute(args, &out, &errOut); got != 1 {
+			t.Errorf("%v: exit = %d, want 1", args, got)
+		}
+		if !strings.Contains(errOut.String(), "invalid command line") {
+			t.Errorf("%v: stderr = %q, want the diagnostic", args, errOut.String())
+		}
+		if out.Len() != 0 {
+			t.Errorf("%v: stdout = %q, want empty", args, out.String())
+		}
+	}
+}

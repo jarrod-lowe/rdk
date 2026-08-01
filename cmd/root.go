@@ -90,7 +90,9 @@ func execute(args []string, stdout, stderr io.Writer) int {
 				Hint:    "run 'rdk --help' for the accepted commands and flags",
 			})
 		}
-		log = logger.New(logger.Options{})
+		// The injected writers matter most on exactly this path: a test that
+		// cannot see the diagnostic cannot assert on it.
+		log = logger.New(logger.Options{Stdout: stdout, Stderr: stderr})
 	}
 	log.Fail(err)
 	return diag.ExitCode(err)
