@@ -104,10 +104,16 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// is no half-deleted tree to be mistaken for a healthy one on the next run.
 	// It also works on Windows, where renaming onto an existing directory does
 	// not.
-	if _, err := s.root.Stat(managedDir); err == nil {
+	switch _, err := s.root.Stat(managedDir); {
+	case err == nil:
 		if err := s.root.Rename(managedDir, scratchOld); err != nil {
 			return err
 		}
+	case !os.IsNotExist(err):
+		// Not knowing whether there is a tree to displace is its own failure.
+		// Falling through would surface a confusing rename error instead of
+		// the real cause.
+		return err
 	}
 	if err := s.root.Rename(scratchNew, managedDir); err != nil {
 		return err

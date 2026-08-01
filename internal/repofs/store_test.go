@@ -146,6 +146,38 @@ func TestMaterializeLeavesNoScratchBehind(t *testing.T) {
 	}
 }
 
+// Not being able to tell whether there is a tree to displace is a failure in
+// its own right; reporting it as a rename error would name the wrong cause.
+func TestMaterializeReportsAnUnreadableManagedDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	s, root := newTestStore(t)
+	set := NewFileSet()
+	set.Bytes("f.txt", []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	// Remove search permission on the parent so Stat("managed") fails with
+	// EACCES rather than ENOENT.
+	sub := filepath.Join(root, "nested")
+	if err := os.MkdirAll(filepath.Join(sub, "managed"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(sub, 0o700) })
+
+	err := s.Materialize("nested/managed", set)
+	if err == nil {
+		t.Fatal("want an error when the managed dir cannot be stat-ed")
+	}
+	if os.IsNotExist(err) {
+		t.Errorf("reported as not-exist, want the underlying permission error: %v", err)
+	}
+}
+
 func TestSeedCreatesOnceAndDoesNotOverwrite(t *testing.T) {
 	s, root := newTestStore(t)
 	if err := s.Seed("rdk/config.yaml", []byte("first")); err != nil {
