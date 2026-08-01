@@ -2,6 +2,7 @@ package repofs
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -50,6 +51,21 @@ func (e *publishError) Error() string        { return e.err.Error() }
 func (e *publishError) Unwrap() error        { return e.err }
 func (e *publishError) Is(target error) bool { return target == ErrPublish }
 
+// ErrSeedTarget reports that the path a seed would occupy exists but is not a
+// file rdk can leave alone. Seeding is "create once, then it is the user's" —
+// a directory there is neither, and accepting it silently defers the failure
+// to a later apply, far from its cause.
+var ErrSeedTarget = errors.New("seed target is not a file")
+
+// seedTargetError marks a failure to seed because the target already exists
+// as something other than a file or symlink. It carries what's actually
+// there, since the caller's summary can't know that.
+type seedTargetError struct{ err error }
+
+func (e *seedTargetError) Error() string        { return e.err.Error() }
+func (e *seedTargetError) Unwrap() error        { return e.err }
+func (e *seedTargetError) Is(target error) bool { return target == ErrSeedTarget }
+
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
 type Store interface {
@@ -62,7 +78,9 @@ type Store interface {
 	// created; files use 0o644, dirs 0o755. managedDir is repo-relative.
 	Materialize(managedDir string, set *FileSet) error
 	// Seed creates a user-owned file once: it never overwrites and never
-	// follows a symlink at the target. A pre-existing path is a no-op.
+	// follows a symlink at the target. A pre-existing file or symlink is a
+	// no-op; anything else there (a directory, a device, a socket) is
+	// reported via ErrSeedTarget rather than treated as already seeded.
 	Seed(path string, data []byte) error
 	// ReadFile / ReadDir read within the repo root. ReadDir returns entries
 	// sorted by name. Paths are repo-relative.
@@ -160,13 +178,42 @@ func (s *osStore) Seed(name string, data []byte) error {
 	f, err := s.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
-			return nil // already present (file or symlink) — leave it (DD-3)
+			// Lstat, not Stat: a symlink must be judged as itself, not as
+			// whatever it points to, so that leaving it alone (DD-3) doesn't
+			// depend on where it happens to resolve.
+			info, statErr := s.root.Lstat(name)
+			if statErr != nil {
+				return statErr
+			}
+			if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return nil // already present (file or symlink) — leave it (DD-3)
+			}
+			return &seedTargetError{err: fmt.Errorf("%s is a %s, not a file", name, modeKind(info.Mode()))}
 		}
 		return err
 	}
 	defer f.Close()
 	_, err = f.Write(data)
 	return err
+}
+
+// modeKind names what occupies a seed target, for a message that says what's
+// actually in the way instead of just that it isn't a file.
+func modeKind(mode fs.FileMode) string {
+	switch {
+	case mode.IsDir():
+		return "directory"
+	case mode&fs.ModeDevice != 0:
+		return "device"
+	case mode&fs.ModeSocket != 0:
+		return "socket"
+	case mode&fs.ModeNamedPipe != 0:
+		return "named pipe"
+	case mode&fs.ModeIrregular != 0:
+		return "irregular file"
+	default:
+		return "non-regular file"
+	}
 }
 
 func (s *osStore) ReadFile(name string) ([]byte, error) {

@@ -340,6 +340,44 @@ func TestSeedCreatesOnceAndDoesNotOverwrite(t *testing.T) {
 	}
 }
 
+// Seeding is "create once, then it is the user's file". A directory is not a
+// file, and accepting it silently would defer the failure to a later apply.
+func TestSeedRejectsADirectoryAtTheTarget(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, "rdk", "config.yaml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Seed("rdk/config.yaml", []byte("x"))
+	if !errors.Is(err, ErrSeedTarget) {
+		t.Fatalf("err = %v, want it to wrap ErrSeedTarget", err)
+	}
+}
+
+// A pre-existing symlink is still the user's, and still left alone.
+func TestSeedLeavesASymlinkAlone(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, "rdk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "elsewhere.yaml")
+	if err := os.WriteFile(target, []byte("theirs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "rdk", "config.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Seed("rdk/config.yaml", []byte("ours")); err != nil {
+		t.Fatalf("Seed over a symlink: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "theirs" {
+		t.Errorf("symlink target = %q, want it untouched", got)
+	}
+}
+
 func TestReadFileAndReadDir(t *testing.T) {
 	s, root := newTestStore(t)
 	os.MkdirAll(filepath.Join(root, "rdk"), 0o755)

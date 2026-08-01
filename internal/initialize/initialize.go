@@ -4,6 +4,7 @@ package initialize
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -66,5 +67,21 @@ func Run(store repofs.Store, dir string) error {
 			})
 		}
 	}
-	return store.Seed("rdk/config.yaml", []byte(seedConfig))
+	if err := store.Seed("rdk/config.yaml", []byte(seedConfig)); err != nil {
+		if errors.Is(err, repofs.ErrSeedTarget) {
+			return diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeSeedNotAFile,
+				File:    "rdk/config.yaml",
+				Summary: "cannot seed the config: the path exists and is not a file",
+				Hint:    "remove or rename it, then re-run 'rdk init'",
+			})
+		}
+		return diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeSeedFailed,
+			File:    "rdk/config.yaml",
+			Summary: "cannot seed the config",
+			Hint:    "check permissions and free space",
+		})
+	}
+	return nil
 }

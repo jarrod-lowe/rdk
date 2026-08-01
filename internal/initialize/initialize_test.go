@@ -123,3 +123,27 @@ func TestMalformedGitIsNotTreatedAsARepository(t *testing.T) {
 		t.Errorf("code = %q, want %q", d.Code, diag.CodeGitInit)
 	}
 }
+
+// A directory at rdk/config.yaml is indistinguishable from an already-seeded
+// file by EEXIST alone, so without a mode check init would report success and
+// leave the failure for a later apply, far from its cause.
+func TestConfigPathIsADirectoryIsNotTreatedAsSeeded(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "rdk", "config.yaml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := Run(newStore(t, dir), dir)
+	if err == nil {
+		t.Fatal("want an error when rdk/config.yaml is a directory, got success")
+	}
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeSeedNotAFile {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeSeedNotAFile)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
+	}
+}
