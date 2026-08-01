@@ -99,3 +99,27 @@ func TestGitInitFailureCarriesGitsOutput(t *testing.T) {
 		t.Errorf("error does not carry git's output: %q", d.Error())
 	}
 }
+
+// A .git that git cannot use was indistinguishable from a healthy one by
+// stat, so rdk seeded the config and reported success on a broken repo.
+func TestMalformedGitIsNotTreatedAsARepository(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /nowhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := repofs.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Run(store, dir)
+	if err == nil {
+		t.Fatal("want an error for a .git git cannot use, got success")
+	}
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeGitInit {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeGitInit)
+	}
+}

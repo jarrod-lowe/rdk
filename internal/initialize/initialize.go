@@ -5,7 +5,6 @@ package initialize
 import (
 	_ "embed"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -20,9 +19,33 @@ import (
 //go:embed seed/config.yaml
 var seedConfig string
 
+// isRepoRoot asks git whether dir is itself the root of a working
+// repository, rather than inspecting the .git path directly: a worktree's
+// .git is a file, not a directory, and one that is malformed or unreadable
+// is indistinguishable from a healthy one by stat alone. git is the
+// authority on what git can use. Comparing the toplevel keeps the existing
+// behaviour that a subdirectory of a repo still gets its own.
+func isRepoRoot(dir string) bool {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	top, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	if err != nil {
+		return false
+	}
+	want, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
+	return top == want
+}
+
 // Run initialises dir as an rdk repository. The store must be rooted at dir.
 func Run(store repofs.Store, dir string) error {
-	if _, err := os.Stat(filepath.Join(dir, ".git")); os.IsNotExist(err) {
+	if !isRepoRoot(dir) {
 		cmd := exec.Command("git", "init")
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
