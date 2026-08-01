@@ -18,12 +18,12 @@ func TestMemReadDirMissingErrors(t *testing.T) {
 func TestMemMaterializeAndReplace(t *testing.T) {
 	m := NewMem()
 	first := NewFileSet()
-	first.Bytes(Managed("stale.txt"), []byte("old"))
+	add(t, first, Managed("stale.txt"), []byte("old"))
 	if err := m.Materialize("managed", first); err != nil {
 		t.Fatal(err)
 	}
 	second := NewFileSet()
-	second.Bytes(Managed("fresh.txt"), []byte("new"))
+	add(t, second, Managed("fresh.txt"), []byte("new"))
 	if err := m.Materialize("managed", second); err != nil {
 		t.Fatal(err)
 	}
@@ -40,12 +40,8 @@ func TestMemMaterializeAndReplace(t *testing.T) {
 func TestMemMaterializeRejectsAnOutsideEntry(t *testing.T) {
 	m := NewMem()
 	set := NewFileSet()
-	if err := set.Bytes(Managed("f.txt"), []byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	if err := set.Bytes(AtRepoRoot(".github/workflows/ci.yml"), []byte("x")); err != nil {
-		t.Fatal(err)
-	}
+	add(t, set, Managed("f.txt"), []byte("x"))
+	add(t, set, AtRepoRoot(".github/workflows/ci.yml"), []byte("x"))
 	if err := m.Materialize("managed", set); err == nil {
 		t.Fatal("want an error for an outside entry")
 	}
