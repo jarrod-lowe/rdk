@@ -1,6 +1,7 @@
 package repofs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -175,6 +176,88 @@ func TestMaterializeReportsAnUnreadableManagedDir(t *testing.T) {
 	}
 	if os.IsNotExist(err) {
 		t.Errorf("reported as not-exist, want the underlying permission error: %v", err)
+	}
+}
+
+// chmodUnwritable makes dir's contents undeletable, and restores it so the
+// test's own cleanup can succeed. Skips as root, which ignores the bits.
+func chmodUnwritable(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+}
+
+// The failure that motivated this design: it must leave the published tree
+// untouched rather than half-deleted, and it must say so.
+func TestMaterializeReportsASweepFailureAndKeepsTheTree(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	first.Bytes("sub/f.txt", []byte("old"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+	// After the displacing rename this becomes .rdk/old/sub, whose contents
+	// cannot be unlinked — so the sweep fails while everything before it works.
+	chmodUnwritable(t, filepath.Join(root, "managed", "sub"))
+	// The pre-rename path is restored above, but by the time cleanup runs the
+	// directory has moved to .rdk/old/sub — restore that path too, ignoring
+	// whichever of the two no longer exists.
+	t.Cleanup(func() { os.Chmod(filepath.Join(root, ScratchDir, "old", "sub"), 0o700) })
+
+	second := NewFileSet()
+	second.Bytes("fresh.txt", []byte("new"))
+	err := s.Materialize("managed", second)
+	if !errors.Is(err, ErrSweep) {
+		t.Fatalf("err = %v, want it to wrap ErrSweep", err)
+	}
+	// The tree is correct: that is the whole point of reporting this
+	// separately from every other failure.
+	got, readErr := os.ReadFile(filepath.Join(root, "managed", "fresh.txt"))
+	if readErr != nil {
+		t.Fatalf("published tree is not correct: %v", readErr)
+	}
+	if string(got) != "new" {
+		t.Errorf("managed/fresh.txt = %q, want %q", got, "new")
+	}
+}
+
+// A blocked scratch must stop the run before anything is displaced — the tree
+// on disk has to survive intact.
+func TestMaterializeLeavesTheTreeIntactWhenScratchCannotBeCleared(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	first.Bytes("f.txt", []byte("old"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+	// Leave an old scratch behind that cannot be removed.
+	oldDir := filepath.Join(root, ScratchDir, "old", "sub")
+	if err := os.MkdirAll(oldDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldDir, "stuck.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	chmodUnwritable(t, oldDir)
+
+	second := NewFileSet()
+	second.Bytes("fresh.txt", []byte("new"))
+	if err := s.Materialize("managed", second); err == nil {
+		t.Fatal("want an error when the scratch cannot be cleared")
+	} else if errors.Is(err, ErrSweep) {
+		t.Errorf("reported as a sweep failure, but nothing was published: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "managed", "f.txt"))
+	if err != nil {
+		t.Fatalf("previous tree did not survive: %v", err)
+	}
+	if string(got) != "old" {
+		t.Errorf("managed/f.txt = %q, want the previous %q", got, "old")
 	}
 }
 
