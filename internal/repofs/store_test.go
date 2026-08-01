@@ -261,6 +261,37 @@ func TestMaterializeLeavesTheTreeIntactWhenScratchCannotBeCleared(t *testing.T) 
 	}
 }
 
+// Displacing is a rename precisely so that failing it leaves the previous tree
+// whole — a RemoveAll here could delete half of it and return.
+func TestMaterializeLeavesTheTreeIntactWhenItCannotBeDisplaced(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	first.Bytes("f.txt", []byte("old"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+	// Read-only root: the scratch already exists and stays writable, so this
+	// blocks the displacing rename and nothing before it.
+	chmodUnwritable(t, root)
+
+	second := NewFileSet()
+	second.Bytes("fresh.txt", []byte("new"))
+	err := s.Materialize("managed", second)
+	if err == nil {
+		t.Fatal("want an error when the tree cannot be displaced")
+	}
+	if errors.Is(err, ErrSweep) {
+		t.Errorf("reported as a sweep failure, but nothing was published: %v", err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "managed", "f.txt"))
+	if readErr != nil {
+		t.Fatalf("previous tree did not survive: %v", readErr)
+	}
+	if string(got) != "old" {
+		t.Errorf("managed/f.txt = %q, want the previous %q", got, "old")
+	}
+}
+
 func TestSeedCreatesOnceAndDoesNotOverwrite(t *testing.T) {
 	s, root := newTestStore(t)
 	if err := s.Seed("rdk/config.yaml", []byte("first")); err != nil {
