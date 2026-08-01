@@ -3,6 +3,7 @@
 package apply
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
@@ -50,7 +51,22 @@ func Run(store repofs.Store, version string) (Result, error) {
 	}
 
 	if err := store.Materialize(ManagedDir, set); err != nil {
-		return Result{}, err
+		if errors.Is(err, repofs.ErrSweep) {
+			// The tree is already correct here, so the summary leads with that.
+			// Swallowing this would only move the problem: the same locked file
+			// blocks the next apply's mandatory scratch clear, far from its cause.
+			return Result{}, diag.Wrap(err, diag.Diagnostic{
+				Code: diag.CodeScratchNotRemoved,
+				Summary: fmt.Sprintf("rdk apply: wrote %d files to %s/, but could not remove the displaced copy",
+					set.Len(), ManagedDir),
+				Hint: "the generated tree is correct; clear " + repofs.ScratchDir + "/old, then re-run",
+			})
+		}
+		return Result{}, diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeWriteManagedDir,
+			Summary: fmt.Sprintf("cannot write %s/", ManagedDir),
+			Hint:    "check permissions and free space",
+		})
 	}
 	return Result{FilesWritten: set.Len(), Warnings: warnings}, nil
 }

@@ -1,8 +1,10 @@
 package apply
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
@@ -77,6 +79,52 @@ func TestRunFailsWithoutDefinitions(t *testing.T) {
 	}
 	if _, err := Run(store, "v"); err == nil {
 		t.Error("want error when rdk/ is missing")
+	}
+}
+
+// This failure happens after the tree is already correct, so the message has
+// to say so — otherwise the reader goes looking for damage that is not there,
+// or starts deleting rdk-managed/ to fix a problem that does not exist.
+func TestSweepFailureSaysTheApplySucceeded(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	store, root := setupRepo(t)
+	if _, err := Run(store, "v"); err != nil {
+		t.Fatal(err)
+	}
+	// After the displacing rename this becomes .rdk/old/terraform, whose
+	// contents cannot be unlinked, so only the final sweep fails.
+	stuck := filepath.Join(root, ManagedDir, "terraform")
+	if err := os.Chmod(stuck, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.Chmod(stuck, 0o700)
+		os.Chmod(filepath.Join(root, repofs.ScratchDir, "old", "terraform"), 0o700)
+	})
+
+	_, err := Run(store, "v")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeScratchNotRemoved {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeScratchNotRemoved)
+	}
+	if !strings.Contains(d.Summary, "wrote") {
+		t.Errorf("summary %q does not lead with the apply having succeeded", d.Summary)
+	}
+	if !strings.Contains(d.Hint, "correct") {
+		t.Errorf("hint %q does not say the tree is correct", d.Hint)
+	}
+	// Exit 1: a locked file is environmental, not an rdk bug.
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
+	}
+	// The published tree really is correct — that is what the message claims.
+	if _, err := os.Stat(filepath.Join(root, ManagedDir, "terraform", "main.tf.json")); err != nil {
+		t.Errorf("published tree is not intact: %v", err)
 	}
 }
 
