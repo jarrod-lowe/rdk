@@ -711,6 +711,26 @@ rdk's or wholly the user's. Where both want a say (`.gitignore`), split by
 mechanism: rdk's ignore rules live in per-directory `.gitignore` files inside
 rdk-owned dirs; the root `.gitignore` is seeded-once user property.
 
+**Decision — rdk claims three fixed paths, and names them here.** Every other
+rdk-owned file is an outside file, justified under rule 12 and manifest-tracked
+by the algorithm below. A path not in this table and not in the manifest is the
+user's, and apply may not write to or delete it.
+
+| Path | Owner | Committed | Notes |
+| --- | --- | --- | --- |
+| `rdk/` | the user | yes | definitions; rdk reads them, and seeds `config.yaml` once (DD-3) |
+| `rdk-managed/` | rdk | yes | deleted and wholly regenerated every apply |
+| `.rdk/` | rdk | no | scratch for the materialize swap; carries its own `.gitignore` of `*`, so git never sees it |
+
+`.rdk/` earns its place by holding no state that survives a run: `new/` and
+`old/` are both cleared unconditionally at the start of every apply, so nothing
+in it is ever read back. That is what lets rdk delete it on sight without
+validating it first — it is rdk's working space, not rdk's memory, and the
+manifest above remains rdk's only cross-apply state. It has to be a directory
+rather than siblings of `rdk-managed/` because a per-directory `.gitignore`
+governs only its own directory: nothing rdk owns could ignore a sibling, and the
+root `.gitignore` is the user's.
+
 **Decision — the apply algorithm per outside file.**
 
 | Manifest entry | On disk | Still generated? | Action |
