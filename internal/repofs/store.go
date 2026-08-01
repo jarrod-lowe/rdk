@@ -2,7 +2,6 @@ package repofs
 
 import (
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -28,6 +27,15 @@ const (
 // the caller has to lead with the fact that the apply succeeded — anything
 // else sends the reader looking for damage that is not there (rule 11).
 var ErrSweep = errors.New("displaced copy not removed")
+
+// sweepError marks a failure of the final sweep without contributing to the
+// message: the caller's summary already says what could not be removed, so
+// repeating it here would render the same complaint twice.
+type sweepError struct{ err error }
+
+func (e *sweepError) Error() string        { return e.err.Error() }
+func (e *sweepError) Unwrap() error        { return e.err }
+func (e *sweepError) Is(target error) bool { return target == ErrSweep }
 
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
@@ -122,9 +130,7 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// Past this point the tree on disk is correct, so the caller must say so
 	// even while reporting this failure.
 	if err := s.root.RemoveAll(scratchOld); err != nil {
-		// Both wrapped: the caller matches on ErrSweep, and errors.Is still
-		// reaches the underlying filesystem error.
-		return fmt.Errorf("%w: %w", ErrSweep, err)
+		return &sweepError{err: err}
 	}
 	return nil
 }
