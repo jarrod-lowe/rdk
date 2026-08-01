@@ -55,13 +55,11 @@ func Dir(store repofs.Store, dir string) ([]Definition, []diag.Diagnostic, error
 			})
 		}
 		if !strings.HasSuffix(name, ".yaml") {
-			w, ok, err := classify(name)
+			w, err := classify(name)
 			if err != nil {
 				return nil, nil, err
 			}
-			if ok {
-				warnings = append(warnings, w)
-			}
+			warnings = append(warnings, w)
 			continue
 		}
 		def, err := parseFile(store, dir, name)

@@ -223,20 +223,44 @@ func TestEditorArtifactsWarn(t *testing.T) {
 	}
 }
 
-// Finder writes .DS_Store on its own; warning about it every apply would train
-// people to ignore warnings, and erroring would break apply outright.
-func TestHiddenFilesSilentlyIgnored(t *testing.T) {
-	files := map[string]string{"config.yaml": goodConfig, "assets.yaml": goodBucket,
-		".DS_Store": "\x00", ".gitignore": "*.tfstate\n", ".gitkeep": "", ".assets.yaml.swp": "vim"}
-	defs, warnings, err := Dir(memWith(t, files), "rdk")
-	if err != nil {
-		t.Fatalf("Dir: %v", err)
+// rdk/ holds definitions; anything else in it gets one line of output. These
+// files are exempt from being errors because nobody chooses to create them,
+// but not from being mentioned (rule 6).
+func TestMachineMadeFilesWarn(t *testing.T) {
+	for _, name := range []string{".DS_Store", ".gitignore", ".gitkeep", ".assets.yaml.swp", "Thumbs.db"} {
+		defs, warnings, err := Dir(memWith(t, map[string]string{
+			"config.yaml": goodConfig, "assets.yaml": goodBucket, name: "x",
+		}), "rdk")
+		if err != nil {
+			t.Fatalf("%s: Dir: %v", name, err)
+		}
+		if len(defs) != 2 {
+			t.Errorf("%s: got %d definitions, want 2", name, len(defs))
+		}
+		if len(warnings) != 1 {
+			t.Fatalf("%s: got %d warnings, want 1", name, len(warnings))
+		}
+		if warnings[0].Code != diag.CodeMachineFile {
+			t.Errorf("%s: code = %q, want %q", name, warnings[0].Code, diag.CodeMachineFile)
+		}
+		if warnings[0].File != name {
+			t.Errorf("%s: warning names file %q", name, warnings[0].File)
+		}
 	}
-	if len(defs) != 2 {
-		t.Fatalf("got %d definitions, want 2", len(defs))
-	}
-	if len(warnings) != 0 {
-		t.Errorf("warnings = %v, want none", warnings)
+}
+
+// A leading dot must not change the verdict on an identical mistake: a hidden
+// definition with the wrong extension was silently dropped, exit 0.
+func TestHiddenFilesGetTheSameVerdictAsVisibleOnes(t *testing.T) {
+	for _, name := range []string{".assets.yml", ".notes.txt", ".deploy.sh"} {
+		_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, name: "x"}), "rdk")
+		var d *diag.Error
+		if !errors.As(err, &d) {
+			t.Fatalf("%s: want a diagnostic, got %v", name, err)
+		}
+		if d.File != name {
+			t.Errorf("%s: error names file %q", name, d.File)
+		}
 	}
 }
 

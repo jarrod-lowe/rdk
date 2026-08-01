@@ -22,6 +22,7 @@ const (
 	CodeUnprocessableFile = "unprocessable-file"
 	CodeSetAside          = "set-aside"
 	CodeEditorArtifact    = "editor-artifact"
+	CodeMachineFile       = "machine-file"
 	CodeReadDefsDir       = "read-defs-dir"
 	CodeReadFile          = "read-file"
 	CodeGitInit           = "git-init"
@@ -40,7 +41,8 @@ var all = []string{
 	CodeEmptyKind, CodeUnknownKind, CodeUnknownField, CodeMissingField,
 	CodeFieldNotString, CodeEmptyField, CodeMultiDocument, CodeDuplicateName,
 	CodeConfigCardinality, CodeDirInDefs, CodeWrongExtension,
-	CodeUnprocessableFile, CodeSetAside, CodeEditorArtifact, CodeReadDefsDir,
+	CodeUnprocessableFile, CodeSetAside, CodeEditorArtifact, CodeMachineFile,
+	CodeReadDefsDir,
 	CodeReadFile, CodeGitInit, CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal, CodeInvalidFlag,
 }

@@ -43,6 +43,7 @@ status on their own — a run that warns and then fails still exits 1.
 |---|---|---|
 | `set-aside` | A file is parked with `.disabled` or `.example`, so nothing is generated for it. | Intentional — rename to `.yaml` to enable it. |
 | `editor-artifact` | An editor or merge leftover (`.orig`, `.rej`, `.bak`, `~`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
+| `machine-file` | A file nobody chose to create (`.DS_Store`, `Thumbs.db`, a vim swap file) or a git housekeeping file (`.gitignore`, `.gitkeep`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
 
 ## Results
 
