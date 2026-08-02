@@ -40,11 +40,15 @@ func (a *app) applyCmd() *cobra.Command {
 					// match) is the user's mistake, not rdk's — it must exit 1,
 					// not 2. This is lock-mismatch, not apply-locked: nothing is
 					// necessarily holding the repository, you named a lock and
-					// the repository disagreed about it.
+					// the repository disagreed about it. "re-run rdk apply to
+					// see the current lock" used to be the hint here, but that
+					// describes a diagnostic step that will not happen when no
+					// lock exists at all — the next apply just succeeds. The
+					// cause above already says which of the two it was.
 					return diag.Wrap(err, diag.Diagnostic{
 						Code:    diag.CodeLockMismatch,
 						Summary: fmt.Sprintf("cannot break lock %s", breakLock),
-						Hint:    "re-run rdk apply to see the current lock, if any, and its id",
+						Hint:    "read the cause above: if nothing is locked, drop --break-lock and re-run; if the id is wrong, it does not match the lock actually held",
 					})
 				}
 				// Taking someone else's lock is surprising state, and

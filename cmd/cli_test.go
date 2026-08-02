@@ -266,8 +266,9 @@ func TestCommandLineErrorsReachTheInjectedStream(t *testing.T) {
 	}
 }
 
-// The loser of a race has to be told what to do — and warned off the door that
-// is not theirs, since the error itself hands over the id both flags need.
+// The loser of a race has to be told what to do — an apply lock is never a
+// door --with-lock could open, so the error hands over only the id and
+// --break-lock, not a warning about a flag that was never relevant here.
 func TestApplyReportsAnExistingLock(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := runSplit(t, dir, "init"); err != nil {
@@ -283,10 +284,13 @@ func TestApplyReportsAnExistingLock(t *testing.T) {
 	if err == nil {
 		t.Fatal("apply succeeded despite a lock")
 	}
-	for _, want := range []string{"9f3a1c4e7b2d8a05", "--break-lock", "never --with-lock"} {
+	for _, want := range []string{"9f3a1c4e7b2d8a05", "--break-lock"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("stderr does not mention %q: %q", want, errOut)
 		}
+	}
+	if strings.Contains(errOut, "--with-lock") {
+		t.Errorf("stderr mentions --with-lock for an apply lock: %q", errOut)
 	}
 
 	// A blocked apply is the user's problem, not rdk's — the exit code is the
@@ -361,13 +365,23 @@ func TestLockThenUnlock(t *testing.T) {
 		t.Errorf("lock did not report its message: %q", out)
 	}
 
-	// An apply is now blocked, and told why.
+	// An apply is now blocked, and told why. A held lock is not "another rdk
+	// apply" — nothing is applying — so the message must say "locked", not
+	// "apply", and it must not explain how to use --with-lock: that
+	// instruction is for the holder alone, and belongs only in rdk lock's own
+	// success output above.
 	_, errOut, err := runSplit(t, dir, "apply")
 	if err == nil {
 		t.Fatal("apply ran under someone else's lock")
 	}
 	if !strings.Contains(errOut, "agent working") {
 		t.Errorf("the blocked apply does not say why: %q", errOut)
+	}
+	if !strings.Contains(errOut, "is locked") || strings.Contains(errOut, "another rdk apply") {
+		t.Errorf("the blocked apply does not name a held lock for what it is: %q", errOut)
+	}
+	if strings.Contains(errOut, "--with-lock=") {
+		t.Errorf("the blocked apply explains how to use --with-lock: %q", errOut)
 	}
 
 	id := lockIDFromDisk(t, dir)

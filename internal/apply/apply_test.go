@@ -168,10 +168,12 @@ func TestScratchTargetNamesRdkAndSaysToRemoveIt(t *testing.T) {
 }
 
 // The blocked-apply error is exactly where an agent looks for a way past a
-// lock, so it has to hand over the id and warn off --with-lock (which does
-// not exist yet), while carrying the holder's details as attrs a JSONL
-// consumer can match on directly rather than parsing the sentence.
-func TestRunReportsAnExistingLockWithAttrs(t *testing.T) {
+// lock, so it has to hand over the id, while carrying the holder's details as
+// attrs a JSONL consumer can match on directly rather than parsing the
+// sentence. An apply lock is nothing an agent could ever legitimately hold
+// (--with-lock is only for a held lock), so its hint says nothing about
+// --with-lock at all rather than warning off a door that was never relevant.
+func TestRunReportsAnExistingApplyLockWithAttrs(t *testing.T) {
 	store, root := setupRepo(t)
 	if err := os.MkdirAll(filepath.Join(root, repofs.ScratchDir), 0o755); err != nil {
 		t.Fatal(err)
@@ -189,16 +191,20 @@ func TestRunReportsAnExistingLockWithAttrs(t *testing.T) {
 	if d.Code != diag.CodeApplyLocked {
 		t.Errorf("code = %q, want %q", d.Code, diag.CodeApplyLocked)
 	}
+	if !strings.Contains(d.Summary, "another rdk apply holds this repository") {
+		t.Errorf("summary %q does not name it as an apply, not a held lock", d.Summary)
+	}
 	if !strings.Contains(d.Summary, "9f3a1c4e7b2d8a05") {
 		t.Errorf("summary %q does not name the lock", d.Summary)
 	}
-	// The text handler indents only a hint's first line, so a multi-line hint
-	// would render badly — the holder's details belong in the summary instead.
-	if strings.Contains(d.Hint, "\n") {
-		t.Errorf("hint %q spans more than one line", d.Hint)
+	if !strings.Contains(d.Hint, "--break-lock=9f3a1c4e7b2d8a05") {
+		t.Errorf("hint %q does not name --break-lock", d.Hint)
 	}
-	if !strings.Contains(d.Hint, "--break-lock=9f3a1c4e7b2d8a05") || !strings.Contains(d.Hint, "never --with-lock") {
-		t.Errorf("hint %q does not warn off the wrong door", d.Hint)
+	// --with-lock is only ever for a held lock; an apply lock's hint must not
+	// mention it at all, not even as a warning — there is nothing to warn
+	// against here.
+	if strings.Contains(d.Hint, "--with-lock") {
+		t.Errorf("hint %q mentions --with-lock for an apply lock", d.Hint)
 	}
 	attrs := map[string]any{}
 	for _, a := range d.Attrs {
@@ -214,6 +220,65 @@ func TestRunReportsAnExistingLockWithAttrs(t *testing.T) {
 		t.Errorf("host attr = %v, want builder-3", attrs["host"])
 	}
 	// Exit 1: someone else holding the lock is environmental, not an rdk bug.
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
+	}
+}
+
+// A held lock blocking an apply is not "another rdk apply" — nothing is
+// applying — so it must render as "locked", carry the holder's message, and
+// warn off --with-lock (the id is right there, and someone will try it) while
+// never explaining how to use it: that instruction belongs only in rdk lock's
+// own success output, seen only by the person who took the lock.
+func TestRunReportsAnExistingHeldLockWithAttrs(t *testing.T) {
+	store, root := setupRepo(t)
+	if err := os.MkdirAll(filepath.Join(root, repofs.ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := `{"id":"9f3a1c4e7b2d8a05","kind":"held","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z","message":"agent refactoring the s3-bucket module"}`
+	if err := os.WriteFile(filepath.Join(root, repofs.ScratchDir, "lock"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Run(store, "v")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeApplyLocked {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeApplyLocked)
+	}
+	if strings.Contains(d.Summary, "apply") {
+		t.Errorf("summary %q calls a held lock an apply", d.Summary)
+	}
+	if !strings.Contains(d.Summary, "is locked") {
+		t.Errorf("summary %q does not say the repository is locked", d.Summary)
+	}
+	if !strings.Contains(d.Summary, "agent refactoring the s3-bucket module") {
+		t.Errorf("summary %q does not carry the holder's message", d.Summary)
+	}
+	if !strings.Contains(d.Hint, "--break-lock=9f3a1c4e7b2d8a05") {
+		t.Errorf("hint %q does not name --break-lock", d.Hint)
+	}
+	// The warning form ("do not use") is allowed and expected; the
+	// instruction form ("--with-lock=<id>", showing how to use it) is not —
+	// that belongs only to rdk lock's own success output. Checking for the
+	// bare flag name would pass vacuously since it's expected to appear as
+	// part of the warning, so this checks specifically for the "=" that would
+	// make it an instruction.
+	if !strings.Contains(d.Hint, "--with-lock") {
+		t.Errorf("hint %q does not warn off --with-lock", d.Hint)
+	}
+	if strings.Contains(d.Hint, "--with-lock=") {
+		t.Errorf("hint %q explains how to use --with-lock, which is not this reader's to use", d.Hint)
+	}
+	attrs := map[string]any{}
+	for _, a := range d.Attrs {
+		attrs[a.Key] = a.Value()
+	}
+	if attrs["lock_id"] != "9f3a1c4e7b2d8a05" {
+		t.Errorf("lock_id attr = %v", attrs["lock_id"])
+	}
 	if got := diag.ExitCode(err); got != 1 {
 		t.Errorf("ExitCode = %d, want 1", got)
 	}

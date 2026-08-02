@@ -119,31 +119,47 @@ func Run(store repofs.Store, version string) (Result, error) {
 // failing to acquire because something already holds the repository is the
 // identical condition — not a second, differently-worded message — so it
 // calls this too rather than growing its own copy.
+//
+// The wording is keyed off info.Kind: an "apply" lock really is another rdk
+// apply, but a "held" lock is nothing applying at all, and saying so would be
+// false. Neither branch explains how to use --with-lock, even though a held
+// lock's id is exactly what it needs — that instruction belongs only in rdk
+// lock's own success output (cmd/lock.go), the one place only the holder
+// sees it. Whoever is blocked here is very often not the holder, and warning
+// them off the wrong door (held case only — an apply lock is never a door
+// --with-lock could open) costs a clause; explaining the right one to a
+// reader who may not be entitled to it would not be reversible once it ships.
 func LockedDiagnostic(err error) (diag.Diagnostic, bool) {
 	info, ok := repofs.LockInfoFromError(err)
 	if !ok {
 		return diag.Diagnostic{}, false
 	}
-	// The holder's details go in the summary, not the hint: the text handler
-	// indents only a hint's first line, so a multi-line hint renders badly.
-	// The Message tail is only present for a kind "held" lock, so it's
-	// appended rather than baked into a fixed format — leaving a dangling
-	// colon for kind "apply" (no message) would be its own small lie.
-	summary := fmt.Sprintf("another rdk apply holds this repository (lock %s, pid %d on %s since %s)",
-		info.ID, info.PID, info.Host, info.Since)
+
+	// The holder's details go in the summary, not the hint, so the hint stays
+	// short and single-purpose regardless of how much there is to say about
+	// the holder. The Message tail is only present for a kind "held" lock, so
+	// it's appended rather than baked into a fixed format — leaving a
+	// dangling colon for kind "apply" (no message) would be its own small
+	// lie.
+	var summary, hint string
+	if info.Kind == "held" {
+		summary = fmt.Sprintf("this repository is locked (lock %s, pid %d on %s since %s)",
+			info.ID, info.PID, info.Host, info.Since)
+		hint = fmt.Sprintf("wait for it to be unlocked; if it is stranded use --break-lock=%s — do not use --with-lock unless this lock is yours",
+			info.ID)
+	} else {
+		summary = fmt.Sprintf("another rdk apply holds this repository (lock %s, pid %d on %s since %s)",
+			info.ID, info.PID, info.Host, info.Since)
+		hint = fmt.Sprintf("wait for it; if it is stranded use --break-lock=%s", info.ID)
+	}
 	if info.Message != "" {
 		summary += ": " + info.Message
 	}
-	// --with-lock is step 3 of the lock feature, but this is exactly where an
-	// agent looks for a way past a blocked lock, and the error already hands
-	// over the id both --break-lock and --with-lock need. Warning off the
-	// wrong door before it exists is cheaper than retrofitting the warning
-	// once it does.
+
 	return diag.Diagnostic{
 		Code:    diag.CodeApplyLocked,
 		Summary: summary,
-		Hint: fmt.Sprintf("wait for it; if it is stranded use --break-lock=%s — never --with-lock, which is only for the process that took the lock",
-			info.ID),
+		Hint:    hint,
 		Attrs: []diag.Attr{
 			diag.Str("lock_id", info.ID),
 			diag.Str("lock_kind", info.Kind),

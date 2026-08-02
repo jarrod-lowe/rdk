@@ -92,12 +92,17 @@ func (a *app) unlockCmd() *cobra.Command {
 				// not apply-locked: nothing is necessarily holding the
 				// repository, you named a lock and the repository disagreed
 				// about it. Wrap (not New) so the underlying message — which
-				// already names --break-lock for the apply-lock case —
-				// reaches the user as the cause.
+				// already distinguishes all three cases, including naming
+				// --break-lock for the apply-lock one — reaches the user as
+				// the cause; the hint just points at it rather than repeating
+				// (or worse, guessing wrong at) which case applied. "re-run
+				// rdk apply to see the current lock" used to be the hint, but
+				// that describes a diagnostic step that will not happen when
+				// no lock exists at all — the next apply just succeeds.
 				return diag.Wrap(err, diag.Diagnostic{
 					Code:    diag.CodeLockMismatch,
 					Summary: fmt.Sprintf("cannot unlock %s", id),
-					Hint:    "re-run rdk apply to see the current lock, if any, and its id",
+					Hint:    "read the cause above: it says whether nothing is locked, the id is wrong, or it's an apply lock (use --break-lock for that)",
 				})
 			}
 			a.log.Result(diag.Diagnostic{
