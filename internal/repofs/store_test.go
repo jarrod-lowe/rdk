@@ -718,6 +718,45 @@ func TestMaterializeRefusesWhileLocked(t *testing.T) {
 	}
 }
 
+// Testing the actual race directly needs two processes racing between a Stat
+// and a lock acquisition — not worth the harness. This instead asserts the
+// invariant that makes the race impossible: Materialize resolves the lock
+// (acquire, or fail, or adopt via UseLock) before it ever reads managedDir's
+// state. It plants a lock so acquisition fails immediately, and — separately
+// — makes managedDir itself unreadable (EACCES, not ENOENT, same trick as
+// TestMaterializeReportsAnUnreadableManagedDir) so that a Stat which ran
+// before the lock check would surface *that* error instead of ErrLocked.
+// Getting ErrLocked back is only possible if the lock was checked first.
+//
+// What this does not cover: two real processes actually racing between the
+// Stat and a concurrent Materialize's displace-then-die. That scenario needs
+// two processes to reproduce honestly, and isn't exercised here — this test
+// only shows that a single Materialize call never reads managedDir state
+// ahead of settling the lock, which is the property the fix relies on.
+func TestMaterializeChecksTheLockBeforeReadingManagedDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	s, root := newTestStore(t)
+	writeLock(t, root, heldLock())
+
+	sub := filepath.Join(root, "nested")
+	if err := os.MkdirAll(filepath.Join(sub, "managed"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(sub, 0o700) })
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err := s.Materialize("nested/managed", set)
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want ErrLocked — a different error means Stat read managedDir before the lock was checked", err)
+	}
+}
+
 // A malformed lock must still block. Failing open here would mean a corrupt
 // file silently disables the exclusion.
 func TestMaterializeRefusesWhileLockedEvenIfUnreadable(t *testing.T) {

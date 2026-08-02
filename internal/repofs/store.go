@@ -312,20 +312,6 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 
-	// Taken once, up front, because the answer drives two independent
-	// decisions below: whether .rdk/old needs to be cleared before staging
-	// even starts, and — using the very same result, not a second Stat —
-	// whether there is a tree to displace once staging succeeds. Its
-	// non-ENOENT error is returned rather than treated as "absent": not
-	// knowing whether there is a tree to displace is its own failure, and
-	// falling through would surface a confusing rename error instead of the
-	// real cause.
-	_, managedStatErr := s.root.Stat(managedDir)
-	managedExists := managedStatErr == nil
-	if managedStatErr != nil && !os.IsNotExist(managedStatErr) {
-		return managedStatErr
-	}
-
 	// Guards the scratch directory itself, and writes its .gitignore; see
 	// ensureScratchDir for why Lstat rather than Stat, why this is not folded
 	// into checkPathComponents, and why the .gitignore write lives there
@@ -357,6 +343,27 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 			return err
 		}
 		defer s.ReleaseLock()
+	}
+
+	// Deliberately not read any earlier: the answer drives two decisions below
+	// (whether .rdk/old needs clearing, and — the very same result, not a
+	// second Stat — whether there is a tree to displace once staging
+	// succeeds), and both are only safe to act on once nothing else can be
+	// changing managedDir underneath this run. Reading it before the lock was
+	// exactly the bug this fixes: stat sees the tree, block on the lock,
+	// another run displaces it and dies before publishing, this run then
+	// acquires the lock still believing the tree exists and clears .rdk/old —
+	// destroying the only remaining copy. Still runs on the usingLock path,
+	// where nothing above acquires anything: an adopted lock is just as much a
+	// lock as one taken here, so the state it protects is exactly as settled.
+	// Its non-ENOENT error is returned rather than treated as "absent": not
+	// knowing whether there is a tree to displace is its own failure, and
+	// falling through would surface a confusing rename error instead of the
+	// real cause.
+	_, managedStatErr := s.root.Stat(managedDir)
+	managedExists := managedStatErr == nil
+	if managedStatErr != nil && !os.IsNotExist(managedStatErr) {
+		return managedStatErr
 	}
 
 	// .rdk/new is never trusted across runs, so it is cleared unconditionally.
