@@ -29,6 +29,10 @@ func (a *app) applyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Gives the signal handler installed in execute a route to this
+			// store, so Ctrl-C during Materialize below releases the lock
+			// instead of stranding it.
+			a.setStore(store)
 			if breakLock != "" {
 				info, err := store.BreakLock(breakLock)
 				if err != nil {

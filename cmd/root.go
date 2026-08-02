@@ -5,10 +5,14 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
 	"github.com/jarrod-lowe/rdk/internal/kind"
 	"github.com/jarrod-lowe/rdk/internal/logger"
+	"github.com/jarrod-lowe/rdk/internal/repofs"
 	"github.com/spf13/cobra"
 )
 
@@ -21,6 +25,29 @@ type app struct {
 	logFormat string
 	logLevel  string
 	color     string
+
+	// storeMu guards store, which is set by whichever subcommand's RunE opens
+	// one (apply, so far) and read by the signal handler below. The two run on
+	// different goroutines — RunE on the one root.Execute() called from, the
+	// handler on its own — so the pointer needs a lock even though only one
+	// write ever happens.
+	storeMu sync.Mutex
+	store   repofs.Store
+}
+
+// setStore records the Store a RunE opened, giving the signal handler a route
+// to it. A command that never takes a lock (version, init) can call this too
+// with no ill effect: ReleaseLock is a no-op when this process holds nothing.
+func (a *app) setStore(s repofs.Store) {
+	a.storeMu.Lock()
+	a.store = s
+	a.storeMu.Unlock()
+}
+
+func (a *app) getStore() repofs.Store {
+	a.storeMu.Lock()
+	defer a.storeMu.Unlock()
+	return a.store
 }
 
 // NewRootCmd builds the root command with all subcommands attached.
@@ -72,12 +99,59 @@ func execute(args []string, stdout, stderr io.Writer) int {
 	if stderr != nil {
 		root.SetErr(stderr)
 	}
+
+	stop := a.handleSignals()
+	defer stop()
+
 	err := root.Execute()
 	if err == nil {
 		return 0
 	}
 	err = a.renderFailure(err, stdout, stderr)
 	return diag.ExitCode(err)
+}
+
+// handleSignals installs a SIGINT/SIGTERM handler for the duration of a run
+// and returns a func that tears it down. SIGINT and SIGTERM don't run
+// deferred functions, so without this, Ctrl-C during an apply strands
+// .rdk/lock and every apply after it needs --break-lock — turning the rare
+// recovery path into the routine one. The handler is confined to releasing
+// the lock this process holds (a's Store already refuses to release anyone
+// else's, including one left by `rdk lock`, once that exists) and exiting; it
+// must not grow into general cleanup, which is what a signal handler
+// duplicating defer's job would become.
+//
+// The channel is buffered by one and read at most once: os/signal never
+// blocks sending to it, so a second signal arriving while the first is still
+// being handled is simply dropped rather than deadlocking anything, and
+// os.Exit ends the process before a third could matter.
+func (a *app) handleSignals() func() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case sig := <-sigCh:
+			if store := a.getStore(); store != nil {
+				// Best-effort: a run this deep into interruption has nowhere
+				// left to report a release failure to, and exiting promptly
+				// matters more than that report.
+				_ = store.ReleaseLock()
+			}
+			// Shell convention: 128 + signal number, so a script can tell an
+			// interruption (130/143) from a definition error (1) or an rdk
+			// bug (2). os.Exit bypasses execute's normal return because a
+			// signal is not a value root.Execute() ever produces.
+			os.Exit(128 + int(sig.(syscall.Signal)))
+		case <-done:
+		}
+	}()
+
+	return func() {
+		signal.Stop(sigCh)
+		close(done)
+	}
 }
 
 // renderFailure logs err through a's own logger and returns it unchanged, so

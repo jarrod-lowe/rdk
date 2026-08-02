@@ -11,6 +11,11 @@ something else.
 Exit status is a property of the run, not of a code: a failure exits 1, an
 unanticipated error exits 2, and warnings and results do not affect the exit
 status on their own — a run that warns and then fails still exits 1.
+`SIGINT` and `SIGTERM` follow the shell convention of 128 + signal instead —
+130 and 143 — so a script can tell an interruption apart from either of those.
+An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
+`SIGKILL`, a power loss, or an OOM kill leaves it stranded, and
+`--break-lock=<id>` is the recovery.
 
 ## Failures
 
