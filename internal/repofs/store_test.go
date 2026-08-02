@@ -958,17 +958,21 @@ func TestHoldLockWritesTheScratchGitignore(t *testing.T) {
 // ensureScratchDir runs before the lock, in both HoldLock and Materialize, so
 // two of either racing is normal, not exceptional — a repository with two
 // people or two applies starting close together hits this on every fresh
-// scratch. The remove-then-create is not something user code can pin to a
-// precise instant, so this cannot force the collision on every run the way a
-// unit test normally would; it only drives enough concurrent calls that Go's
-// scheduler interleaves some of them across the RemoveAll/OpenFile gap. What
-// is deterministic is the assertion: however they interleave, none may ever
-// return an error — that's what "idempotent" means here. Before treating
-// EEXIST as success, this reliably caught the regression (most runs produced
-// at least one non-nil error); run with -race and it also confirms there is
-// no data race underneath, on top of the logical one this targets.
+// scratch. Exactly when the goroutines interleave is not something a test can
+// pin to a precise instant, so this cannot force any particular interleaving
+// the way a unit test normally would; it only drives enough concurrent calls
+// that Go's scheduler interleaves some of them across
+// publishScratchGitignore's write-then-rename gap. What is deterministic is
+// the assertion: however they interleave, none may ever return an error —
+// that's what "idempotent" means here — and the .gitignore they leave behind
+// must be the complete "*\n", never empty or partial. That second assertion
+// is the one this test could not make before write-then-rename replaced
+// remove-then-O_EXCL: a losing goroutine used to return success (EEXIST
+// treated as "already done") without ever checking what was actually on
+// disk. Run with -race and this also confirms there is no data race
+// underneath, on top of the logical one this targets.
 func TestEnsureScratchDirIsIdempotentUnderConcurrency(t *testing.T) {
-	s, _ := newTestStore(t)
+	s, root := newTestStore(t)
 	st := s.(*osStore)
 
 	const n = 50
@@ -989,6 +993,28 @@ func TestEnsureScratchDirIsIdempotentUnderConcurrency(t *testing.T) {
 	for i, err := range errs {
 		if err != nil {
 			t.Errorf("goroutine %d: ensureScratchDir returned %v, want nil", i, err)
+		}
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, ScratchDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("scratch .gitignore missing after concurrent calls: %v", err)
+	}
+	if string(got) != "*\n" {
+		t.Errorf("scratch .gitignore = %q, want the complete %q — a reader saw a partial write", got, "*\n")
+	}
+
+	// Renaming a temp file consumes its name whether or not that rename is
+	// later overwritten by someone else's rename onto the same destination,
+	// so none of the n temp names should survive as litter next to the
+	// .gitignore they were building.
+	entries, err := os.ReadDir(filepath.Join(root, ScratchDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != ".gitignore" {
+			t.Errorf("unexpected entry left in scratch dir: %s", e.Name())
 		}
 	}
 }

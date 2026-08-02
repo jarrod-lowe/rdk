@@ -654,34 +654,63 @@ func (s *osStore) ensureScratchDir() error {
 	if err := s.root.MkdirAll(ScratchDir, 0o755); err != nil {
 		return err
 	}
-	// Remove-then-create rather than truncate: RemoveAll unlinks a symlink as
-	// itself, and O_EXCL then cannot follow one, so a planted link cannot aim
-	// this write at a file the user owns. The file is rdk's, so removing it is
-	// ours to do (rule 13: always write). This protects the leaf itself, which
-	// the Lstat above cannot: that only verifies ScratchDir, and .gitignore is
-	// the name inside it.
-	gitignore := ScratchDir + "/.gitignore"
-	if err := s.root.RemoveAll(gitignore); err != nil {
+	return s.publishScratchGitignore()
+}
+
+// publishScratchGitignore (re)writes the scratch .gitignore, unconditionally
+// (rule 13: always write) — this protects the leaf itself, which the Lstat in
+// ensureScratchDir cannot: that only verifies ScratchDir, and .gitignore is
+// the name inside it.
+//
+// It used to remove the file and recreate it with O_EXCL, on the reasoning
+// that EEXIST from a racing run's O_EXCL meant the desired state already
+// held. That reasoning was wrong: EEXIST only proves another run *created*
+// the file, not that it finished writing "*\n" — so a run that lost the
+// O_EXCL race could return success while the winner's Write had not
+// happened yet, and a reader (or `git status`) landing in that window saw a
+// zero-length .gitignore, briefly unignoring the scratch dir's contents.
+//
+// Writing the full content to an unpredictable temporary name and renaming
+// it into place closes that window: rename is atomic, so any reader sees
+// either the previous .gitignore or the complete new one, never a partial
+// write. Two concurrent calls each write their own temp name — no O_EXCL
+// collision between them — and whichever rename lands second simply wins;
+// the content is the same constant either way, so it doesn't matter which.
+//
+// Renaming onto an existing path also preserves the no-follow property the
+// old remove-then-O_EXCL existed for: rename() replaces the directory entry
+// at the destination without dereferencing a symlink that might be sitting
+// there, the same way unlink() does not follow one, unlike open(). Verified
+// directly, not assumed — TestMaterializeDoesNotFollowASymlinkedScratchGitignore
+// plants a symlink at the .gitignore path pointing at a file the user owns
+// and asserts that file is untouched after this runs.
+func (s *osStore) publishScratchGitignore() error {
+	// Random, not sequential or fixed: two concurrent runs must not choose
+	// the same temp name and stomp each other's in-flight write, the very
+	// failure mode this replaces.
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
 		return err
 	}
-	f, err := s.root.OpenFile(gitignore, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	tmp := ScratchDir + "/.gitignore." + hex.EncodeToString(suffix) + ".tmp"
+	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
-		// Another run created it between our remove and our create. The
-		// content is a constant and the file is rdk's, so the desired state
-		// already holds — and because we never wrote through anything, the
-		// no-follow property the remove-then-O_EXCL exists for is intact.
-		// Racing here is expected: ensureScratchDir runs before the lock,
-		// since the lock file needs the directory it makes.
-		if os.IsExist(err) {
-			return nil
-		}
 		return err
 	}
 	if _, err := f.Write([]byte("*\n")); err != nil {
 		f.Close()
+		_ = s.root.Remove(tmp)
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		_ = s.root.Remove(tmp)
+		return err
+	}
+	if err := s.root.Rename(tmp, ScratchDir+"/.gitignore"); err != nil {
+		_ = s.root.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // HoldLock takes a lock that outlives this process, so a person or agent can
