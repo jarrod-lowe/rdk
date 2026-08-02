@@ -321,28 +321,15 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return managedStatErr
 	}
 
-	// Judged before MkdirAll, and by Lstat rather than Stat: MkdirAll succeeds
-	// whenever the path already resolves to a directory, including through a
-	// symlink, and by then the .gitignore write below would already be aimed
-	// wherever that symlink points. Lstat sees the symlink itself rather than
-	// its target, so it catches what MkdirAll cannot refuse.
+	// Guards the scratch directory itself; see ensureScratchDir for why Lstat
+	// rather than Stat, and why this is not folded into checkPathComponents.
 	//
-	// This is not folded into checkPathComponents even though the condition is
-	// the same (Lstat, non-directory): ScratchDir is a single top-level path
-	// component, so checkPathComponents would Lstat exactly this one entry and
-	// nothing more — genuinely the same check, not a broader one. Kept
-	// separate because modeKind here can say "device"/"socket"/"named
-	// pipe"/"irregular file" as well as "symlink" or "file", where
-	// checkPathComponents' sentinel (ErrUnsafePath) is worded for the symlink
-	// case specifically; a bare file at .rdk deserves to be named as a file,
-	// not folded into "passes through a symlink".
-	//
-	// scratchNew and scratchOld get no matching check: both are unconditionally
-	// RemoveAll'd a few lines down, and RemoveAll unlinks a symlink as itself
-	// rather than recursing through it (it only recurses on EISDIR, which a
-	// symlink never returns), so a symlink planted at either name is inert —
-	// removed, not followed. ScratchDir is different because nothing removes
-	// it first; MkdirAll walks straight through it.
+	// scratchNew and scratchOld get no matching check: both are RemoveAll'd a
+	// few lines down, and RemoveAll unlinks a symlink as itself rather than
+	// recursing through it (it only recurses on EISDIR, which a symlink never
+	// returns), so a symlink planted at either name is inert — removed, not
+	// followed. ScratchDir is different because nothing removes it first;
+	// MkdirAll walks straight through it.
 	if err := s.ensureScratchDir(); err != nil {
 		return err
 	}
