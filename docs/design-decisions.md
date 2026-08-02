@@ -306,6 +306,17 @@ explainability, because each layer announces itself.
   mechanism; setting-level pins are the exception for when rdk *does* move
   everyone to a new module version but must preserve one specific legacy value).
   Do not build both without settling this.
+- **Provider naming rules are unvalidated until the policy exists.** A
+  definition's `name` is validated as a Terraform identifier (it becomes the
+  module label verbatim), but *not* against the target provider's own naming
+  rules — and today that same name is used as the physical resource name. So
+  `Assets`, `asset_store` and the single character `a` all pass rdk and are
+  rejected by S3. Deliberately not fixed at the kind level: the naming policy
+  is what will derive physical names from the logical one, and that is where
+  provider rules belong — validating them twice, in two places, with two
+  notions of what the name *is*, would be worse than the gap. **When the naming
+  policy is built, this must be part of it**: the policy owns the mapping, so
+  it owns rejecting a logical name it cannot map. (Raised in review of PR-1.)
 - **Intra-layer conflicts, not just inter-layer.** Two applied policies both
   setting `memory` is a conflict *within* layer 3. Need a rule: explicit policy
   priority, or error-on-conflict (leaning error, unless one is a mandate).

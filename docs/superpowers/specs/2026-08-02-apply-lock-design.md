@@ -251,6 +251,14 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
   `--with-lock` asserts "I am the coordinator here": rdk serialises everyone
   else, not you against yourself.
 - A hard kill strands a lock. The recovery is manual and the message says so.
+- **Neither `BreakLock` nor `ReleaseLock` is atomic between checking the id and
+  removing the file.** If the observed holder releases in that window and a
+  third run acquires a fresh lock, the removal deletes the newcomer's. There is
+  no portable atomic compare-and-delete for a file, so closing this would mean
+  a second lock guarding the first — turtles down. The window is two syscalls
+  wide, against a `--break-lock` window that spans a human reading an error and
+  typing a command, so the id check remains worth having even though it is not
+  airtight. Accepted, not overlooked.
 
 ## Sequencing
 
