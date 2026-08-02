@@ -80,8 +80,9 @@ func (a *app) applyCmd() *cobra.Command {
 				// blocked apply's error, since the token is identical either
 				// way. Prevention is impossible, so every run under a lock
 				// names whose it is and what they said they were doing — but
-				// that notice now rides with the result below instead of
-				// firing here as its own warning, so it cannot be silenced by
+				// that notice now rides with whatever apply.Run produces below
+				// (a result on success, an error on failure) instead of firing
+				// here as its own warning, so it cannot be silenced by
 				// --log-level independently of the outcome it qualifies.
 				lockInfo = info
 				underLock = true
@@ -124,6 +125,15 @@ func (a *app) applyCmd() *cobra.Command {
 					// it would have ridden on the result.
 					err = withBrokeLockErr(err, brokenLock)
 				}
+				if underLock {
+					// Adoption succeeding and the apply then failing is exactly
+					// the case that loses this notice if it only rides on a
+					// successful result: the run did proceed under someone's
+					// lock, whether or not what it then tried to do worked. (A
+					// blocked-apply error never reaches here at all — this run
+					// already got past that by naming a lock UseLock accepted.)
+					err = withUnderLockErr(err, lockInfo)
+				}
 				return err
 			}
 			// Warnings print before the summary so the summary lands last, and
@@ -156,20 +166,41 @@ func (a *app) applyCmd() *cobra.Command {
 // notice) once withBrokeLockNotice below needed to be told apart from it —
 // the two report different facts and must not collide in JSONL.
 func withUnderLockNotice(d diag.Diagnostic, info repofs.LockInfo) diag.Diagnostic {
-	d.Summary += fmt.Sprintf(" (under lock %s, held by pid %d", info.ID, info.PID)
+	d.Summary += underLockSuffix(info)
+	d.Attrs = append(d.Attrs, underLockAttrs(info)...)
+	return d
+}
+
+// withUnderLockErr is withUnderLockNotice's counterpart for the path where
+// apply.Run fails after this run adopted someone else's lock: adoption
+// succeeding and the apply then failing is exactly the case a result-only
+// notice cannot cover, since a failure produces no result to ride on — only
+// the *diag.Error rendered by Fail, which (like withBrokeLockErr's) is
+// always Error level and therefore never filtered by --log-level.
+func withUnderLockErr(err error, info repofs.LockInfo) error {
+	return withLockErr(err, underLockSuffix(info), underLockAttrs(info))
+}
+
+// underLockSuffix and underLockAttrs are shared by the result and error
+// paths above so the two can never say the under-lock fact in different
+// words depending on whether apply.Run happened to succeed.
+func underLockSuffix(info repofs.LockInfo) string {
+	s := fmt.Sprintf(" (under lock %s, held by pid %d", info.ID, info.PID)
 	if info.Message != "" {
-		d.Summary += ": " + info.Message
+		s += ": " + info.Message
 	}
-	d.Summary += ")"
-	d.Attrs = append(d.Attrs,
+	return s + ")"
+}
+
+func underLockAttrs(info repofs.LockInfo) []diag.Attr {
+	return []diag.Attr{
 		diag.Str("lock_id", info.ID),
 		diag.Str("lock_kind", info.Kind),
 		diag.Str("host", info.Host),
 		diag.Int("pid", info.PID),
 		diag.Str("since", info.Since),
 		diag.Str("message", info.Message),
-	)
-	return d
+	}
 }
 
 // withBrokeLockNotice is a sibling of withUnderLockNotice, not a shared
@@ -192,25 +223,31 @@ func withBrokeLockNotice(d diag.Diagnostic, info repofs.LockInfo) diag.Diagnosti
 
 // withBrokeLockErr is withBrokeLockNotice's counterpart for the path where
 // apply.Run fails after the lock was already broken: breaking happens before
-// Run and is not undone by Run's failure, so the fact has to reach the user
-// some way that survives --log-level — and unlike a result, a failure has no
-// stdout line to ride on, only the *diag.Error rendered by Fail, which is
-// always Error level and therefore never filtered by --log-level (there is
-// no level stricter than error). Folding the notice into that diagnostic's
-// Summary and Attrs is what makes it visible on the one output a failed
-// apply is guaranteed to produce.
+// Run and is not undone by Run's failure, so the fact does not get to vanish
+// just because what followed then failed.
 func withBrokeLockErr(err error, info repofs.LockInfo) error {
+	return withLockErr(err, brokeLockSuffix(info), brokeLockAttrs(info))
+}
+
+// withLockErr upgrades err's diagnostic with a lock notice's precomputed
+// suffix and attrs, or wraps err in plain text if it isn't a *diag.Error at
+// all. Shared by withBrokeLockErr and withUnderLockErr: once written out
+// twice, the two were identical apart from which suffix/attrs a call
+// computed — not a difference in behaviour, so passing those in as data
+// avoids the alternative of a mode flag whose only job would be selecting
+// between two copies of the same plumbing.
+func withLockErr(err error, suffix string, attrs []diag.Attr) error {
 	var d *diag.Error
 	if !errors.As(err, &d) {
 		// apply.Run is documented to return diagnostics, not bare errors, so
 		// this is a defensive fallback, not the expected path — mirroring how
 		// Fail itself treats an error it cannot upgrade: render it rather than
 		// dropping the one fact this function exists to preserve.
-		return fmt.Errorf("%w%s", err, brokeLockSuffix(info))
+		return fmt.Errorf("%w%s", err, suffix)
 	}
 	upgraded := *d
-	upgraded.Summary += brokeLockSuffix(info)
-	upgraded.Attrs = append(append([]diag.Attr{}, d.Attrs...), brokeLockAttrs(info)...)
+	upgraded.Summary += suffix
+	upgraded.Attrs = append(append([]diag.Attr{}, d.Attrs...), attrs...)
 	return &upgraded
 }
 

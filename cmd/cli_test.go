@@ -652,6 +652,41 @@ func TestApplyWithLockSucceedsAndLockSurvives(t *testing.T) {
 	}
 }
 
+// Adoption succeeding and the apply then failing is exactly the case a
+// result-only notice loses: the run did proceed under someone's lock
+// regardless of whether what it then tried to do worked, so the notice has
+// to survive on the error the same way withBrokeLockErr's does for
+// --break-lock.
+func TestApplyWithLockNoticeSurvivesAFailedApply(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	if _, _, err := runSplit(t, dir, "lock", "-m", "agent refactoring the s3-bucket module"); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	id := lockIDFromDisk(t, dir)
+	// A stray file makes apply.Run fail after the lock has already been
+	// adopted.
+	os.WriteFile(filepath.Join(dir, "rdk", "notes.txt"), []byte("scratch\n"), 0o644)
+
+	_, errOut, err := runSplit(t, dir, "apply", "--with-lock="+id)
+	if err == nil {
+		t.Fatal("apply succeeded despite the stray file")
+	}
+	for _, want := range []string{"notes.txt", "under lock", id, strconv.Itoa(os.Getpid()), "agent refactoring the s3-bucket module"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("failure does not mention %q: %q", want, errOut)
+		}
+	}
+	// --with-lock never releases what it adopted, failure or not.
+	if _, statErr := os.Stat(filepath.Join(dir, ".rdk", "lock")); statErr != nil {
+		t.Errorf(".rdk/lock did not survive a failed --with-lock apply: %v", statErr)
+	}
+}
+
 // The announcement is the safety property, not decoration: rdk cannot tell a
 // legitimate holder from someone who copied the id out of a blocked apply's
 // error, so it has to say whose lock this is and why every time — riding with
