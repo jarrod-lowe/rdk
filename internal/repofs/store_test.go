@@ -826,6 +826,23 @@ func TestReleaseLockLeavesAHeldLockAlone(t *testing.T) {
 	}
 }
 
+// A lock committed into the repository is unreleasable: its id belongs to a
+// process that is long gone. The scratch has to be invisible to git from the
+// moment it exists, not from the first apply.
+func TestHoldLockWritesTheScratchGitignore(t *testing.T) {
+	s, root := newTestStore(t)
+	if _, err := s.HoldLock("working"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, ScratchDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("scratch .gitignore missing after HoldLock: %v", err)
+	}
+	if string(got) != "*\n" {
+		t.Errorf("scratch .gitignore = %q, want %q", got, "*\n")
+	}
+}
+
 func TestHoldLockRefusesWhenAlreadyLocked(t *testing.T) {
 	s, root := newTestStore(t)
 	writeLock(t, root, heldLock())

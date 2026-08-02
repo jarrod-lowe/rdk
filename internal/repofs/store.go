@@ -192,11 +192,11 @@ type Store interface {
 	// component of managedDir is refused via ErrUnsafePath for the same
 	// reason. Parent dirs are created; files use 0o644, dirs 0o755. managedDir
 	// is repo-relative. Materialize acquires the repository lock for its
-	// duration (after the ScratchDir check and MkdirAll, before the
-	// .gitignore write) and releases it before returning, on every path
-	// including failure — a stranded lock is not the price of an ordinary
-	// error. If something else already holds it, Materialize returns an error
-	// wrapping ErrLocked without touching the tree.
+	// duration (after the ScratchDir check, MkdirAll, and .gitignore write)
+	// and releases it before returning, on every path including failure — a
+	// stranded lock is not the price of an ordinary error. If something else
+	// already holds it, Materialize returns an error wrapping ErrLocked
+	// without touching the tree.
 	Materialize(managedDir string, set *FileSet) error
 	// Seed creates a user-owned file once: it never overwrites and never
 	// follows a symlink at the target, and it refuses via ErrUnsafePath if any
@@ -326,8 +326,10 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return managedStatErr
 	}
 
-	// Guards the scratch directory itself; see ensureScratchDir for why Lstat
-	// rather than Stat, and why this is not folded into checkPathComponents.
+	// Guards the scratch directory itself, and writes its .gitignore; see
+	// ensureScratchDir for why Lstat rather than Stat, why this is not folded
+	// into checkPathComponents, and why the .gitignore write lives there
+	// rather than here.
 	//
 	// scratchNew and scratchOld get no matching check: both are RemoveAll'd a
 	// few lines down, and RemoveAll unlinks a symlink as itself rather than
@@ -339,13 +341,10 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 
-	// Acquired here — after ScratchDir exists, before anything is written into
-	// it — because the .gitignore write just below is remove-then-create, and
-	// two concurrent runs racing into that O_EXCL would otherwise fail
-	// spuriously instead of one of them simply waiting on the lock. Released on
-	// every path out of this function, including a panic, which is what makes
-	// a stranded lock the cost of only a hard kill rather than of an ordinary
-	// error.
+	// Acquired here — after ScratchDir (and its .gitignore) exist, before
+	// anything else is written into it. Released on every path out of this
+	// function, including a panic, which is what makes a stranded lock the
+	// cost of only a hard kill rather than of an ordinary error.
 	// Skipped entirely when this Store adopted someone else's lock via
 	// UseLock: the file already belongs to that lock's holder, so acquiring
 	// would fail against it, and releasing it on the way out is exactly what
@@ -358,30 +357,6 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 			return err
 		}
 		defer s.ReleaseLock()
-	}
-
-	// Remove-then-create rather than truncate: RemoveAll unlinks a symlink as
-	// itself, and O_EXCL then cannot follow one, so a planted link cannot aim
-	// this write at a file the user owns. The file is rdk's, so removing it is
-	// ours to do (rule 13: always write). This protects the leaf itself, which
-	// checkPathComponents cannot: ScratchDir is already known to be a real
-	// directory by this point, but .gitignore is the name inside it, and a
-	// component check only ever verifies directories, not the file being
-	// written.
-	gitignore := ScratchDir + "/.gitignore"
-	if err := s.root.RemoveAll(gitignore); err != nil {
-		return err
-	}
-	f, err := s.root.OpenFile(gitignore, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write([]byte("*\n")); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
 	}
 
 	// .rdk/new is never trusted across runs, so it is cleared unconditionally.
@@ -613,6 +588,14 @@ func (s *osStore) BreakLock(id string) (LockInfo, error) {
 //
 // Shared by Materialize and HoldLock: `rdk lock` may well run in a repository
 // that has never been applied, so it cannot assume the directory exists.
+//
+// Also writes the scratch .gitignore, rather than leaving that to Materialize
+// alone: `rdk lock` in a repository that has never been applied used to leave
+// `.rdk/lock` with nothing ignoring it, so it showed up in `git status` and a
+// routine `git add .` could commit it — after which every checkout carries a
+// lock nobody can release, since the id belongs to a process that is long
+// gone. Whatever creates the scratch directory has to make it invisible to
+// git in the same step, not on the first apply that happens to follow.
 func (s *osStore) ensureScratchDir() error {
 	switch info, err := s.root.Lstat(ScratchDir); {
 	case err == nil && !info.IsDir():
@@ -623,7 +606,28 @@ func (s *osStore) ensureScratchDir() error {
 	case err != nil && !os.IsNotExist(err):
 		return err
 	}
-	return s.root.MkdirAll(ScratchDir, 0o755)
+	if err := s.root.MkdirAll(ScratchDir, 0o755); err != nil {
+		return err
+	}
+	// Remove-then-create rather than truncate: RemoveAll unlinks a symlink as
+	// itself, and O_EXCL then cannot follow one, so a planted link cannot aim
+	// this write at a file the user owns. The file is rdk's, so removing it is
+	// ours to do (rule 13: always write). This protects the leaf itself, which
+	// the Lstat above cannot: that only verifies ScratchDir, and .gitignore is
+	// the name inside it.
+	gitignore := ScratchDir + "/.gitignore"
+	if err := s.root.RemoveAll(gitignore); err != nil {
+		return err
+	}
+	f, err := s.root.OpenFile(gitignore, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte("*\n")); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // HoldLock takes a lock that outlives this process, so a person or agent can
