@@ -380,6 +380,14 @@ func TestIdentifierFieldRejectsIllegalForms(t *testing.T) {
 		{"leading digit", "123-assets"},
 		{"space", "my assets"},
 		{"empty after trim", "   "},
+		{"leading dash", "-assets"},
+		// A leading Unicode decimal digit (Arabic-Indic 1) is rejected exactly
+		// like a leading ASCII digit — confirmed against `terraform validate`.
+		{"leading non-ASCII digit", "۱assets"},
+		// Emoji are not Unicode letters (\p{L}) or decimal digits (\p{Nd}), so
+		// they stay rejected under the widened pattern — confirmed against
+		// `terraform validate`.
+		{"emoji", "assets🎉"},
 	}
 	for _, c := range cases {
 		body := fmt.Sprintf("kind: s3-bucket\nname: %q\ndescription: d\n", c.value)
@@ -400,8 +408,17 @@ func TestIdentifierFieldRejectsIllegalForms(t *testing.T) {
 	}
 }
 
+// Non-ASCII letters and digits are legal Terraform identifiers (HCL's
+// ID_Start/ID_Continue are the Unicode UAX#31 properties, not ASCII ranges);
+// confirmed against `terraform validate`. A pattern that rejected these would
+// be too strict: it would block a legal name with an error insisting it is
+// illegal.
 func TestIdentifierFieldAcceptsLegalForms(t *testing.T) {
-	for _, n := range []string{"assets", "_private", "web-server", "a1"} {
+	for _, n := range []string{
+		"assets", "_private", "web-server", "a1",
+		"café", "naïve", "日本語", "café2", "a۱",
+		"_", "a", "trailing-dash-",
+	} {
 		_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: s3-bucket\nname: " + n + "\ndescription: d\n"}), "rdk")
 		if err != nil {
 			t.Errorf("%s: Dir: %v", n, err)

@@ -18,12 +18,32 @@ import (
 	"github.com/jarrod-lowe/rdk/internal/schema"
 )
 
-// identifierPattern is a conservative, ASCII-only subset of Terraform's actual
-// identifier grammar (HCL's ID_Start/ID_Continue, which also admits Unicode
-// letters). Under-accepting is the safe direction here — everything this
-// pattern allows is unambiguously legal to Terraform, which is what matters
-// for a check that exists to keep generated HCL parseable.
-var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+// identifierPattern approximates HCL's real identifier grammar:
+//
+//	Ident = (ID_Start | '_') (ID_Continue | '-')*
+//
+// (hashicorp/hcl/v2 hclsyntax/scan_tokens.rl), where ID_Start/ID_Continue are
+// the Unicode UAX#31 properties, not ASCII ranges — an earlier version of
+// this pattern was ASCII-only ([A-Za-z_][A-Za-z0-9_-]*) and so rejected
+// legal names like "café" or "日本語".
+//
+// Verified empirically against `terraform validate` (v1.14.6, the ground
+// truth: `terraform` shells out to the real HCL parser) by generating module
+// blocks with candidate labels and checking init/validate. Confirmed:
+// Unicode letters (café, naïve, 日本語, Ω) and Unicode decimal digits
+// (\p{Nd}, e.g. Arabic-Indic ۱) are accepted anywhere ASCII letters/digits
+// are; a leading digit, dot, space, leading dash, or emoji are all still
+// rejected, matching the ASCII-only cases already covered.
+//
+// \p{L} and \p{Nd} do not cover the whole of UAX#31: real ID_Start also
+// includes Nl (letter-numbers, e.g. Roman numeral code points), and real
+// ID_Continue also includes Mn/Mc (combining marks) and Pc (connector
+// punctuation generally, of which ASCII '_' is only one member) — all
+// confirmed accepted by `terraform validate` in the same experiment. Those
+// are left out here: no legitimate resource name is expected to use them,
+// and omitting them keeps the pattern auditable while staying safely
+// under-accepting rather than accepting something Terraform would reject.
+var identifierPattern = regexp.MustCompile(`^[\p{L}_][\p{L}\p{Nd}_-]*$`)
 
 // Definition is one parsed, schema-validated definition file.
 type Definition struct {
