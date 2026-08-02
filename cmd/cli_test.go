@@ -324,11 +324,46 @@ func TestApplyReportsAnExistingLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply --break-lock: %v (%s)", err, errOut2)
 	}
-	if !strings.Contains(errOut2, "broke lock") || !strings.Contains(errOut2, "4127") {
-		t.Errorf("breaking a lock was not announced: %q", errOut2)
+	// The notice rides with the result now, not a separate warning: it has to
+	// be exactly as visible as the success it explains.
+	if !strings.Contains(out, "broke lock") || !strings.Contains(out, "4127") {
+		t.Errorf("breaking a lock was not announced in the result: %q", out)
+	}
+	if strings.Contains(errOut2, "broke lock") {
+		t.Errorf("breaking a lock was also announced separately on stderr: %q", errOut2)
 	}
 	if !strings.Contains(out, "rdk apply: wrote") {
 		t.Errorf("apply did not proceed: %q", out)
+	}
+}
+
+// Breaking happens before apply.Run, so a subsequent apply failure must not
+// make that fact disappear — the lock is destroyed either way, and the user
+// needs to know that regardless of whether what followed then succeeded.
+func TestApplyBreakLockNoticeSurvivesAFailedApply(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	// A stray file makes apply.Run fail after the lock is already broken.
+	os.WriteFile(filepath.Join(dir, "rdk", "notes.txt"), []byte("scratch\n"), 0o644)
+	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".rdk", "lock"),
+		[]byte(`{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`), 0o644)
+
+	_, errOut, err := runSplit(t, dir, "apply", "--break-lock=9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("apply succeeded despite the stray file")
+	}
+	for _, want := range []string{"notes.txt", "broke lock", "9f3a1c4e7b2d8a05", "4127"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("failure does not mention %q: %q", want, errOut)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".rdk", "lock")); !os.IsNotExist(statErr) {
+		t.Errorf(".rdk/lock still exists after --break-lock: %v", statErr)
 	}
 }
 

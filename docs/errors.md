@@ -59,13 +59,12 @@ An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
 | `set-aside` | A file is parked with `.disabled` or `.example`, so nothing is generated for it. | Intentional — rename to `.yaml` to enable it. |
 | `editor-artifact` | An editor or merge leftover (`.orig`, `.rej`, `.bak`, `~`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
 | `machine-file` | A file nobody chose to create (`.DS_Store`, `Thumbs.db`, a vim swap file) or a git housekeeping file (`.gitignore`, `.gitkeep`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
-| `lock-broken` | `--break-lock` removed a lock another run had left behind. | Intentional. If an apply really was running, both runs are now unsafe — check `rdk-managed/` and re-run. |
 
 ## Results
 
 | Code | Means |
 |---|---|
-| `apply-complete` | `rdk apply` finished; carries `files` and `dir`. Run with `--with-lock=<id>`, it also carries `lock_id`, `lock_kind`, `host`, `pid`, `since`, and `message` — a JSONL consumer detects an under-lock apply by `lock_id`'s presence, and the summary names the holder in the same line as the result: rdk cannot tell the legitimate holder from someone who copied the id out of a blocked apply's error, so this is the only guarantee, and it cannot be silenced by `--log-level` independently of the result it qualifies. |
+| `apply-complete` | `rdk apply` finished; carries `files` and `dir`. Run with `--with-lock=<id>`, it also carries `lock_id`, `lock_kind`, `host`, `pid`, `since`, and `message` — a JSONL consumer detects an under-lock apply by `lock_id`'s presence, and the summary names the holder in the same line as the result: rdk cannot tell the legitimate holder from someone who copied the id out of a blocked apply's error, so this is the only guarantee, and it cannot be silenced by `--log-level` independently of the result it qualifies. Run with `--break-lock=<id>`, it instead carries `broke_lock_id`, `broke_lock_kind`, `broke_host`, `broke_pid`, `broke_since`, and `broke_message`, prefixed so the two facts — ran under a lock, broke one — are never ambiguous on the same record; the summary names what was broken and its provenance the same way. If the apply that follows a broken lock then fails, the same `broke_*` facts and summary suffix are folded into the failure's own diagnostic instead, since breaking already happened and is not undone by what came after. |
 | `init-complete` | `rdk init` finished. |
 | `version` | `rdk version` output; carries `version`. |
 | `lock-held` | `rdk lock` took a held lock; carries `lock_id`. It outlives this process — only `rdk unlock` or `--break-lock` ends it. |
