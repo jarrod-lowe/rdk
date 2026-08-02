@@ -67,6 +67,8 @@ An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
 | `apply-complete` | `rdk apply` finished; carries `files` and `dir`. |
 | `init-complete` | `rdk init` finished. |
 | `version` | `rdk version` output; carries `version`. |
+| `lock-held` | `rdk lock` took a held lock; carries `lock_id`. It outlives this process — only `rdk unlock` or `--break-lock` ends it. |
+| `unlocked` | `rdk unlock` released a held lock; carries `lock_id`. |
 
 ## Internal
 

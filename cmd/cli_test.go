@@ -306,3 +306,136 @@ func TestApplyReportsAnExistingLock(t *testing.T) {
 		t.Errorf("apply did not proceed: %q", out)
 	}
 }
+
+// lockIDFromDisk reads .rdk/lock and pulls out the id, via encoding/json
+// rather than string surgery — the format is JSON, not a format worth
+// re-parsing by hand in a test.
+func lockIDFromDisk(t *testing.T, dir string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, ".rdk", "lock"))
+	if err != nil {
+		t.Fatalf("reading .rdk/lock: %v", err)
+	}
+	var lock struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(b, &lock); err != nil {
+		t.Fatalf(".rdk/lock is not JSON: %v (%q)", err, b)
+	}
+	if lock.ID == "" {
+		t.Fatalf(".rdk/lock has no id: %q", b)
+	}
+	return lock.ID
+}
+
+func TestLockThenUnlock(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+
+	out, _, err := runSplit(t, dir, "lock", "-m", "agent working")
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	if !strings.Contains(out, "agent working") {
+		t.Errorf("lock did not report its message: %q", out)
+	}
+
+	// An apply is now blocked, and told why.
+	_, errOut, err := runSplit(t, dir, "apply")
+	if err == nil {
+		t.Fatal("apply ran under someone else's lock")
+	}
+	if !strings.Contains(errOut, "agent working") {
+		t.Errorf("the blocked apply does not say why: %q", errOut)
+	}
+
+	id := lockIDFromDisk(t, dir)
+	if _, _, err := runSplit(t, dir, "unlock", id); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	if _, _, err := runSplit(t, dir, "apply"); err != nil {
+		t.Fatalf("apply after unlock: %v", err)
+	}
+}
+
+// A lock nobody can explain is worse than no lock.
+func TestLockRequiresAMessage(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := runSplit(t, dir, "lock"); err == nil {
+		t.Error("lock succeeded with no message")
+	}
+}
+
+// A second rdk lock while one is held gets the same treatment as a blocked
+// apply, and exits 1 — this is the user's problem (someone else has it), not
+// rdk's.
+func TestLockRefusesWhenAlreadyLocked(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := runSplit(t, dir, "lock", "-m", "first"); err != nil {
+		t.Fatalf("first lock: %v", err)
+	}
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	gotExit := execute([]string{"lock", "-m", "second"}, &out, &errOut)
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+	if gotExit != 1 {
+		t.Errorf("blocked lock exit = %d, want 1 (stderr: %s)", gotExit, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "first") {
+		t.Errorf("second lock's error does not name the first holder: %q", errOut.String())
+	}
+}
+
+// rdk unlock with a wrong id must not remove the real lock.
+func TestUnlockRejectsAWrongID(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, _, err := runSplit(t, dir, "lock", "-m", "agent working"); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+
+	if _, _, err := runSplit(t, dir, "unlock", "not-the-right-id"); err == nil {
+		t.Error("unlock succeeded with a wrong id")
+	}
+	if _, _, err := runSplit(t, dir, "apply"); err == nil {
+		t.Error("apply ran after a failed unlock — the lock was removed anyway")
+	}
+}
+
+// rdk unlock refuses to end an apply lock, and points at --break-lock instead
+// — ending someone's running apply is breaking, not unlocking.
+func TestUnlockRefusesAnApplyLock(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".rdk", "lock"),
+		[]byte(`{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`), 0o644)
+
+	_, errOut, err := runSplit(t, dir, "unlock", "9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("unlock removed an apply lock")
+	}
+	if !strings.Contains(errOut, "--break-lock") {
+		t.Errorf("unlock's refusal does not point at --break-lock: %q", errOut)
+	}
+}

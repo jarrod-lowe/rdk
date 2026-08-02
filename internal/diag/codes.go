@@ -41,6 +41,8 @@ const (
 	CodeInvalidFlag       = "invalid-flag"
 	CodeApplyLocked       = "apply-locked"
 	CodeLockBroken        = "lock-broken"
+	CodeLockHeld          = "lock-held"
+	CodeUnlocked          = "unlocked"
 )
 
 // all lists every code so the documentation coverage tests can check them.
@@ -57,5 +59,5 @@ var all = []string{
 	CodeScratchNotRemoved, CodeScratchTarget, CodeUnsafePath, CodeSeedNotAFile, CodeSeedFailed,
 	CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal, CodeInvalidFlag,
-	CodeApplyLocked, CodeLockBroken,
+	CodeApplyLocked, CodeLockBroken, CodeLockHeld, CodeUnlocked,
 }

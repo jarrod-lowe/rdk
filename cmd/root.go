@@ -80,6 +80,8 @@ func (a *app) rootCmd() *cobra.Command {
 	root.AddCommand(a.versionCmd())
 	root.AddCommand(a.initCmd())
 	root.AddCommand(a.applyCmd())
+	root.AddCommand(a.lockCmd())
+	root.AddCommand(a.unlockCmd())
 	return root
 }
 
