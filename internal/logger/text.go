@@ -83,9 +83,19 @@ func (h *textHandler) Handle(_ context.Context, r slog.Record) error {
 	b.WriteString(strings.Join(parts, ": "))
 	b.WriteByte('\n')
 	if hint != "" {
-		b.WriteString("  ")
-		b.WriteString(hint)
-		b.WriteByte('\n')
+		// Every line gets its own indent, not just the first: a hint that
+		// spans lines (rdk lock's follow-up commands, commit 4) must read as
+		// one indented block, not a first line of hint followed by flush-left
+		// lines that look like separate top-level output. A single trailing
+		// newline is trimmed first so it doesn't produce a stray indented
+		// blank line — the caller almost certainly meant "this hint ends
+		// here", not "print an empty indented line after it".
+		hint = strings.TrimSuffix(hint, "\n")
+		for _, line := range strings.Split(hint, "\n") {
+			b.WriteString("  ")
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
 	}
 
 	h.mu.Lock()

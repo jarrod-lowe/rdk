@@ -127,6 +127,30 @@ type lazyValue struct{}
 
 func (lazyValue) LogValue() slog.Value { return slog.StringValue("resolved") }
 
+// Only the first line used to be indented, so a second line landed flush-left
+// and read as separate top-level output — which is why every hint until now
+// had to be a single line.
+func TestMultiLineHintIsIndentedThroughout(t *testing.T) {
+	got := logOne(t, false, slog.LevelInfo, "held 9f3a1c4e",
+		slog.String("hint", "apply with: rdk apply --with-lock=9f3a1c4e\nwhen done: rdk unlock 9f3a1c4e"))
+	want := "held 9f3a1c4e\n" +
+		"  apply with: rdk apply --with-lock=9f3a1c4e\n" +
+		"  when done: rdk unlock 9f3a1c4e\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A hint built with fmt.Sprintf("...\n") is an easy mistake — the trailing
+// newline must not survive as an indented blank line of its own.
+func TestHintTrailingNewlineDoesNotAddBlankLine(t *testing.T) {
+	got := logOne(t, false, slog.LevelInfo, "held", slog.String("hint", "do the thing\n"))
+	want := "held\n  do the thing\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // The closed API means these are unreachable; the panic is what keeps that true.
 func TestDerivedHandlersPanic(t *testing.T) {
 	h := newTextHandler(&bytes.Buffer{}, slog.LevelDebug, false, &sync.Mutex{})
