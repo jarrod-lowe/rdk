@@ -619,8 +619,9 @@ func TestApplyWithLockSucceedsAndLockSurvives(t *testing.T) {
 
 // The announcement is the safety property, not decoration: rdk cannot tell a
 // legitimate holder from someone who copied the id out of a blocked apply's
-// error, so it has to say whose lock this is and why every time, in a form a
-// human reading stderr actually sees.
+// error, so it has to say whose lock this is and why every time — riding with
+// the result rather than as a separate warning, so it is exactly as visible
+// as the success it qualifies and cannot be silenced independently of it.
 func TestApplyWithLockAnnouncesTheHolder(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := runSplit(t, dir, "init"); err != nil {
@@ -633,22 +634,28 @@ func TestApplyWithLockAnnouncesTheHolder(t *testing.T) {
 	}
 	id := lockIDFromDisk(t, dir)
 
-	_, errOut, err := runSplit(t, dir, "apply", "--with-lock="+id)
+	out, errOut, err := runSplit(t, dir, "apply", "--with-lock="+id)
 	if err != nil {
 		t.Fatalf("apply --with-lock: %v (%s)", err, errOut)
 	}
-	// runSplit executes in-process, so the pid and host the lock recorded are
-	// this test process's own.
-	host, _ := os.Hostname()
-	for _, want := range []string{"warning", id, strconv.Itoa(os.Getpid()), host, "agent refactoring the s3-bucket module"} {
-		if !strings.Contains(errOut, want) {
-			t.Errorf("announcement missing %q: %q", want, errOut)
+	if !strings.Contains(out, "rdk apply: wrote") {
+		t.Errorf("stdout missing the result: %q", out)
+	}
+	// runSplit executes in-process, so the pid the lock recorded is this test
+	// process's own.
+	for _, want := range []string{id, strconv.Itoa(os.Getpid()), "agent refactoring the s3-bucket module"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("result missing %q: %q", want, out)
 		}
+	}
+	if strings.Contains(errOut, id) {
+		t.Errorf("the notice was also emitted separately on stderr: %q", errOut)
 	}
 }
 
-// The JSONL form must carry the holder's details as typed fields, not just
-// prose, so an agent matches on structure rather than parsing the sentence.
+// The JSONL form must carry the holder's details as typed fields on the
+// apply-complete record itself, not just prose or a second record — a
+// consumer detects an under-lock apply by lock_id's presence.
 func TestApplyWithLockJSONLCarriesTypedAttrs(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := runSplit(t, dir, "init"); err != nil {
@@ -661,20 +668,24 @@ func TestApplyWithLockJSONLCarriesTypedAttrs(t *testing.T) {
 	}
 	id := lockIDFromDisk(t, dir)
 
-	_, errOut, err := runSplit(t, dir, "apply", "--with-lock="+id, "--log-format=jsonl")
+	out, errOut, err := runSplit(t, dir, "apply", "--with-lock="+id, "--log-format=jsonl")
 	if err != nil {
 		t.Fatalf("apply --with-lock: %v (%s)", err, errOut)
 	}
 	var rec map[string]any
-	line := strings.SplitN(strings.TrimSpace(errOut), "\n", 2)[0]
+	line := strings.SplitN(strings.TrimSpace(out), "\n", 2)[0]
 	if jsonErr := json.Unmarshal([]byte(line), &rec); jsonErr != nil {
-		t.Fatalf("stderr is not JSON: %v (%q)", jsonErr, errOut)
+		t.Fatalf("stdout is not JSON: %v (%q)", jsonErr, out)
 	}
-	if rec["code"] != "running-under-lock" {
-		t.Errorf("code = %v, want running-under-lock", rec["code"])
+	if rec["code"] != "apply-complete" {
+		t.Errorf("code = %v, want apply-complete", rec["code"])
 	}
 	if rec["lock_id"] != id {
 		t.Errorf("lock_id = %v, want %q", rec["lock_id"], id)
+	}
+	host, _ := os.Hostname()
+	if rec["host"] != host {
+		t.Errorf("host = %v, want %q", rec["host"], host)
 	}
 	if rec["message"] != "agent refactoring the s3-bucket module" {
 		t.Errorf("message = %v, want the holder's message", rec["message"])

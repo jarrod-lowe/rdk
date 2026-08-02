@@ -17,6 +17,11 @@ func (a *app) applyCmd() *cobra.Command {
 	// every command shares, so they don't belong on app.
 	var breakLock string
 	var withLock string
+	// Captured from UseLock below so the under-lock notice can ride with the
+	// result once apply.Run returns, rather than being announced separately
+	// before rdk even knows whether the apply will succeed.
+	var lockInfo repofs.LockInfo
+	var underLock bool
 	cmd := &cobra.Command{
 		Use:   "apply",
 		Short: "Regenerate all rdk-managed files from the definitions in rdk/",
@@ -71,25 +76,12 @@ func (a *app) applyCmd() *cobra.Command {
 				// the legitimate holder from someone who copied the id out of a
 				// blocked apply's error, since the token is identical either
 				// way. Prevention is impossible, so every run under a lock
-				// announces whose it is and what they said they were doing —
-				// emitted before apply.Run so the announcement lands even if
-				// the apply that follows then fails.
-				summary := fmt.Sprintf("running under lock %s, held by pid %d on %s", info.ID, info.PID, info.Host)
-				if info.Message != "" {
-					summary += ": " + info.Message
-				}
-				a.log.Warn(diag.Diagnostic{
-					Code:    diag.CodeRunningUnderLock,
-					Summary: summary,
-					Attrs: []diag.Attr{
-						diag.Str("lock_id", info.ID),
-						diag.Str("lock_kind", info.Kind),
-						diag.Str("host", info.Host),
-						diag.Int("pid", info.PID),
-						diag.Str("since", info.Since),
-						diag.Str("message", info.Message),
-					},
-				})
+				// names whose it is and what they said they were doing — but
+				// that notice now rides with the result below instead of
+				// firing here as its own warning, so it cannot be silenced by
+				// --log-level independently of the outcome it qualifies.
+				lockInfo = info
+				underLock = true
 			}
 			if breakLock != "" {
 				info, err := store.BreakLock(breakLock)
@@ -125,11 +117,38 @@ func (a *app) applyCmd() *cobra.Command {
 			for _, w := range res.Warnings {
 				a.log.Warn(w)
 			}
-			a.log.Result(res.Diagnostic())
+			d := res.Diagnostic()
+			if underLock {
+				d = withLockNotice(d, lockInfo)
+			}
+			a.log.Result(d)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&breakLock, "break-lock", "", "remove a stranded lock with this id before applying")
 	cmd.Flags().StringVar(&withLock, "with-lock", "", "run this apply under an existing held lock with this id, without acquiring or releasing it")
 	return cmd
+}
+
+// withLockNotice folds the under-lock announcement into the apply result
+// rather than emitting it as a separate warning: a warning can be silenced by
+// --log-level independently of the result it qualifies, which is exactly the
+// gap that let an apply run under someone else's lock with no output at all.
+// Riding with the result means the notice is exactly as visible as the
+// success it describes.
+func withLockNotice(d diag.Diagnostic, info repofs.LockInfo) diag.Diagnostic {
+	d.Summary += fmt.Sprintf(" (under lock %s, held by pid %d", info.ID, info.PID)
+	if info.Message != "" {
+		d.Summary += ": " + info.Message
+	}
+	d.Summary += ")"
+	d.Attrs = append(d.Attrs,
+		diag.Str("lock_id", info.ID),
+		diag.Str("lock_kind", info.Kind),
+		diag.Str("host", info.Host),
+		diag.Int("pid", info.PID),
+		diag.Str("since", info.Since),
+		diag.Str("message", info.Message),
+	)
+	return d
 }
