@@ -877,7 +877,7 @@ func TestUseLockRunsWithoutAcquiringOrReleasing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UseLock(info.ID); err != nil {
+	if _, err := s.UseLock(info.ID); err != nil {
 		t.Fatal(err)
 	}
 	set := NewFileSet()
@@ -897,12 +897,51 @@ func TestUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 	s, root := newTestStore(t)
 	// Nothing held: you asserted you hold a lock and you do not, which means
 	// it was broken out from under you.
-	if err := s.UseLock("9f3a1c4e7b2d8a05"); err == nil {
+	if _, err := s.UseLock("9f3a1c4e7b2d8a05"); err == nil {
 		t.Error("adopted a lock that does not exist")
 	}
 	writeLock(t, root, heldLock())
-	if err := s.UseLock("some-other-id"); err == nil {
+	if _, err := s.UseLock("some-other-id"); err == nil {
 		t.Error("adopted someone else's lock under the wrong id")
+	}
+}
+
+// The whole point of --with-lock is that the holder can apply repeatedly
+// while they work: the lock is adopted, never consumed. Each iteration opens
+// a fresh Store, the way each separate `rdk apply --with-lock` process would,
+// so this exercises the lock file surviving across processes, not just calls
+// on one Go value.
+func TestUseLockSupportsRepeatedApplies(t *testing.T) {
+	root := t.TempDir()
+	holder, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := holder.HoldLock("working")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		s, err := New(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.UseLock(info.ID); err != nil {
+			t.Fatalf("UseLock #%d: %v", i, err)
+		}
+		set := NewFileSet()
+		add(t, set, Managed("f.txt"), []byte("x"))
+		if err := s.Materialize("managed", set); err != nil {
+			t.Fatalf("materialize #%d under a held lock: %v", i, err)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("the held lock did not survive two applies: %v", err)
+	}
+	if err := holder.Unlock(info.ID); err != nil {
+		t.Fatalf("unlock: %v", err)
 	}
 }
 

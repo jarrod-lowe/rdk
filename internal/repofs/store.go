@@ -231,7 +231,12 @@ type Store interface {
 	// lock: ending someone's running apply is breaking, not unlocking.
 	Unlock(id string) error
 	// UseLock runs under an existing held lock without taking or releasing it.
-	UseLock(id string) error
+	// It returns the lock's details from the very read that verified id, rather
+	// than making the caller re-read the file afterwards — a second read could
+	// in principle disagree with the one that just verified the id, and the
+	// caller (rdk apply --with-lock) needs those details to announce whose lock
+	// it is running under.
+	UseLock(id string) (LockInfo, error)
 }
 
 // Entry is one directory entry. It carries IsDir rather than the full
@@ -661,25 +666,28 @@ func (s *osStore) Unlock(id string) error {
 // UseLock runs under an existing held lock without taking or releasing it.
 // Both refusals matter: a mismatched id means someone else's lock, and no lock
 // at all means yours was broken out from under you — which the caller needs to
-// hear rather than have silently treated as permission to proceed.
-func (s *osStore) UseLock(id string) error {
+// hear rather than have silently treated as permission to proceed. It returns
+// the LockInfo this same readLock call verified, so the caller can announce
+// the holder's details without a second read that could disagree with this
+// one.
+func (s *osStore) UseLock(id string) (LockInfo, error) {
 	info, err := s.readLock()
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("no lock is held: %s was broken out from under you", id)
+			return LockInfo{}, fmt.Errorf("no lock is held: %s was broken out from under you", id)
 		}
-		return err
+		return LockInfo{}, err
 	}
 	if info.ID != id {
-		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
 	}
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()
 	if s.lockHeld && s.lockID != id {
-		return errors.New("this store already holds a different lock and cannot also run under one")
+		return LockInfo{}, errors.New("this store already holds a different lock and cannot also run under one")
 	}
 	s.usingLock = true
-	return nil
+	return info, nil
 }
 
 // hostname reports the current host for a lock's Host field, falling back to

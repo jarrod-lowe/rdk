@@ -227,20 +227,20 @@ func (m *Mem) Unlock(id string) error {
 }
 
 // UseLock mirrors osStore.UseLock.
-func (m *Mem) UseLock(id string) error {
+func (m *Mem) UseLock(id string) (LockInfo, error) {
 	info, err := m.readLock()
 	if err != nil {
 		if err == fs.ErrNotExist {
-			return fmt.Errorf("no lock is held: %s was broken out from under you", id)
+			return LockInfo{}, fmt.Errorf("no lock is held: %s was broken out from under you", id)
 		}
-		return err
+		return LockInfo{}, err
 	}
 	if info.ID != id {
-		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
 	}
 	if m.lockHeld && m.lockID != id {
-		return errors.New("this store already holds a different lock and cannot also run under one")
+		return LockInfo{}, errors.New("this store already holds a different lock and cannot also run under one")
 	}
 	m.usingLock = true
-	return nil
+	return info, nil
 }

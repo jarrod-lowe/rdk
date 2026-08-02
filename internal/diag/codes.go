@@ -44,6 +44,7 @@ const (
 	CodeLockBroken        = "lock-broken"
 	CodeLockHeld          = "lock-held"
 	CodeUnlocked          = "unlocked"
+	CodeRunningUnderLock  = "running-under-lock"
 )
 
 // all lists every code so the documentation coverage tests can check them.
@@ -61,4 +62,5 @@ var all = []string{
 	CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal, CodeInvalidFlag,
 	CodeApplyLocked, CodeLockMismatch, CodeLockBroken, CodeLockHeld, CodeUnlocked,
+	CodeRunningUnderLock,
 }

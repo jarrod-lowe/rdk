@@ -60,6 +60,7 @@ An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
 | `editor-artifact` | An editor or merge leftover (`.orig`, `.rej`, `.bak`, `~`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
 | `machine-file` | A file nobody chose to create (`.DS_Store`, `Thumbs.db`, a vim swap file) or a git housekeeping file (`.gitignore`, `.gitkeep`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
 | `lock-broken` | `--break-lock` removed a lock another run had left behind. | Intentional. If an apply really was running, both runs are now unsafe — check `rdk-managed/` and re-run. |
+| `running-under-lock` | `rdk apply --with-lock=<id>` is proceeding under an existing held lock; carries `lock_id`, `lock_kind`, `host`, `pid`, `since`, and `message`. | Intentional if you are the holder. rdk cannot tell you apart from someone who copied the id out of a blocked apply's error, so this is the only guarantee: whoever ran it, and why the lock exists, is now on the record. |
 
 ## Results
 

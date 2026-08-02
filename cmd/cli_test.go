@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -545,4 +546,216 @@ func TestLockMismatchWhenNoLockExists(t *testing.T) {
 		t.Error("apply --break-lock succeeded with no lock held")
 	}
 	assertLockMismatch(t, breakErr, "--break-lock with no lock held")
+}
+
+// This is the whole point of --with-lock: the holder can keep applying while
+// they hold the lock, so it has to survive — twice, to show it is adopted
+// rather than consumed.
+func TestApplyWithLockSucceedsAndLockSurvives(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+
+	if _, _, err := runSplit(t, dir, "lock", "-m", "agent refactoring the s3-bucket module"); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	id := lockIDFromDisk(t, dir)
+
+	out, _, err := runSplit(t, dir, "apply", "--with-lock="+id)
+	if err != nil {
+		t.Fatalf("apply --with-lock: %v", err)
+	}
+	if !strings.Contains(out, "rdk apply: wrote") {
+		t.Errorf("apply did not run: %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".rdk", "lock")); err != nil {
+		t.Errorf(".rdk/lock did not survive: %v", err)
+	}
+	if got := lockIDFromDisk(t, dir); got != id {
+		t.Errorf("lock id changed: got %q, want %q", got, id)
+	}
+
+	// Not consumed: a second apply under the same id works exactly like the
+	// first, and the lock is still there afterwards.
+	out2, _, err := runSplit(t, dir, "apply", "--with-lock="+id)
+	if err != nil {
+		t.Fatalf("second apply --with-lock: %v", err)
+	}
+	if !strings.Contains(out2, "rdk apply: wrote") {
+		t.Errorf("second apply did not run: %q", out2)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".rdk", "lock")); err != nil {
+		t.Errorf(".rdk/lock did not survive a second apply: %v", err)
+	}
+	if got := lockIDFromDisk(t, dir); got != id {
+		t.Errorf("lock id changed after second apply: got %q, want %q", got, id)
+	}
+}
+
+// The announcement is the safety property, not decoration: rdk cannot tell a
+// legitimate holder from someone who copied the id out of a blocked apply's
+// error, so it has to say whose lock this is and why every time, in a form a
+// human reading stderr actually sees.
+func TestApplyWithLockAnnouncesTheHolder(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	if _, _, err := runSplit(t, dir, "lock", "-m", "agent refactoring the s3-bucket module"); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	id := lockIDFromDisk(t, dir)
+
+	_, errOut, err := runSplit(t, dir, "apply", "--with-lock="+id)
+	if err != nil {
+		t.Fatalf("apply --with-lock: %v (%s)", err, errOut)
+	}
+	// runSplit executes in-process, so the pid and host the lock recorded are
+	// this test process's own.
+	host, _ := os.Hostname()
+	for _, want := range []string{"warning", id, strconv.Itoa(os.Getpid()), host, "agent refactoring the s3-bucket module"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("announcement missing %q: %q", want, errOut)
+		}
+	}
+}
+
+// The JSONL form must carry the holder's details as typed fields, not just
+// prose, so an agent matches on structure rather than parsing the sentence.
+func TestApplyWithLockJSONLCarriesTypedAttrs(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	if _, _, err := runSplit(t, dir, "lock", "-m", "agent refactoring the s3-bucket module"); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	id := lockIDFromDisk(t, dir)
+
+	_, errOut, err := runSplit(t, dir, "apply", "--with-lock="+id, "--log-format=jsonl")
+	if err != nil {
+		t.Fatalf("apply --with-lock: %v (%s)", err, errOut)
+	}
+	var rec map[string]any
+	line := strings.SplitN(strings.TrimSpace(errOut), "\n", 2)[0]
+	if jsonErr := json.Unmarshal([]byte(line), &rec); jsonErr != nil {
+		t.Fatalf("stderr is not JSON: %v (%q)", jsonErr, errOut)
+	}
+	if rec["code"] != "running-under-lock" {
+		t.Errorf("code = %v, want running-under-lock", rec["code"])
+	}
+	if rec["lock_id"] != id {
+		t.Errorf("lock_id = %v, want %q", rec["lock_id"], id)
+	}
+	if rec["message"] != "agent refactoring the s3-bucket module" {
+		t.Errorf("message = %v, want the holder's message", rec["message"])
+	}
+}
+
+// A mismatched id must not be treated as permission to proceed — the id is
+// the only thing distinguishing "this is mine" from a guess, so a wrong one
+// has to fail.
+func TestApplyWithLockRejectsAMismatchedID(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	if _, _, err := runSplit(t, dir, "lock", "-m", "working"); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+
+	_, _, err := runSplit(t, dir, "apply", "--with-lock=not-the-right-id")
+	if err == nil {
+		t.Fatal("apply ran under a mismatched --with-lock id")
+	}
+	assertLockMismatch(t, err, "--with-lock with a wrong id")
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	gotExit := execute([]string{"apply", "--with-lock=not-the-right-id"}, &out, &errOut)
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+	if gotExit != 1 {
+		t.Errorf("mismatched --with-lock exit = %d, want 1 (stderr: %s)", gotExit, errOut.String())
+	}
+}
+
+// No lock at all is not "nothing to worry about" — it means the lock the
+// caller believed they held was broken out from under them, which they need
+// to hear rather than have silently treated as permission to proceed.
+func TestApplyWithLockRejectsWhenNoLockExists(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+
+	_, errOut, err := runSplit(t, dir, "apply", "--with-lock=9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("apply ran with --with-lock but no lock exists")
+	}
+	assertLockMismatch(t, err, "--with-lock with no lock held")
+	if !strings.Contains(errOut, "broken out from under you") {
+		t.Errorf("does not say the lock was broken out from under them: %q", errOut)
+	}
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut2 bytes.Buffer
+	gotExit := execute([]string{"apply", "--with-lock=9f3a1c4e7b2d8a05"}, &out, &errOut2)
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+	if gotExit != 1 {
+		t.Errorf("--with-lock with no lock exit = %d, want 1 (stderr: %s)", gotExit, errOut2.String())
+	}
+}
+
+// --with-lock and --break-lock contradict each other: one says the lock is
+// yours to run under, the other says it is stale and should be destroyed.
+func TestApplyRejectsWithLockAndBreakLockTogether(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+
+	_, _, err := runSplit(t, dir, "apply", "--with-lock=abc", "--break-lock=abc")
+	if err == nil {
+		t.Fatal("apply accepted --with-lock and --break-lock together")
+	}
+	var d *diag.Error
+	if !errors.As(err, &d) || d.Code != diag.CodeInvalidFlag {
+		t.Errorf("code = %v, want %q", err, diag.CodeInvalidFlag)
+	}
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	gotExit := execute([]string{"apply", "--with-lock=abc", "--break-lock=abc"}, &out, &errOut)
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+	if gotExit != 1 {
+		t.Errorf("--with-lock + --break-lock exit = %d, want 1 (stderr: %s)", gotExit, errOut.String())
+	}
 }

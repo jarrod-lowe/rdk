@@ -260,7 +260,7 @@ func TestMemUseLockRunsWithoutAcquiringOrReleasing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UseLock(info.ID); err != nil {
+	if _, err := m.UseLock(info.ID); err != nil {
 		t.Fatal(err)
 	}
 	set := NewFileSet()
@@ -281,7 +281,7 @@ func TestMemUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 	m := NewMem()
 	// Nothing held: you asserted you hold a lock and you do not, which means
 	// it was broken out from under you.
-	if err := m.UseLock("9f3a1c4e7b2d8a05"); err == nil {
+	if _, err := m.UseLock("9f3a1c4e7b2d8a05"); err == nil {
 		t.Error("adopted a lock that does not exist")
 	}
 	b, err := json.Marshal(heldLock())
@@ -289,7 +289,7 @@ func TestMemUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.Files()[scratchLock] = b
-	if err := m.UseLock("some-other-id"); err == nil {
+	if _, err := m.UseLock("some-other-id"); err == nil {
 		t.Error("adopted someone else's lock under the wrong id")
 	}
 }
