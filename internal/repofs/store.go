@@ -681,6 +681,13 @@ func (s *osStore) UseLock(id string) (LockInfo, error) {
 	if info.ID != id {
 		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
 	}
+	if info.Kind != lockKindHeld {
+		// An apply lock exists only for the duration of one Materialize, so
+		// adopting it would mean running concurrently with the apply that holds
+		// it — the corruption the lock exists to prevent, reached through the
+		// flag meant to be safe.
+		return LockInfo{}, fmt.Errorf("lock %s belongs to a running apply, not to a person or agent — wait for it, or use --break-lock=%s if it is stranded", info.ID, info.ID)
+	}
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()
 	if s.lockHeld && s.lockID != id {

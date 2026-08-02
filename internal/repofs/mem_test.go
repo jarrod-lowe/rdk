@@ -276,6 +276,23 @@ func TestMemUseLockRunsWithoutAcquiringOrReleasing(t *testing.T) {
 	}
 }
 
+// Mirrors TestUseLockRefusesAnApplyLock.
+func TestMemUseLockRefusesAnApplyLock(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(heldLock()) // heldLock() is kind "apply" despite the name
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchLock] = b
+	_, err = m.UseLock("9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("adopted a running apply's lock")
+	}
+	if !strings.Contains(err.Error(), "apply") {
+		t.Errorf("error %q does not say why", err.Error())
+	}
+}
+
 // Mirrors TestUseLockRejectsAMismatchedOrAbsentLock.
 func TestMemUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 	m := NewMem()

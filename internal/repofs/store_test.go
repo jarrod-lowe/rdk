@@ -893,6 +893,22 @@ func TestUseLockRunsWithoutAcquiringOrReleasing(t *testing.T) {
 	}
 }
 
+// --with-lock means "run under a lock I hold". An apply's lock exists only for
+// the duration of one Materialize, so adopting it would mean running
+// concurrently with the apply that holds it — the corruption the lock exists
+// to prevent, reached through the flag meant to be safe.
+func TestUseLockRefusesAnApplyLock(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, heldLock()) // heldLock() is kind "apply" despite the name
+	_, err := s.UseLock("9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("adopted a running apply's lock")
+	}
+	if !strings.Contains(err.Error(), "apply") {
+		t.Errorf("error %q does not say why", err.Error())
+	}
+}
+
 func TestUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 	s, root := newTestStore(t)
 	// Nothing held: you asserted you hold a lock and you do not, which means
