@@ -1,8 +1,10 @@
 package repofs
 
 import (
+	"encoding/json"
 	"errors"
 	"io/fs"
+	"strings"
 	"testing"
 )
 
@@ -85,5 +87,95 @@ func TestMemReadDirReportsDirectories(t *testing.T) {
 	}
 	if entries[1].Name != "nested" || !entries[1].IsDir {
 		t.Errorf("entries[1] = %+v, want nested dir", entries[1])
+	}
+}
+
+// The fake must exclude a concurrent Materialize exactly like the real Store,
+// or a component test could pass against Mem while misrepresenting
+// production's locking.
+func TestMemMaterializeRefusesWhileLocked(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(heldLock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchLock] = b
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err = m.Materialize("managed", set)
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked", err)
+	}
+	for _, want := range []string{"9f3a1c4e7b2d8a05", "4127", "builder-3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+	if _, ok := m.Files()["managed/f.txt"]; ok {
+		t.Error("published despite the lock")
+	}
+}
+
+// A malformed lock must still block, same as the real Store.
+func TestMemMaterializeRefusesWhileLockedEvenIfUnreadable(t *testing.T) {
+	m := NewMem()
+	m.Files()[scratchLock] = []byte("{not json")
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := m.Materialize("managed", set); !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked", err)
+	}
+}
+
+func TestMemMaterializeReleasesTheLockOnSuccess(t *testing.T) {
+	m := NewMem()
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := m.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Files()[scratchLock]; ok {
+		t.Error("lock survived a successful apply")
+	}
+	// And a second run must work, which is the point.
+	if err := m.Materialize("managed", set); err != nil {
+		t.Fatalf("second materialize: %v", err)
+	}
+}
+
+// The id is the whole safety property, same as the real Store.
+func TestMemBreakLockOnlyRemovesTheNamedLock(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(heldLock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchLock] = b
+
+	if _, err := m.BreakLock("some-other-id"); err == nil {
+		t.Error("broke a lock whose id did not match")
+	}
+	if _, ok := m.Files()[scratchLock]; !ok {
+		t.Error("removed the lock anyway")
+	}
+
+	info, err := m.BreakLock("9f3a1c4e7b2d8a05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Held || info.PID != 4127 || info.Host != "builder-3" {
+		t.Errorf("info = %+v, want the holder's details", info)
+	}
+	if _, ok := m.Files()[scratchLock]; ok {
+		t.Error("lock not removed")
+	}
+}
+
+func TestMemBreakLockWithNoLockPresentIsAnError(t *testing.T) {
+	m := NewMem()
+	if _, err := m.BreakLock("9f3a1c4e7b2d8a05"); err == nil {
+		t.Error("want an error: the named lock does not exist")
 	}
 }

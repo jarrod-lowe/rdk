@@ -1,6 +1,9 @@
 package repofs
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -8,6 +11,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // ScratchDir is rdk's own working directory inside the repo. It carries a
@@ -20,8 +25,9 @@ import (
 const ScratchDir = ".rdk"
 
 const (
-	scratchNew = ScratchDir + "/new"
-	scratchOld = ScratchDir + "/old"
+	scratchNew  = ScratchDir + "/new"
+	scratchOld  = ScratchDir + "/old"
+	scratchLock = ScratchDir + "/lock"
 )
 
 // ErrScratchTarget reports that the scratch path exists as something other
@@ -99,6 +105,53 @@ func (e *unsafePathError) Error() string        { return e.err.Error() }
 func (e *unsafePathError) Unwrap() error        { return e.err }
 func (e *unsafePathError) Is(target error) bool { return target == ErrUnsafePath }
 
+// ErrLocked reports that something else holds the repository's lock.
+var ErrLocked = errors.New("another rdk apply holds this repository")
+
+// lockedError marks a failure to acquire the repository lock. It carries the
+// holder's details (whatever could be read), since the caller's summary can't
+// know that — and the id it carries is the only way past this error, so it
+// has to be in the message rather than dropped.
+type lockedError struct{ err error }
+
+func (e *lockedError) Error() string        { return e.err.Error() }
+func (e *lockedError) Unwrap() error        { return e.err }
+func (e *lockedError) Is(target error) bool { return target == ErrLocked }
+
+// LockInfo is who holds (or held) the repository lock. It is written for a
+// human to read in an error message and is never acted on: rdk must not
+// decide a lock is stale because a pid looks dead, since on shared storage
+// the pid is not even meaningful. That decision is the user's, and the id is
+// how they say which lock they decided about.
+//
+// Encoded with plain encoding/json rather than FileSet.JSON: FileSet.JSON is
+// the single owner of rdk's *generated output* format, where determinism is
+// load-bearing (DD-1). The lock is coordination state — gitignored, never
+// read by generation, never part of the managed tree — so it doesn't belong
+// to that format at all. The same distinction is why the Since timestamp and
+// the random ID below don't violate rule 1's ban on clocks and randomness:
+// that rule governs generation, and this file never touches it.
+type LockInfo struct {
+	Held    bool   `json:"-"`
+	ID      string `json:"id"`
+	Kind    string `json:"kind"` // "apply" now; "held" arrives with rdk lock
+	Host    string `json:"host"`
+	PID     int    `json:"pid"`
+	Since   string `json:"since"`             // RFC3339
+	Message string `json:"message,omitempty"` // only for kind "held"
+}
+
+// describeLock formats a held lock's details for the blocked-apply error.
+// Printing the id here is what makes the error actionable at all: it is the
+// only argument --break-lock accepts, so the error has to hand it over.
+func describeLock(info LockInfo) string {
+	msg := fmt.Sprintf("lock %s, pid %d on %s since %s", info.ID, info.PID, info.Host, info.Since)
+	if info.Message != "" {
+		msg += ": " + info.Message
+	}
+	return msg
+}
+
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
 type Store interface {
@@ -115,7 +168,12 @@ type Store interface {
 	// there cannot redirect the write either. A symlinked parent directory
 	// component of managedDir is refused via ErrUnsafePath for the same
 	// reason. Parent dirs are created; files use 0o644, dirs 0o755. managedDir
-	// is repo-relative.
+	// is repo-relative. Materialize acquires the repository lock for its
+	// duration (after the ScratchDir check and MkdirAll, before the
+	// .gitignore write) and releases it before returning, on every path
+	// including failure — a stranded lock is not the price of an ordinary
+	// error. If something else already holds it, Materialize returns an error
+	// wrapping ErrLocked without touching the tree.
 	Materialize(managedDir string, set *FileSet) error
 	// Seed creates a user-owned file once: it never overwrites and never
 	// follows a symlink at the target, and it refuses via ErrUnsafePath if any
@@ -128,6 +186,19 @@ type Store interface {
 	// sorted by name. Paths are repo-relative.
 	ReadFile(path string) ([]byte, error)
 	ReadDir(path string) ([]Entry, error)
+	// ReleaseLock removes the repository lock, but only if this Store value
+	// acquired it — never a lock left by another process or another call.
+	// Idempotent, so both a deferred call and (in a later step) a signal
+	// handler can call it unconditionally.
+	ReleaseLock() error
+	// BreakLock removes the repository lock only if its id matches, and
+	// returns what it found. The id is required, not optional: the safety
+	// property is compare-and-swap, not "remove whatever is there" — between
+	// reading a blocked-apply error and typing the recovery, the lock it named
+	// may have been released and a live one taken. Erroring when id doesn't
+	// match, or when no lock exists at all, means a caller can never break a
+	// lock it hasn't observed.
+	BreakLock(id string) (LockInfo, error)
 }
 
 // Entry is one directory entry. It carries IsDir rather than the full
@@ -140,6 +211,16 @@ type Entry struct {
 
 type osStore struct {
 	root *os.Root
+
+	// lockMu guards lockHeld and lockID, which record whether *this* Store
+	// value currently holds the repository lock and, if so, its id.
+	// ReleaseLock consults them rather than unconditionally removing
+	// scratchLock: a lock left by another process (or, once held locks land,
+	// deliberately outliving this one) must survive a release it did not
+	// grant.
+	lockMu   sync.Mutex
+	lockHeld bool
+	lockID   string
 }
 
 // New opens a Store rooted at repoRoot. All operations are confined to it and
@@ -237,6 +318,18 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 
+	// Acquired here — after ScratchDir exists, before anything is written into
+	// it — because the .gitignore write just below is remove-then-create, and
+	// two concurrent runs racing into that O_EXCL would otherwise fail
+	// spuriously instead of one of them simply waiting on the lock. Released on
+	// every path out of this function, including a panic, which is what makes
+	// a stranded lock the cost of only a hard kill rather than of an ordinary
+	// error.
+	if err := s.acquireLock(); err != nil {
+		return err
+	}
+	defer s.ReleaseLock()
+
 	// Remove-then-create rather than truncate: RemoveAll unlinks a symlink as
 	// itself, and O_EXCL then cannot follow one, so a planted link cannot aim
 	// this write at a file the user owns. The file is rdk's, so removing it is
@@ -328,6 +421,127 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return &sweepError{err: err}
 	}
 	return nil
+}
+
+// acquireLock takes the repository lock by creating scratchLock exclusively.
+// O_CREAT|O_EXCL is atomic on NFSv3 and later and depends on no mount option
+// or lock daemon, unlike flock: flock over NFS is emulated as a whole-file
+// POSIX lock that degrades to purely local (excluding nothing) under the
+// local_lock=flock/all mount options, with no error to say so. A lock that
+// silently does not lock is worse than no lock, because it manufactures
+// confidence — see docs/superpowers/specs/2026-08-02-apply-lock-design.md.
+func (s *osStore) acquireLock() error {
+	idBytes := make([]byte, 8)
+	if _, err := rand.Read(idBytes); err != nil {
+		return err
+	}
+	info := LockInfo{
+		ID:    hex.EncodeToString(idBytes),
+		Kind:  "apply",
+		Host:  hostname(),
+		PID:   os.Getpid(),
+		Since: time.Now().UTC().Format(time.RFC3339),
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	f, err := s.root.OpenFile(scratchLock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			// Read whatever is there for the message; a malformed or
+			// unreadable lock must still block (rule 6) rather than let a
+			// corrupt file silently disable the exclusion, so parse failures
+			// here are swallowed and describeLock is handed whatever did come
+			// through, even if that's nothing.
+			existing, _ := s.readLock()
+			return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing))}
+		}
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(b); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	s.lockMu.Lock()
+	s.lockHeld = true
+	s.lockID = info.ID
+	s.lockMu.Unlock()
+	return nil
+}
+
+// readLock reads whatever lock file is present. A parse failure is not
+// reported as an error: the file existing is itself the fact that matters
+// (something is blocking), so the caller gets a zero-valued LockInfo rather
+// than losing that fact to a JSON error. Held is set whenever a file was
+// found at all, parseable or not.
+func (s *osStore) readLock() (LockInfo, error) {
+	b, err := s.root.ReadFile(scratchLock)
+	if err != nil {
+		return LockInfo{}, err
+	}
+	var info LockInfo
+	_ = json.Unmarshal(b, &info) // best effort; see doc comment
+	info.Held = true
+	return info, nil
+}
+
+// ReleaseLock removes the repository lock, but only the one this Store value
+// itself acquired: lockHeld is set exclusively by a successful acquireLock on
+// this same value and cleared here, under the same mutex, so a lock taken by
+// another process — or, once held locks exist, one this process deliberately
+// left behind via `rdk lock` — is never touched by a release it did not
+// grant. Idempotent: safe to call when nothing is held, which covers both the
+// deferred call after a failed acquireLock and a second call from a signal
+// handler racing the deferred one.
+func (s *osStore) ReleaseLock() error {
+	s.lockMu.Lock()
+	held := s.lockHeld
+	s.lockHeld = false
+	s.lockMu.Unlock()
+	if !held {
+		return nil
+	}
+	if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// BreakLock removes the lock only if its id matches, and returns what it
+// found. The id is required so this can never be "remove whatever is
+// there": between reading a blocked-apply error and typing the recovery, the
+// stranded lock it named may have been released and a live one taken, and a
+// blind removal would destroy that live one.
+func (s *osStore) BreakLock(id string) (LockInfo, error) {
+	info, err := s.readLock()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return LockInfo{}, fmt.Errorf("no lock %q is held", id)
+		}
+		return LockInfo{}, err
+	}
+	if info.ID != id {
+		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
+	}
+	if err := s.root.Remove(scratchLock); err != nil {
+		return LockInfo{}, err
+	}
+	return info, nil
+}
+
+// hostname reports the current host for a lock's Host field, falling back to
+// "unknown" rather than failing acquireLock over what is only a display
+// value.
+func hostname() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return h
 }
 
 func (s *osStore) Seed(name string, data []byte) error {

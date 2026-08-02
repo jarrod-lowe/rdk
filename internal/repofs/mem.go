@@ -1,10 +1,16 @@
 package repofs
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io/fs"
+	"os"
 	"path"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Mem is an in-memory Store for filesystem-free component tests. It does not
@@ -12,6 +18,13 @@ import (
 // real Store; Mem is for logic.
 type Mem struct {
 	files map[string][]byte // repo-relative path -> content
+
+	// lockHeld and lockID mirror osStore's: they record whether this Mem
+	// value took the lock it is about to release, so ReleaseLock never
+	// removes one it didn't grant. No mutex — Mem is single-goroutine test
+	// scaffolding, unlike the real Store.
+	lockHeld bool
+	lockID   string
 }
 
 // Compile-time assertion that *Mem satisfies Store.
@@ -29,6 +42,10 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 	if err := set.checkNoOutsideEntries(); err != nil {
 		return err
 	}
+	if err := m.acquireLock(); err != nil {
+		return err
+	}
+	defer m.ReleaseLock()
 	prefix := managedDir + "/"
 	for p := range m.files {
 		if strings.HasPrefix(p, prefix) {
@@ -39,6 +56,77 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 		m.files[path.Join(managedDir, p)] = append([]byte(nil), set.managedBytes(p)...)
 	}
 	return nil
+}
+
+// acquireLock mirrors osStore.acquireLock's exclusive-create semantics using
+// the same map that models the rest of the tree, keyed under scratchLock so a
+// planted lock and a materialized file can never collide.
+func (m *Mem) acquireLock() error {
+	if _, ok := m.files[scratchLock]; ok {
+		existing, _ := m.readLock()
+		return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing))}
+	}
+	idBytes := make([]byte, 8)
+	if _, err := rand.Read(idBytes); err != nil {
+		return err
+	}
+	info := LockInfo{
+		ID:    hex.EncodeToString(idBytes),
+		Kind:  "apply",
+		Host:  hostname(),
+		PID:   os.Getpid(),
+		Since: time.Now().UTC().Format(time.RFC3339),
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	m.files[scratchLock] = b
+	m.lockHeld = true
+	m.lockID = info.ID
+	return nil
+}
+
+// readLock mirrors osStore.readLock: a lock file that exists but fails to
+// parse still reports Held, since the malformed file is itself what has to
+// keep blocking (rule 6).
+func (m *Mem) readLock() (LockInfo, error) {
+	b, ok := m.files[scratchLock]
+	if !ok {
+		return LockInfo{}, fs.ErrNotExist
+	}
+	var info LockInfo
+	_ = json.Unmarshal(b, &info) // best effort; see doc comment
+	info.Held = true
+	return info, nil
+}
+
+// ReleaseLock removes the lock only if this Mem value acquired it — see
+// osStore.ReleaseLock for why that matters. Idempotent.
+func (m *Mem) ReleaseLock() error {
+	if !m.lockHeld {
+		return nil
+	}
+	m.lockHeld = false
+	delete(m.files, scratchLock)
+	return nil
+}
+
+// BreakLock mirrors osStore.BreakLock: the id is required, and only a match
+// is removed.
+func (m *Mem) BreakLock(id string) (LockInfo, error) {
+	info, err := m.readLock()
+	if err != nil {
+		if err == fs.ErrNotExist {
+			return LockInfo{}, fmt.Errorf("no lock %q is held", id)
+		}
+		return LockInfo{}, err
+	}
+	if info.ID != id {
+		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
+	}
+	delete(m.files, scratchLock)
+	return info, nil
 }
 
 func (m *Mem) Seed(name string, data []byte) error {

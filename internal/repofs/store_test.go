@@ -1,9 +1,11 @@
 package repofs
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -666,5 +668,140 @@ func TestSecurityRejectsEscapes(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(external, "evil.yaml")); err == nil {
 		t.Error("seed wrote through an escaping symlink into an external dir")
+	}
+}
+
+// writeLock plants a lock file the way another process would have.
+func writeLock(t *testing.T, root string, info LockInfo) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ScratchDir, "lock"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func heldLock() LockInfo {
+	return LockInfo{
+		ID: "9f3a1c4e7b2d8a05", Kind: "apply", Host: "builder-3",
+		PID: 4127, Since: "2026-08-02T10:04:11Z",
+	}
+}
+
+// Two applies in one checkout used to interleave on the fixed scratch names
+// and publish a mixture of both runs' files.
+func TestMaterializeRefusesWhileLocked(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, heldLock())
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err := s.Materialize("managed", set)
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked", err)
+	}
+	// The holder's details have to reach the message, or the reader cannot
+	// tell a live apply from a stranded lock — and the id is what any
+	// recovery has to name.
+	for _, want := range []string{"9f3a1c4e7b2d8a05", "4127", "builder-3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "managed")); !os.IsNotExist(err) {
+		t.Error("published despite the lock")
+	}
+}
+
+// A malformed lock must still block. Failing open here would mean a corrupt
+// file silently disables the exclusion.
+func TestMaterializeRefusesWhileLockedEvenIfUnreadable(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ScratchDir, "lock"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := s.Materialize("managed", set); !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked", err)
+	}
+}
+
+func TestMaterializeReleasesTheLockOnSuccess(t *testing.T) {
+	s, root := newTestStore(t)
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("lock survived a successful apply")
+	}
+	// And a second run must work, which is the point.
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatalf("second materialize: %v", err)
+	}
+}
+
+// A stranded lock is the cost of not using flock; it must not also be the cost
+// of an ordinary failure.
+func TestMaterializeReleasesTheLockOnFailure(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	add(t, first, Managed("f.txt"), []byte("old"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+	chmodUnwritable(t, root) // blocks the displacing rename
+
+	second := NewFileSet()
+	add(t, second, Managed("fresh.txt"), []byte("new"))
+	if err := s.Materialize("managed", second); err == nil {
+		t.Fatal("want an error")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("lock survived a failed apply")
+	}
+}
+
+// The id is the whole safety property: between reading an error and typing the
+// recovery, the stranded lock may have been replaced by a live one.
+func TestBreakLockOnlyRemovesTheNamedLock(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, heldLock())
+
+	if _, err := s.BreakLock("some-other-id"); err == nil {
+		t.Error("broke a lock whose id did not match")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("removed the lock anyway: %v", err)
+	}
+
+	info, err := s.BreakLock("9f3a1c4e7b2d8a05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Held || info.PID != 4127 || info.Host != "builder-3" {
+		t.Errorf("info = %+v, want the holder's details", info)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("lock not removed")
+	}
+}
+
+// With a required id, "nothing there" means the lock you named is gone, which
+// the caller should hear rather than have silently treated as success.
+func TestBreakLockWithNoLockPresentIsAnError(t *testing.T) {
+	s, _ := newTestStore(t)
+	if _, err := s.BreakLock("9f3a1c4e7b2d8a05"); err == nil {
+		t.Error("want an error: the named lock does not exist")
 	}
 }
