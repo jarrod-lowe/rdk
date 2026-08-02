@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -879,6 +880,44 @@ func TestHoldLockWritesTheScratchGitignore(t *testing.T) {
 	}
 	if string(got) != "*\n" {
 		t.Errorf("scratch .gitignore = %q, want %q", got, "*\n")
+	}
+}
+
+// ensureScratchDir runs before the lock, in both HoldLock and Materialize, so
+// two of either racing is normal, not exceptional — a repository with two
+// people or two applies starting close together hits this on every fresh
+// scratch. The remove-then-create is not something user code can pin to a
+// precise instant, so this cannot force the collision on every run the way a
+// unit test normally would; it only drives enough concurrent calls that Go's
+// scheduler interleaves some of them across the RemoveAll/OpenFile gap. What
+// is deterministic is the assertion: however they interleave, none may ever
+// return an error — that's what "idempotent" means here. Before treating
+// EEXIST as success, this reliably caught the regression (most runs produced
+// at least one non-nil error); run with -race and it also confirms there is
+// no data race underneath, on top of the logical one this targets.
+func TestEnsureScratchDirIsIdempotentUnderConcurrency(t *testing.T) {
+	s, _ := newTestStore(t)
+	st := s.(*osStore)
+
+	const n = 50
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = st.ensureScratchDir()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: ensureScratchDir returned %v, want nil", i, err)
+		}
 	}
 }
 

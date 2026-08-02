@@ -628,6 +628,15 @@ func (s *osStore) ensureScratchDir() error {
 	}
 	f, err := s.root.OpenFile(gitignore, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
+		// Another run created it between our remove and our create. The
+		// content is a constant and the file is rdk's, so the desired state
+		// already holds — and because we never wrote through anything, the
+		// no-follow property the remove-then-O_EXCL exists for is intact.
+		// Racing here is expected: ensureScratchDir runs before the lock,
+		// since the lock file needs the directory it makes.
+		if os.IsExist(err) {
+			return nil
+		}
 		return err
 	}
 	if _, err := f.Write([]byte("*\n")); err != nil {
