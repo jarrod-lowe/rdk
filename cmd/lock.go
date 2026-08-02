@@ -86,16 +86,16 @@ func (a *app) unlockCmd() *cobra.Command {
 				return err
 			}
 			if err := store.Unlock(id); err != nil {
-				// Unlock's own refusals (a mismatched id, or an apply lock —
-				// use --break-lock for that) are the user's mistake, not
-				// rdk's: exit 1, not 2. apply-locked fits the same way it
-				// fits --break-lock's own failure in apply.go: either way the
-				// repository's lock state isn't what the caller assumed, and
-				// the fix is the same, re-observe it. Wrap (not New) so the
-				// underlying message — which already names --break-lock for
-				// the apply-lock case — reaches the user as the cause.
+				// Unlock's own refusals (no lock, a mismatched id, or an
+				// apply lock — use --break-lock for that) are the user's
+				// mistake, not rdk's: exit 1, not 2. This is lock-mismatch,
+				// not apply-locked: nothing is necessarily holding the
+				// repository, you named a lock and the repository disagreed
+				// about it. Wrap (not New) so the underlying message — which
+				// already names --break-lock for the apply-lock case —
+				// reaches the user as the cause.
 				return diag.Wrap(err, diag.Diagnostic{
-					Code:    diag.CodeApplyLocked,
+					Code:    diag.CodeLockMismatch,
 					Summary: fmt.Sprintf("cannot unlock %s", id),
 					Hint:    "re-run rdk apply to see the current lock, if any, and its id",
 				})

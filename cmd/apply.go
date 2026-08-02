@@ -38,12 +38,11 @@ func (a *app) applyCmd() *cobra.Command {
 				if err != nil {
 					// BreakLock's own error (no lock, or an id that doesn't
 					// match) is the user's mistake, not rdk's — it must exit 1,
-					// not 2. The apply-locked code fits: either way the
-					// repository's lock state isn't what the caller assumed,
-					// and the fix is the same, re-observe it (re-run and read
-					// the current error, or check rdk-managed/ if unsure).
+					// not 2. This is lock-mismatch, not apply-locked: nothing is
+					// necessarily holding the repository, you named a lock and
+					// the repository disagreed about it.
 					return diag.Wrap(err, diag.Diagnostic{
-						Code:    diag.CodeApplyLocked,
+						Code:    diag.CodeLockMismatch,
 						Summary: fmt.Sprintf("cannot break lock %s", breakLock),
 						Hint:    "re-run rdk apply to see the current lock, if any, and its id",
 					})

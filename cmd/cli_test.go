@@ -3,11 +3,25 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jarrod-lowe/rdk/internal/diag"
 )
+
+// assertLockMismatch checks that err is a diagnostic coded lock-mismatch: the
+// caller named a lock and the repository disagreed about it, as opposed to
+// apply-locked (something holds the repository and you didn't name it).
+func assertLockMismatch(t *testing.T, err error, what string) {
+	t.Helper()
+	var d *diag.Error
+	if !errors.As(err, &d) || d.Code != diag.CodeLockMismatch {
+		t.Errorf("%s: code = %v, want %q", what, err, diag.CodeLockMismatch)
+	}
+}
 
 func runSplit(t *testing.T, dir string, args ...string) (string, string, error) {
 	t.Helper()
@@ -290,10 +304,13 @@ func TestApplyReportsAnExistingLock(t *testing.T) {
 		t.Errorf("blocked apply exit = %d, want 1 (stderr: %s)", gotExit, lockedErr.String())
 	}
 
-	// A wrong id must not get past it.
-	if _, _, err := runSplit(t, dir, "apply", "--break-lock=wrong-id"); err == nil {
+	// A wrong id must not get past it, and codes as lock-mismatch: you named
+	// a lock and the repository disagreed, not "something holds it".
+	_, _, breakErr := runSplit(t, dir, "apply", "--break-lock=wrong-id")
+	if breakErr == nil {
 		t.Error("apply proceeded with a mismatched --break-lock id")
 	}
+	assertLockMismatch(t, breakErr, "--break-lock with a wrong id")
 
 	out, errOut2, err := runSplit(t, dir, "apply", "--break-lock=9f3a1c4e7b2d8a05")
 	if err != nil {
@@ -412,9 +429,11 @@ func TestUnlockRejectsAWrongID(t *testing.T) {
 		t.Fatalf("lock: %v", err)
 	}
 
-	if _, _, err := runSplit(t, dir, "unlock", "not-the-right-id"); err == nil {
+	_, _, err := runSplit(t, dir, "unlock", "not-the-right-id")
+	if err == nil {
 		t.Error("unlock succeeded with a wrong id")
 	}
+	assertLockMismatch(t, err, "unlock with a wrong id")
 	if _, _, err := runSplit(t, dir, "apply"); err == nil {
 		t.Error("apply ran after a failed unlock — the lock was removed anyway")
 	}
@@ -438,4 +457,29 @@ func TestUnlockRefusesAnApplyLock(t *testing.T) {
 	if !strings.Contains(errOut, "--break-lock") {
 		t.Errorf("unlock's refusal does not point at --break-lock: %q", errOut)
 	}
+	assertLockMismatch(t, err, "unlock naming an apply lock")
+}
+
+// Naming a lock id when nothing is locked at all is still lock-mismatch, not
+// apply-locked: nothing holds the repository, so there is no holder to
+// report — the repository simply disagrees with the id you named.
+func TestLockMismatchWhenNoLockExists(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+
+	_, _, unlockErr := runSplit(t, dir, "unlock", "nonexistent")
+	if unlockErr == nil {
+		t.Error("unlock succeeded with no lock held")
+	}
+	assertLockMismatch(t, unlockErr, "unlock with no lock held")
+
+	_, _, breakErr := runSplit(t, dir, "apply", "--break-lock=nonexistent")
+	if breakErr == nil {
+		t.Error("apply --break-lock succeeded with no lock held")
+	}
+	assertLockMismatch(t, breakErr, "--break-lock with no lock held")
 }
