@@ -470,6 +470,78 @@ func TestMaterializeDoesNotFollowASymlinkedScratchGitignore(t *testing.T) {
 	}
 }
 
+// A dangling symlink at managedDir's name used to be judged via Stat, which
+// follows it: Stat reports ENOENT, Materialize concludes there is nothing to
+// displace, skips the displacing rename, and the publish rename then fails
+// against the symlink that is still occupying the name. Lstat sees the
+// symlink itself, so the displace step runs and clears it first.
+func TestMaterializePublishesOverADanglingManagedSymlink(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.Symlink("nowhere", filepath.Join(root, "managed")); err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatalf("Materialize over a dangling symlink: %v", err)
+	}
+
+	info, err := os.Lstat(filepath.Join(root, "managed"))
+	if err != nil {
+		t.Fatalf("managed missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("managed is still a symlink after Materialize")
+	}
+	got, err := os.ReadFile(filepath.Join(root, "managed", "f.txt"))
+	if err != nil || string(got) != "x" {
+		t.Errorf("managed/f.txt = %q, %v, want %q", got, err, "x")
+	}
+}
+
+// A symlink at managedDir's name that resolves to a real directory is not a
+// tree rdk made, so displacing it must move the link entry rather than
+// follow it: the directory it points to is the user's, wherever it lives,
+// and must survive untouched.
+func TestMaterializeDisplacesASymlinkToARealDirectoryWithoutTouchingIt(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, "elsewhere"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(root, "elsewhere", "theirs.txt")
+	if err := os.WriteFile(victim, []byte("precious"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("elsewhere", filepath.Join(root, "managed")); err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatalf("Materialize over a symlink to a real directory: %v", err)
+	}
+
+	info, err := os.Lstat(filepath.Join(root, "managed"))
+	if err != nil {
+		t.Fatalf("managed missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("managed is still a symlink after Materialize")
+	}
+	got, err := os.ReadFile(filepath.Join(root, "managed", "f.txt"))
+	if err != nil || string(got) != "x" {
+		t.Errorf("managed/f.txt = %q, %v, want %q", got, err, "x")
+	}
+	// The directory the symlink pointed to is not rdk's; only the pointer
+	// moved, not what it pointed to.
+	got, err = os.ReadFile(victim)
+	if err != nil || string(got) != "precious" {
+		t.Errorf("elsewhere/theirs.txt = %q, %v, want it untouched", got, err)
+	}
+}
+
 func TestSeedCreatesOnceAndDoesNotOverwrite(t *testing.T) {
 	s, root := newTestStore(t)
 	if err := s.Seed("rdk/config.yaml", []byte("first")); err != nil {

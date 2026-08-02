@@ -360,7 +360,25 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// knowing whether there is a tree to displace is its own failure, and
 	// falling through would surface a confusing rename error instead of the
 	// real cause.
-	_, managedStatErr := s.root.Stat(managedDir)
+	//
+	// Lstat, not Stat, for the same reason ensureScratchDir judges .rdk by
+	// Lstat: Stat follows a symlink, so a dangling rdk-managed would read as
+	// absent, skip the displacing rename below, and then the publish rename
+	// would fail against the symlink that is still sitting there — the
+	// displace step exists precisely to clear that name first. Lstat sees the
+	// symlink itself and reports it as present regardless of where (or
+	// whether) it resolves.
+	//
+	// Whether the symlink is dangling or points at a real directory, the
+	// answer is the same: treat it as present and displace it. Displacing is
+	// a rename, and a rename of a symlink moves the link entry, not whatever
+	// it points to — so a live target is never read, written, or deleted
+	// through, only the name that pointed at it. That is the correct
+	// behaviour, not just the convenient one: a symlink at managedDir's name
+	// was never a tree rdk made, so treating "displace" as "move the pointer
+	// out of the way" rather than "absorb whatever it points to" is what
+	// keeps this from ever acting on a directory that isn't rdk's.
+	_, managedStatErr := s.root.Lstat(managedDir)
 	managedExists := managedStatErr == nil
 	if managedStatErr != nil && !os.IsNotExist(managedStatErr) {
 		return managedStatErr
