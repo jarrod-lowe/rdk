@@ -118,19 +118,26 @@ func (m *Mem) readLock() (LockInfo, error) {
 // lock still carries the id it took — see osStore.ReleaseLock for why the id
 // recheck matters (a broken-and-replaced lock must not be deleted by the run
 // whose lock was broken). Idempotent.
+//
+// lockHeld is cleared only once the removal (or the discovery that there is
+// nothing of this call's left to remove) is settled, mirroring osStore: Mem
+// has no concurrent callers of its own (see the doc comment on the struct),
+// but the two Store implementations must agree on when ownership is
+// surrendered, not just on the end state, so a test written against one
+// cannot describe a sequencing osStore does not actually have.
 func (m *Mem) ReleaseLock() error {
 	// A held lock outlives the process that took it, so no automatic path may
 	// remove one — see osStore.ReleaseLock.
 	if !m.lockHeld || m.lockKind != lockKindApply {
 		return nil
 	}
-	id := m.lockID
-	m.lockHeld = false
 	info, err := m.readLock()
-	if err != nil || !info.Held || info.ID != id {
+	if err != nil || !info.Held || info.ID != m.lockID {
+		m.lockHeld = false
 		return nil
 	}
 	delete(m.files, scratchLock)
+	m.lockHeld = false
 	return nil
 }
 

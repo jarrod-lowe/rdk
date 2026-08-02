@@ -528,32 +528,52 @@ func (s *osStore) readLock() (LockInfo, error) {
 // narrower than the read-a-stale-error-then-type-a-command window
 // --break-lock guards against, and not worth adding machinery for.
 //
+// lockMu is held across that read-and-remove rather than only across the
+// flag check: Materialize's defer and the SIGINT/SIGTERM handler both call
+// this on the same Store value, and clearing lockHeld before the file is
+// actually gone lets the second caller observe "nothing held", no-op, and
+// (in the signal handler's case) os.Exit before the first caller's Remove
+// ever runs — stranding the lock via the very handler that exists to
+// prevent that. Ownership is surrendered only once the removal is settled:
+// either this call actually removed the file, or it found the id already
+// gone/replaced, in which case there is nothing of this call's left to
+// remove. Holding the mutex across a filesystem call is normally suspect,
+// but the only two callers of ReleaseLock are this defer and the signal
+// handler, neither of which needs lockMu for anything else while a release
+// is in flight, so the cost is at most one goroutine blocking for the
+// duration of one Remove — far cheaper than the alternative of a lock that
+// can be stranded by its own release path.
+//
 // Idempotent: safe to call when nothing is held, which covers both the
 // deferred call after a failed acquireLock and a second call from a signal
 // handler racing the deferred one.
 func (s *osStore) ReleaseLock() error {
 	s.lockMu.Lock()
-	held, id, kind := s.lockHeld, s.lockID, s.lockKind
-	if kind == lockKindApply {
-		s.lockHeld = false
-	}
-	s.lockMu.Unlock()
+	defer s.lockMu.Unlock()
 	// A held lock exists precisely to outlive the process that took it, so no
 	// automatic path may remove one — not this defer, not the signal handler
 	// that also calls here. Otherwise a SIGTERM arriving while `rdk lock` was
 	// still running would release the lock the user had just asked for, and
 	// the only thing standing between that and silent failure would be every
 	// future command remembering not to register its store.
-	if !held || kind != lockKindApply {
+	if !s.lockHeld || s.lockKind != lockKindApply {
 		return nil
 	}
 	info, err := s.readLock()
-	if err != nil || !info.Held || info.ID != id {
+	if err != nil || !info.Held || info.ID != s.lockID {
+		// Nothing of this call's is left to remove — already gone, or
+		// replaced by a live lock this call must not touch — so there is
+		// nothing left to track either.
+		s.lockHeld = false
 		return nil
 	}
 	if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
+		// Ownership is kept: the file may still be there, so a retry (another
+		// signal, or a caller that checks the error) must still see this call
+		// as the one responsible for removing it.
 		return err
 	}
+	s.lockHeld = false
 	return nil
 }
 

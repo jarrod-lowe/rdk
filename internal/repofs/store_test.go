@@ -1056,6 +1056,62 @@ func TestUseLockSupportsRepeatedApplies(t *testing.T) {
 	}
 }
 
+// The shape of the race between Materialize's defer and the SIGINT/SIGTERM
+// handler in cmd: both call ReleaseLock on the same Store value, and in
+// production one of them (the handler) calls os.Exit right after. That
+// os.Exit is what turns a merely-late removal into a stranded lock, and it
+// cannot be reproduced honestly inside a test process without actually
+// exiting it — so this instead drives many concurrent ReleaseLock calls
+// against one acquired lock and asserts the invariant the mutex-held-across-
+// the-remove fix is supposed to guarantee: every call returns nil, and the
+// lock file is gone once they have all returned. Run with -race, this also
+// confirms lockHeld/lockID are never touched outside lockMu.
+//
+// What this does and does not prove: it proves ReleaseLock is safe to call
+// concurrently from multiple goroutines and that the lock always ends up
+// removed — which is the property that makes the fix correct regardless of
+// which caller happens to do the removing. It does not prove the specific
+// bad interleaving from the bug report (clear the flag, get descheduled,
+// second caller no-ops, first caller's Remove never runs because the process
+// already exited) used to occur on the old code, since forcing that exact
+// schedule would need control over the Go scheduler this test does not have
+// — that claim rests on reading the old code (the flag was cleared before
+// the unlocked read-and-remove) rather than on reproducing it live.
+func TestReleaseLockConcurrentCallsAlwaysRemoveTheLock(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(lockKindApply, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = s.ReleaseLock()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: ReleaseLock returned %v, want nil", i, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("lock file survived concurrent ReleaseLock calls")
+	}
+}
+
 // Releasing must not remove a lock this process did not take. Otherwise a
 // broken-and-replaced lock gets deleted by the run whose lock was broken,
 // letting a third apply start alongside the live one.
