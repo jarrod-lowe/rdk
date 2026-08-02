@@ -490,19 +490,34 @@ func (s *osStore) readLock() (LockInfo, error) {
 }
 
 // ReleaseLock removes the repository lock, but only the one this Store value
-// itself acquired: lockHeld is set exclusively by a successful acquireLock on
-// this same value and cleared here, under the same mutex, so a lock taken by
-// another process — or, once held locks exist, one this process deliberately
-// left behind via `rdk lock` — is never touched by a release it did not
-// grant. Idempotent: safe to call when nothing is held, which covers both the
+// itself acquired. lockHeld/lockID record what acquireLock actually created,
+// but that alone isn't enough: between this process taking the lock and this
+// call running, someone could have broken it (--break-lock, once that
+// exists) and a third apply could have acquired a fresh one. Deleting on the
+// strength of the boolean alone would remove that third run's live lock —
+// the same mistake as a blind --break-lock, just from the release side, and
+// it reopens exactly the two-applies-at-once corruption this feature exists
+// to prevent. So this re-reads the file and removes it only if it still
+// carries the id this call took; if it doesn't (or the read fails, or it's
+// gone already), releasing nothing is the safe outcome — whoever holds the
+// lock now will release their own. There is a TOCTOU window between the read
+// and the remove, but it is only the interval of one Remove syscall, far
+// narrower than the read-a-stale-error-then-type-a-command window
+// --break-lock guards against, and not worth adding machinery for.
+//
+// Idempotent: safe to call when nothing is held, which covers both the
 // deferred call after a failed acquireLock and a second call from a signal
 // handler racing the deferred one.
 func (s *osStore) ReleaseLock() error {
 	s.lockMu.Lock()
-	held := s.lockHeld
+	held, id := s.lockHeld, s.lockID
 	s.lockHeld = false
 	s.lockMu.Unlock()
 	if !held {
+		return nil
+	}
+	info, err := s.readLock()
+	if err != nil || !info.Held || info.ID != id {
 		return nil
 	}
 	if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {

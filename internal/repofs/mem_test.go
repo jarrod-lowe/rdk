@@ -179,3 +179,33 @@ func TestMemBreakLockWithNoLockPresentIsAnError(t *testing.T) {
 		t.Error("want an error: the named lock does not exist")
 	}
 }
+
+// Same property as osStore: releasing must not remove a lock this Mem value
+// did not take, or a broken-and-replaced lock gets deleted by the run whose
+// lock was broken.
+func TestMemReleaseLockLeavesAReplacedLockAlone(t *testing.T) {
+	m := NewMem()
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := m.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	// Put it back into "believes it holds lock X" the way acquireLock would
+	// have; Materialize already released on the way out.
+	m.lockHeld = true
+	m.lockID = "stale-id-this-run-took"
+
+	// Someone else broke that lock and a third run acquired a fresh one.
+	b, err := json.Marshal(heldLock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchLock] = b
+
+	if err := m.ReleaseLock(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Files()[scratchLock]; !ok {
+		t.Error("released a lock it did not take")
+	}
+}

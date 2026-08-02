@@ -805,3 +805,34 @@ func TestBreakLockWithNoLockPresentIsAnError(t *testing.T) {
 		t.Error("want an error: the named lock does not exist")
 	}
 }
+
+// Releasing must not remove a lock this process did not take. Otherwise a
+// broken-and-replaced lock gets deleted by the run whose lock was broken,
+// letting a third apply start alongside the live one.
+func TestReleaseLockLeavesAReplacedLockAlone(t *testing.T) {
+	s, root := newTestStore(t)
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	// Materialize already released on the way out, so put the store back into
+	// "believes it holds lock X" the same way acquireLock would have, rather
+	// than trying to catch it mid-flight. Reaching into unexported fields is
+	// fine: this test is in-package and nothing here is exported for its sake.
+	st := s.(*osStore)
+	st.lockMu.Lock()
+	st.lockHeld = true
+	st.lockID = "stale-id-this-run-took"
+	st.lockMu.Unlock()
+
+	// Someone else broke that lock and a third run acquired a fresh one.
+	writeLock(t, root, heldLock())
+
+	if err := s.ReleaseLock(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("released a lock it did not take: %v", err)
+	}
+}

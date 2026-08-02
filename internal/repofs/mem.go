@@ -101,13 +101,20 @@ func (m *Mem) readLock() (LockInfo, error) {
 	return info, nil
 }
 
-// ReleaseLock removes the lock only if this Mem value acquired it — see
-// osStore.ReleaseLock for why that matters. Idempotent.
+// ReleaseLock removes the lock only if this Mem value acquired it and the
+// lock still carries the id it took — see osStore.ReleaseLock for why the id
+// recheck matters (a broken-and-replaced lock must not be deleted by the run
+// whose lock was broken). Idempotent.
 func (m *Mem) ReleaseLock() error {
 	if !m.lockHeld {
 		return nil
 	}
+	id := m.lockID
 	m.lockHeld = false
+	info, err := m.readLock()
+	if err != nil || !info.Held || info.ID != id {
+		return nil
+	}
 	delete(m.files, scratchLock)
 	return nil
 }
