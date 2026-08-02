@@ -28,6 +28,13 @@ const (
 	scratchNew  = ScratchDir + "/new"
 	scratchOld  = ScratchDir + "/old"
 	scratchLock = ScratchDir + "/lock"
+
+	// The two kinds of lock. An apply lock lives only as long as the
+	// Materialize that took it; a held lock is taken by `rdk lock` and
+	// deliberately outlives its process, which is why ReleaseLock has to tell
+	// them apart rather than removing whatever it finds.
+	lockKindApply = "apply"
+	lockKindHeld  = "held"
 )
 
 // ErrScratchTarget reports that the scratch path exists as something other
@@ -215,6 +222,16 @@ type Store interface {
 	// match, or when no lock exists at all, means a caller can never break a
 	// lock it hasn't observed.
 	BreakLock(id string) (LockInfo, error)
+	// HoldLock takes a lock that outlives this process, so a person or agent
+	// can work on the tree without an apply running underneath them. Nothing
+	// automatic releases it — see ReleaseLock.
+	HoldLock(message string) (LockInfo, error)
+	// Unlock ends a held lock. It names the lock because between reading an id
+	// and typing it the lock may have been replaced, and it refuses an apply
+	// lock: ending someone's running apply is breaking, not unlocking.
+	Unlock(id string) error
+	// UseLock runs under an existing held lock without taking or releasing it.
+	UseLock(id string) error
 }
 
 // Entry is one directory entry. It carries IsDir rather than the full
@@ -237,6 +254,11 @@ type osStore struct {
 	lockMu   sync.Mutex
 	lockHeld bool
 	lockID   string
+	lockKind string
+
+	// usingLock records that this Store adopted a lock it did not take itself
+	// (UseLock), so Materialize runs without acquiring or releasing one.
+	usingLock bool
 }
 
 // New opens a Store rooted at repoRoot. All operations are confined to it and
@@ -321,16 +343,7 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// symlink never returns), so a symlink planted at either name is inert —
 	// removed, not followed. ScratchDir is different because nothing removes
 	// it first; MkdirAll walks straight through it.
-	switch info, err := s.root.Lstat(ScratchDir); {
-	case err == nil && !info.IsDir():
-		// The path itself isn't repeated here: the caller already has it
-		// (ScratchDir, or diag's File field), so this only needs to say what's
-		// actually occupying it — same reasoning as seedTargetError.
-		return &scratchTargetError{err: fmt.Errorf("it is a %s, not a directory", modeKind(info.Mode()))}
-	case err != nil && !os.IsNotExist(err):
-		return err
-	}
-	if err := s.root.MkdirAll(ScratchDir, 0o755); err != nil {
+	if err := s.ensureScratchDir(); err != nil {
 		return err
 	}
 
@@ -341,10 +354,19 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// every path out of this function, including a panic, which is what makes
 	// a stranded lock the cost of only a hard kill rather than of an ordinary
 	// error.
-	if err := s.acquireLock(); err != nil {
-		return err
+	// Skipped entirely when this Store adopted someone else's lock via
+	// UseLock: the file already belongs to that lock's holder, so acquiring
+	// would fail against it, and releasing it on the way out is exactly what
+	// --with-lock promises not to do.
+	s.lockMu.Lock()
+	usingLock := s.usingLock
+	s.lockMu.Unlock()
+	if !usingLock {
+		if _, err := s.acquireLock(lockKindApply, ""); err != nil {
+			return err
+		}
+		defer s.ReleaseLock()
 	}
-	defer s.ReleaseLock()
 
 	// Remove-then-create rather than truncate: RemoveAll unlinks a symlink as
 	// itself, and O_EXCL then cannot follow one, so a planted link cannot aim
@@ -446,21 +468,31 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 // local_lock=flock/all mount options, with no error to say so. A lock that
 // silently does not lock is worse than no lock, because it manufactures
 // confidence — see docs/superpowers/specs/2026-08-02-apply-lock-design.md.
-func (s *osStore) acquireLock() error {
+func (s *osStore) acquireLock(kind, message string) (LockInfo, error) {
+	s.lockMu.Lock()
+	usingLock := s.usingLock
+	s.lockMu.Unlock()
+	if usingLock {
+		// Already running under a lock adopted via UseLock; acquiring another
+		// would mean holding two under one Store value, and ReleaseLock only
+		// ever tracks one id.
+		return LockInfo{}, errors.New("this store is already running under an adopted lock and cannot also acquire one")
+	}
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {
-		return err
+		return LockInfo{}, err
 	}
 	info := LockInfo{
-		ID:    hex.EncodeToString(idBytes),
-		Kind:  "apply",
-		Host:  hostname(),
-		PID:   os.Getpid(),
-		Since: time.Now().UTC().Format(time.RFC3339),
+		ID:      hex.EncodeToString(idBytes),
+		Kind:    kind,
+		Host:    hostname(),
+		PID:     os.Getpid(),
+		Since:   time.Now().UTC().Format(time.RFC3339),
+		Message: message,
 	}
 	b, err := json.Marshal(info)
 	if err != nil {
-		return err
+		return LockInfo{}, err
 	}
 	f, err := s.root.OpenFile(scratchLock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -471,22 +503,23 @@ func (s *osStore) acquireLock() error {
 			// here are swallowed and describeLock is handed whatever did come
 			// through, even if that's nothing.
 			existing, _ := s.readLock()
-			return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
+			return LockInfo{}, &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
 		}
-		return err
+		return LockInfo{}, err
 	}
 	defer f.Close()
 	if _, err := f.Write(b); err != nil {
-		return err
+		return LockInfo{}, err
 	}
 	if err := f.Close(); err != nil {
-		return err
+		return LockInfo{}, err
 	}
 	s.lockMu.Lock()
 	s.lockHeld = true
 	s.lockID = info.ID
+	s.lockKind = kind
 	s.lockMu.Unlock()
-	return nil
+	return info, nil
 }
 
 // readLock reads whatever lock file is present. A parse failure is not
@@ -526,10 +559,18 @@ func (s *osStore) readLock() (LockInfo, error) {
 // handler racing the deferred one.
 func (s *osStore) ReleaseLock() error {
 	s.lockMu.Lock()
-	held, id := s.lockHeld, s.lockID
-	s.lockHeld = false
+	held, id, kind := s.lockHeld, s.lockID, s.lockKind
+	if kind == lockKindApply {
+		s.lockHeld = false
+	}
 	s.lockMu.Unlock()
-	if !held {
+	// A held lock exists precisely to outlive the process that took it, so no
+	// automatic path may remove one — not this defer, not the signal handler
+	// that also calls here. Otherwise a SIGTERM arriving while `rdk lock` was
+	// still running would release the lock the user had just asked for, and
+	// the only thing standing between that and silent failure would be every
+	// future command remembering not to register its store.
+	if !held || kind != lockKindApply {
 		return nil
 	}
 	info, err := s.readLock()
@@ -562,6 +603,96 @@ func (s *osStore) BreakLock(id string) (LockInfo, error) {
 		return LockInfo{}, err
 	}
 	return info, nil
+}
+
+// ensureScratchDir makes .rdk usable, refusing anything there that is not a
+// real directory. Judged by Lstat rather than Stat, and before MkdirAll:
+// MkdirAll succeeds whenever the path already resolves to a directory,
+// including through a symlink, and by then a write into the scratch would be
+// aimed wherever that symlink points. Lstat sees the symlink itself, so it
+// catches what MkdirAll cannot refuse.
+//
+// Not folded into checkPathComponents even though the condition is the same
+// (Lstat, non-directory): ScratchDir is a single top-level component, so that
+// check would Lstat exactly this one entry and nothing more. Kept separate
+// because modeKind here can say "device"/"socket"/"named pipe" as well as
+// "symlink" or "file", where ErrUnsafePath is worded for the symlink case —
+// a bare file at .rdk deserves to be named as a file.
+//
+// Shared by Materialize and HoldLock: `rdk lock` may well run in a repository
+// that has never been applied, so it cannot assume the directory exists.
+func (s *osStore) ensureScratchDir() error {
+	switch info, err := s.root.Lstat(ScratchDir); {
+	case err == nil && !info.IsDir():
+		// The path itself isn't repeated here: the caller already has it
+		// (ScratchDir, or diag's File field), so this only needs to say what's
+		// actually occupying it — same reasoning as seedTargetError.
+		return &scratchTargetError{err: fmt.Errorf("it is a %s, not a directory", modeKind(info.Mode()))}
+	case err != nil && !os.IsNotExist(err):
+		return err
+	}
+	return s.root.MkdirAll(ScratchDir, 0o755)
+}
+
+// HoldLock takes a lock that outlives this process, so a person or agent can
+// work on the tree without an apply running underneath them.
+func (s *osStore) HoldLock(message string) (LockInfo, error) {
+	if err := s.ensureScratchDir(); err != nil {
+		return LockInfo{}, err
+	}
+	return s.acquireLock(lockKindHeld, message)
+}
+
+// Unlock ends a held lock. It names the lock for the same compare-and-swap
+// reason BreakLock does, and refuses an apply lock: ending a running apply is
+// breaking, not unlocking, and the two differ in how loudly they report.
+func (s *osStore) Unlock(id string) error {
+	info, err := s.readLock()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no lock %q is held", id)
+		}
+		return err
+	}
+	if info.ID != id {
+		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+	}
+	if info.Kind != lockKindHeld {
+		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", info.ID, info.ID)
+	}
+	if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	s.lockMu.Lock()
+	if s.lockID == id {
+		s.lockHeld = false
+	}
+	s.lockMu.Unlock()
+	return nil
+}
+
+// UseLock runs under an existing held lock without taking or releasing it.
+// Both refusals matter: a mismatched id means someone else's lock, and no lock
+// at all means yours was broken out from under you — which the caller needs to
+// hear rather than have silently treated as permission to proceed.
+func (s *osStore) UseLock(id string) error {
+	info, err := s.readLock()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no lock is held: %s was broken out from under you", id)
+		}
+		return err
+	}
+	if info.ID != id {
+		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+	}
+	s.lockMu.Lock()
+	defer s.lockMu.Unlock()
+	if s.lockHeld && s.lockID != id {
+		return errors.New("this store already holds a different lock and cannot also run under one")
+	}
+	s.usingLock = true
+	return nil
 }
 
 // hostname reports the current host for a lock's Host field, falling back to

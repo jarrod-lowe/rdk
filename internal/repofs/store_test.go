@@ -806,6 +806,106 @@ func TestBreakLockWithNoLockPresentIsAnError(t *testing.T) {
 	}
 }
 
+// rdk lock takes a lock and exits leaving it. Nothing automatic may remove it:
+// not a defer, not a signal. Only rdk unlock or --break-lock, both of which
+// name it.
+func TestReleaseLockLeavesAHeldLockAlone(t *testing.T) {
+	s, root := newTestStore(t)
+	info, err := s.HoldLock("agent refactoring the s3-bucket module")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != "held" || info.Message == "" {
+		t.Errorf("info = %+v, want a held lock carrying its message", info)
+	}
+	if err := s.ReleaseLock(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("ReleaseLock removed a held lock: %v", err)
+	}
+}
+
+func TestHoldLockRefusesWhenAlreadyLocked(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, heldLock())
+	if _, err := s.HoldLock("second"); !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want ErrLocked", err)
+	}
+}
+
+// Unlock is the routine end of your own lock, so it names the lock and refuses
+// anything else.
+func TestUnlockOnlyReleasesTheNamedHeldLock(t *testing.T) {
+	s, root := newTestStore(t)
+	info, err := s.HoldLock("working")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Unlock("some-other-id"); err == nil {
+		t.Error("unlocked a lock whose id did not match")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("removed it anyway: %v", err)
+	}
+	if err := s.Unlock(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("lock not removed")
+	}
+}
+
+// An apply's lock is not yours to end routinely — that is what --break-lock is
+// for, and it warns.
+func TestUnlockRefusesAnApplyLock(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, heldLock()) // kind: apply
+	err := s.Unlock("9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("unlocked an apply lock")
+	}
+	if !strings.Contains(err.Error(), "--break-lock") {
+		t.Errorf("error %q does not point at the right door", err.Error())
+	}
+}
+
+// Running under someone's lock must neither take nor release it.
+func TestUseLockRunsWithoutAcquiringOrReleasing(t *testing.T) {
+	s, root := newTestStore(t)
+	info, err := s.HoldLock("working")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UseLock(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatalf("materialize under a held lock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("the held lock did not survive the apply: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "managed", "f.txt")); err != nil {
+		t.Errorf("apply did not publish: %v", err)
+	}
+}
+
+func TestUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
+	s, root := newTestStore(t)
+	// Nothing held: you asserted you hold a lock and you do not, which means
+	// it was broken out from under you.
+	if err := s.UseLock("9f3a1c4e7b2d8a05"); err == nil {
+		t.Error("adopted a lock that does not exist")
+	}
+	writeLock(t, root, heldLock())
+	if err := s.UseLock("some-other-id"); err == nil {
+		t.Error("adopted someone else's lock under the wrong id")
+	}
+}
+
 // Releasing must not remove a lock this process did not take. Otherwise a
 // broken-and-replaced lock gets deleted by the run whose lock was broken,
 // letting a third apply start alongside the live one.

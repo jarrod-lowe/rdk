@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -25,6 +26,11 @@ type Mem struct {
 	// scaffolding, unlike the real Store.
 	lockHeld bool
 	lockID   string
+	lockKind string
+
+	// usingLock mirrors osStore's: this Mem adopted a lock it did not take
+	// (UseLock), so Materialize neither acquires nor releases.
+	usingLock bool
 }
 
 // Compile-time assertion that *Mem satisfies Store.
@@ -42,10 +48,12 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 	if err := set.checkNoOutsideEntries(); err != nil {
 		return err
 	}
-	if err := m.acquireLock(); err != nil {
-		return err
+	if !m.usingLock {
+		if _, err := m.acquireLock(lockKindApply, ""); err != nil {
+			return err
+		}
+		defer m.ReleaseLock()
 	}
-	defer m.ReleaseLock()
 	prefix := managedDir + "/"
 	for p := range m.files {
 		if strings.HasPrefix(p, prefix) {
@@ -61,30 +69,35 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 // acquireLock mirrors osStore.acquireLock's exclusive-create semantics using
 // the same map that models the rest of the tree, keyed under scratchLock so a
 // planted lock and a materialized file can never collide.
-func (m *Mem) acquireLock() error {
+func (m *Mem) acquireLock(kind, message string) (LockInfo, error) {
+	if m.usingLock {
+		return LockInfo{}, errors.New("this store is already running under an adopted lock and cannot also acquire one")
+	}
 	if _, ok := m.files[scratchLock]; ok {
 		existing, _ := m.readLock()
-		return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
+		return LockInfo{}, &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
 	}
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {
-		return err
+		return LockInfo{}, err
 	}
 	info := LockInfo{
-		ID:    hex.EncodeToString(idBytes),
-		Kind:  "apply",
-		Host:  hostname(),
-		PID:   os.Getpid(),
-		Since: time.Now().UTC().Format(time.RFC3339),
+		ID:      hex.EncodeToString(idBytes),
+		Kind:    kind,
+		Host:    hostname(),
+		PID:     os.Getpid(),
+		Since:   time.Now().UTC().Format(time.RFC3339),
+		Message: message,
 	}
 	b, err := json.Marshal(info)
 	if err != nil {
-		return err
+		return LockInfo{}, err
 	}
 	m.files[scratchLock] = b
 	m.lockHeld = true
 	m.lockID = info.ID
-	return nil
+	m.lockKind = kind
+	return info, nil
 }
 
 // readLock mirrors osStore.readLock: a lock file that exists but fails to
@@ -106,7 +119,9 @@ func (m *Mem) readLock() (LockInfo, error) {
 // recheck matters (a broken-and-replaced lock must not be deleted by the run
 // whose lock was broken). Idempotent.
 func (m *Mem) ReleaseLock() error {
-	if !m.lockHeld {
+	// A held lock outlives the process that took it, so no automatic path may
+	// remove one — see osStore.ReleaseLock.
+	if !m.lockHeld || m.lockKind != lockKindApply {
 		return nil
 	}
 	id := m.lockID
@@ -181,4 +196,51 @@ func (m *Mem) ReadDir(dir string) ([]Entry, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// HoldLock mirrors osStore.HoldLock.
+func (m *Mem) HoldLock(message string) (LockInfo, error) {
+	return m.acquireLock(lockKindHeld, message)
+}
+
+// Unlock mirrors osStore.Unlock: it names the lock, and refuses an apply lock
+// because ending a running apply is breaking, not unlocking.
+func (m *Mem) Unlock(id string) error {
+	info, err := m.readLock()
+	if err != nil {
+		if err == fs.ErrNotExist {
+			return fmt.Errorf("no lock %q is held", id)
+		}
+		return err
+	}
+	if info.ID != id {
+		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+	}
+	if info.Kind != lockKindHeld {
+		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", info.ID, info.ID)
+	}
+	delete(m.files, scratchLock)
+	if m.lockID == id {
+		m.lockHeld = false
+	}
+	return nil
+}
+
+// UseLock mirrors osStore.UseLock.
+func (m *Mem) UseLock(id string) error {
+	info, err := m.readLock()
+	if err != nil {
+		if err == fs.ErrNotExist {
+			return fmt.Errorf("no lock is held: %s was broken out from under you", id)
+		}
+		return err
+	}
+	if info.ID != id {
+		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+	}
+	if m.lockHeld && m.lockID != id {
+		return errors.New("this store already holds a different lock and cannot also run under one")
+	}
+	m.usingLock = true
+	return nil
 }
