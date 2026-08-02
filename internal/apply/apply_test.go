@@ -167,6 +167,58 @@ func TestScratchTargetNamesRdkAndSaysToRemoveIt(t *testing.T) {
 	}
 }
 
+// The blocked-apply error is exactly where an agent looks for a way past a
+// lock, so it has to hand over the id and warn off --with-lock (which does
+// not exist yet), while carrying the holder's details as attrs a JSONL
+// consumer can match on directly rather than parsing the sentence.
+func TestRunReportsAnExistingLockWithAttrs(t *testing.T) {
+	store, root := setupRepo(t)
+	if err := os.MkdirAll(filepath.Join(root, repofs.ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := `{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`
+	if err := os.WriteFile(filepath.Join(root, repofs.ScratchDir, "lock"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Run(store, "v")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeApplyLocked {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeApplyLocked)
+	}
+	if !strings.Contains(d.Summary, "9f3a1c4e7b2d8a05") {
+		t.Errorf("summary %q does not name the lock", d.Summary)
+	}
+	// The text handler indents only a hint's first line, so a multi-line hint
+	// would render badly — the holder's details belong in the summary instead.
+	if strings.Contains(d.Hint, "\n") {
+		t.Errorf("hint %q spans more than one line", d.Hint)
+	}
+	if !strings.Contains(d.Hint, "--break-lock=9f3a1c4e7b2d8a05") || !strings.Contains(d.Hint, "never --with-lock") {
+		t.Errorf("hint %q does not warn off the wrong door", d.Hint)
+	}
+	attrs := map[string]any{}
+	for _, a := range d.Attrs {
+		attrs[a.Key] = a.Value()
+	}
+	if attrs["lock_id"] != "9f3a1c4e7b2d8a05" {
+		t.Errorf("lock_id attr = %v", attrs["lock_id"])
+	}
+	if attrs["pid"] != 4127 {
+		t.Errorf("pid attr = %v, want 4127", attrs["pid"])
+	}
+	if attrs["host"] != "builder-3" {
+		t.Errorf("host attr = %v, want builder-3", attrs["host"])
+	}
+	// Exit 1: someone else holding the lock is environmental, not an rdk bug.
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
+	}
+}
+
 // The summary is a diagnostic like any other, so JSONL consumers get the
 // counts as attrs rather than having to parse the sentence.
 func TestResultDiagnosticCarriesCounts(t *testing.T) {

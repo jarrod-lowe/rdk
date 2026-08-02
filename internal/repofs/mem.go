@@ -64,7 +64,7 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 func (m *Mem) acquireLock() error {
 	if _, ok := m.files[scratchLock]; ok {
 		existing, _ := m.readLock()
-		return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing))}
+		return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
 	}
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {

@@ -87,6 +87,43 @@ func Run(store repofs.Store, version string) (Result, error) {
 				Hint: "the generated tree is correct; clear " + repofs.ScratchDir + "/old, then re-run",
 			})
 		}
+		if errors.Is(err, repofs.ErrLocked) {
+			// The holder's details go in the summary, not the hint: the text
+			// handler indents only a hint's first line, so a multi-line hint
+			// renders badly. The Message tail is only present for a kind "held"
+			// lock, so it's appended rather than baked into a fixed format —
+			// leaving a dangling colon for kind "apply" (no message) would be
+			// its own small lie.
+			//
+			// No Cause here (diag.New, not diag.Wrap): the wrapped error's own
+			// text is the same holder details in a different shape, and setting
+			// it as Cause would print them twice.
+			info, _ := repofs.LockInfoFromError(err)
+			summary := fmt.Sprintf("another rdk apply holds this repository (lock %s, pid %d on %s since %s)",
+				info.ID, info.PID, info.Host, info.Since)
+			if info.Message != "" {
+				summary += ": " + info.Message
+			}
+			// --with-lock does not exist yet (that's step 2 of the lock
+			// feature), but this is exactly where an agent looks for a way
+			// past a blocked apply, and the error already hands over the id
+			// both --break-lock and --with-lock need. Warning off the wrong
+			// door before it exists is cheaper than retrofitting the warning
+			// once it does.
+			return Result{}, diag.New(diag.Diagnostic{
+				Code:    diag.CodeApplyLocked,
+				Summary: summary,
+				Hint: fmt.Sprintf("wait for it; if it is stranded use --break-lock=%s — never --with-lock, which is only for the process that took the lock",
+					info.ID),
+				Attrs: []diag.Attr{
+					diag.Str("lock_id", info.ID),
+					diag.Str("lock_kind", info.Kind),
+					diag.Str("host", info.Host),
+					diag.Int("pid", info.PID),
+					diag.Str("since", info.Since),
+				},
+			})
+		}
 		if errors.Is(err, repofs.ErrPublish) {
 			// rdk-managed/ is absent right now, which is alarming to look at.
 			// Both trees are still on disk under the scratch, so the honest

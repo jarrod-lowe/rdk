@@ -44,6 +44,7 @@ status on their own — a run that warns and then fails still exits 1.
 | `seed-not-a-file` | The path a seeded file would occupy exists but is not a file — most often a directory of the same name. | Remove or rename it, then re-run `rdk init`. |
 | `seed-failed` | A seeded file could not be created. | Read the cause; check permissions and free space. |
 | `invalid-flag` | A flag, command, or flag value on the command line was not recognised. | Check the message; run `rdk --help` for the accepted commands and flags. |
+| `apply-locked` | Something else holds this repository's lock. | Wait for it. If it is stranded — the process is gone — re-run with `--break-lock=<id>`, naming the id from the message. |
 
 ## Warnings
 
@@ -52,6 +53,7 @@ status on their own — a run that warns and then fails still exits 1.
 | `set-aside` | A file is parked with `.disabled` or `.example`, so nothing is generated for it. | Intentional — rename to `.yaml` to enable it. |
 | `editor-artifact` | An editor or merge leftover (`.orig`, `.rej`, `.bak`, `~`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
 | `machine-file` | A file nobody chose to create (`.DS_Store`, `Thumbs.db`, a vim swap file) or a git housekeeping file (`.gitignore`, `.gitkeep`) sits in `rdk/`. | Delete it, or move it out of the definitions dir. |
+| `lock-broken` | `--break-lock` removed a lock another run had left behind. | Intentional. If an apply really was running, both runs are now unsafe — check `rdk-managed/` and re-run. |
 
 ## Results
 

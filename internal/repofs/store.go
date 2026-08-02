@@ -111,12 +111,28 @@ var ErrLocked = errors.New("another rdk apply holds this repository")
 // lockedError marks a failure to acquire the repository lock. It carries the
 // holder's details (whatever could be read), since the caller's summary can't
 // know that — and the id it carries is the only way past this error, so it
-// has to be in the message rather than dropped.
-type lockedError struct{ err error }
+// has to be in the message rather than dropped. info is carried structurally,
+// not just baked into err's text, so a caller (apply.Run) can emit the
+// holder's fields as typed attrs instead of parsing the sentence back apart.
+type lockedError struct {
+	err  error
+	info LockInfo
+}
 
 func (e *lockedError) Error() string        { return e.err.Error() }
 func (e *lockedError) Unwrap() error        { return e.err }
 func (e *lockedError) Is(target error) bool { return target == ErrLocked }
+
+// LockInfoFromError extracts the held lock's details from an error wrapping
+// ErrLocked. False if err doesn't carry one — a defensive caller-side check,
+// since Materialize is the only source of ErrLocked and always attaches it.
+func LockInfoFromError(err error) (LockInfo, bool) {
+	var le *lockedError
+	if errors.As(err, &le) {
+		return le.info, true
+	}
+	return LockInfo{}, false
+}
 
 // LockInfo is who holds (or held) the repository lock. It is written for a
 // human to read in an error message and is never acted on: rdk must not
@@ -455,7 +471,7 @@ func (s *osStore) acquireLock() error {
 			// here are swallowed and describeLock is handed whatever did come
 			// through, even if that's nothing.
 			existing, _ := s.readLock()
-			return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing))}
+			return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
 		}
 		return err
 	}

@@ -76,6 +76,16 @@ func execute(args []string, stdout, stderr io.Writer) int {
 	if err == nil {
 		return 0
 	}
+	err = a.renderFailure(err, stdout, stderr)
+	return diag.ExitCode(err)
+}
+
+// renderFailure logs err through a's own logger and returns it unchanged, so
+// the caller can still classify it (e.g. via diag.ExitCode). Split out of
+// execute so a test driving root.Execute() directly — to inspect the raw
+// error alongside the rendered text — can reach the same rendering without
+// duplicating it.
+func (a *app) renderFailure(err error, stdout, stderr io.Writer) error {
 	log := a.log
 	if log == nil {
 		// Nothing has run yet, so cobra rejected the command line itself: an
@@ -95,5 +105,5 @@ func execute(args []string, stdout, stderr io.Writer) int {
 		log = logger.New(logger.Options{Stdout: stdout, Stderr: stderr})
 	}
 	log.Fail(err)
-	return diag.ExitCode(err)
+	return err
 }
