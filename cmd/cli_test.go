@@ -168,7 +168,10 @@ func TestJSONLModeEmitsOneObjectPerLine(t *testing.T) {
 	}
 }
 
-func TestQuietModeSuppressesTheSummary(t *testing.T) {
+// --log-level=warn used to be a quiet mode that swallowed the summary along
+// with the warnings it was meant to filter; a result is not a diagnostic, so
+// it must survive any configured level.
+func TestLogLevelWarnStillPrintsTheSummary(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := runSplit(t, dir, "init"); err != nil {
 		t.Fatalf("init: %v", err)
@@ -180,8 +183,8 @@ func TestQuietModeSuppressesTheSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if strings.TrimSpace(out) != "" {
-		t.Errorf("stdout = %q, want empty", out)
+	if !strings.Contains(out, "rdk apply: wrote") {
+		t.Errorf("stdout = %q, want the summary", out)
 	}
 }
 
@@ -397,6 +400,25 @@ func TestLockThenUnlock(t *testing.T) {
 // rdk lock's success output is the one place --with-lock guidance belongs —
 // only the holder sees it — and it reminds the holder to release when done,
 // since a lock left behind blocks everyone else.
+// This is the case that prompted levels to stop filtering results: a script
+// doing id=$(rdk lock -m work --log-level=warn) must not come back empty and
+// hold a lock nobody can see the id of.
+func TestLockIDSurvivesWarnLevel(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	out, _, err := runSplit(t, dir, "lock", "-m", "agent working", "--log-level=warn")
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	id := lockIDFromDisk(t, dir)
+	if !strings.Contains(out, id) {
+		t.Errorf("stdout = %q, want it to contain the lock id %q", out, id)
+	}
+}
+
 func TestLockTellsYouHowToApplyAndRelease(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := runSplit(t, dir, "init"); err != nil {

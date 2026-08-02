@@ -138,18 +138,20 @@ func TestFailFindsAWrappedDiagnostic(t *testing.T) {
 	}
 }
 
-// Because results are Info, --log-level=warn is the quiet mode.
-func TestWarnLevelSuppressesResults(t *testing.T) {
+// --log-level filters diagnostics, not a command's answer: a result survives
+// any configured level, while a warning at a stricter level than it carries
+// does not.
+func TestLogLevelFiltersWarningsButNeverResults(t *testing.T) {
 	var out, errBuf bytes.Buffer
-	l := New(Options{Format: FormatText, Level: slog.LevelWarn, Color: ColorNever,
+	l := New(Options{Format: FormatText, Level: slog.LevelError, Color: ColorNever,
 		Stdout: &out, Stderr: &errBuf, Env: noEnv})
 	l.Result(diag.Diagnostic{Code: diag.CodeApplyComplete, Summary: "rdk apply: wrote 4 files"})
 	l.Warn(diag.Diagnostic{Code: diag.CodeSetAside, File: "a.yaml.disabled", Summary: "ignored"})
-	if out.Len() != 0 {
-		t.Errorf("stdout = %q, want empty at warn level", out.String())
+	if out.Len() == 0 {
+		t.Error("stdout is empty, want the result to survive --log-level=error")
 	}
-	if errBuf.Len() == 0 {
-		t.Error("warning was suppressed at warn level")
+	if errBuf.Len() != 0 {
+		t.Errorf("stderr = %q, want the warning suppressed at error level", errBuf.String())
 	}
 }
 

@@ -39,16 +39,24 @@ func New(o Options) *Logger {
 	// its hint.
 	mu := &sync.Mutex{}
 	return &Logger{
-		out: slog.New(newHandler(o, o.Stdout, mu)),
-		err: slog.New(newHandler(o, o.Stderr, mu)),
+		// --log-level is a filter over diagnostics — "don't tell me about
+		// warnings" — not over a command's answer. Building the stdout handler
+		// at the lowest level, unconditionally, is what makes a result
+		// unfilterable: only the stderr handler honours the configured level.
+		// (This asymmetry is deliberate, not a bug to "fix" — see the PR
+		// history for what happened when a result could be silenced: `rdk
+		// lock -m work` at --log-level=warn created a lock and printed
+		// nothing, so `id=$(rdk lock ...)` came back empty.)
+		out: slog.New(newHandler(o, slog.LevelDebug, o.Stdout, mu)),
+		err: slog.New(newHandler(o, o.Level, o.Stderr, mu)),
 	}
 }
 
-func newHandler(o Options, w io.Writer, mu *sync.Mutex) slog.Handler {
+func newHandler(o Options, level slog.Level, w io.Writer, mu *sync.Mutex) slog.Handler {
 	if o.Format == FormatJSONL {
-		return slog.NewJSONHandler(&lockedWriter{mu: mu, w: w}, &slog.HandlerOptions{Level: o.Level, ReplaceAttr: dropTime})
+		return slog.NewJSONHandler(&lockedWriter{mu: mu, w: w}, &slog.HandlerOptions{Level: level, ReplaceAttr: dropTime})
 	}
-	return newTextHandler(w, o.Level, useColor(o.Color, w, o.Env), mu)
+	return newTextHandler(w, level, useColor(o.Color, w, o.Env), mu)
 }
 
 // lockedWriter lets the JSON handler share the text handlers' mutex. slog's

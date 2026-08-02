@@ -186,8 +186,21 @@ tell someone who mistyped `--log-format`. The message names the environment
 variable when the value came from one, because a stale export and a
 command-line typo are otherwise indistinguishable to the reader.
 
-Because results are Info, `--log-level=warn` is the quiet mode that suppresses
-the summary while keeping warnings, and `--log-level=error` is near-silent.
+`--log-level` filters diagnostics — Debug, Warn, and the Error half of `Fail`
+— never a command's result. A result is the answer to the question the user
+ran rdk to ask, not chatter to be turned down: `rdk lock -m "work"` at
+`--log-level=warn` still has to print the id, or a caller doing
+`id=$(rdk lock -m work)` gets nothing back and now holds a lock invisibly.
+The same framing makes it obvious the other way — `rdk version` printing
+nothing at `--log-level=error` would plainly be a bug. Concretely: the stdout
+handler `Result` writes through is always built at the lowest level; only the
+stderr handler honours the configured `--log-level`.
+
+One consequence: `--log-level=warn` is *not* a quiet mode for `rdk apply` —
+that framing described the old, since-reverted behaviour. There is
+currently no flag that suppresses a result; redirecting stdout
+(`rdk apply >/dev/null`) is the answer today, and a dedicated `--quiet` is a
+separate, not-yet-requested decision.
 
 ### Who may call the logger
 
