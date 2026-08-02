@@ -54,11 +54,20 @@ func (a *app) lockCmd() *cobra.Command {
 			}
 			// The id has to reach stdout as part of the result: the caller is
 			// very often a script or an agent that needs to capture it to
-			// pass to rdk unlock or --with-lock later.
+			// pass to rdk unlock or --with-lock later. This is also the one
+			// place --with-lock guidance belongs at all — only the process
+			// that took the lock sees this output, unlike a blocked apply's
+			// error, which is read by whoever lost the race and is very often
+			// not the holder. The release reminder matters for the same
+			// reason a stranded lock is worth guarding against elsewhere: a
+			// lock nobody releases blocks every apply after it, and the
+			// holder is the only one who can prevent that.
 			a.log.Result(diag.Diagnostic{
 				Code:    diag.CodeLockHeld,
 				Summary: fmt.Sprintf("rdk lock: held %s — %s", info.ID, info.Message),
-				Attrs:   []diag.Attr{diag.Str("lock_id", info.ID)},
+				Hint: fmt.Sprintf("apply while you hold it: rdk apply --with-lock=%s\nrelease when you are done: rdk unlock %s",
+					info.ID, info.ID),
+				Attrs: []diag.Attr{diag.Str("lock_id", info.ID)},
 			})
 			return nil
 		},

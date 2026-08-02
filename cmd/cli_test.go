@@ -393,6 +393,55 @@ func TestLockThenUnlock(t *testing.T) {
 	}
 }
 
+// rdk lock's success output is the one place --with-lock guidance belongs —
+// only the holder sees it — and it reminds the holder to release when done,
+// since a lock left behind blocks everyone else.
+func TestLockTellsYouHowToApplyAndRelease(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	out, _, err := runSplit(t, dir, "lock", "-m", "agent working")
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	id := lockIDFromDisk(t, dir)
+	for _, want := range []string{
+		"rdk apply --with-lock=" + id,
+		"rdk unlock " + id,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("lock output does not mention %q: %q", want, out)
+		}
+	}
+}
+
+// lock_id has to be a typed attr, not just prose in the summary, so a JSONL
+// consumer reads a field instead of parsing the sentence apart.
+func TestLockJSONLCarriesTypedLockID(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	out, _, err := runSplit(t, dir, "lock", "-m", "agent working", "--log-format=jsonl")
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	var rec map[string]any
+	if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); jsonErr != nil {
+		t.Fatalf("stdout is not JSON: %v (%q)", jsonErr, out)
+	}
+	if rec["code"] != "lock-held" {
+		t.Errorf("code = %v, want lock-held", rec["code"])
+	}
+	id := lockIDFromDisk(t, dir)
+	if rec["lock_id"] != id {
+		t.Errorf("lock_id = %v, want %q", rec["lock_id"], id)
+	}
+}
+
 // A lock nobody can explain is worse than no lock.
 func TestLockRequiresAMessage(t *testing.T) {
 	dir := t.TempDir()
