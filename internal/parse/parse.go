@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -16,6 +17,13 @@ import (
 	"github.com/jarrod-lowe/rdk/internal/repofs"
 	"github.com/jarrod-lowe/rdk/internal/schema"
 )
+
+// identifierPattern is a conservative, ASCII-only subset of Terraform's actual
+// identifier grammar (HCL's ID_Start/ID_Continue, which also admits Unicode
+// letters). Under-accepting is the safe direction here — everything this
+// pattern allows is unambiguously legal to Terraform, which is what matters
+// for a check that exists to keep generated HCL parseable.
+var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
 // Definition is one parsed, schema-validated definition file.
 type Definition struct {
@@ -217,7 +225,7 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 				})
 			}
 		}
-		if v, present := attrs[f.Name]; present && f.Type == schema.StringType {
+		if v, present := attrs[f.Name]; present && (f.Type == schema.StringType || f.Type == schema.IdentifierType) {
 			s, isStr := v.(string)
 			if !isStr {
 				return Definition{}, diag.New(diag.Diagnostic{
@@ -228,14 +236,31 @@ func parseFile(store repofs.Store, dir, name string) (Definition, error) {
 					Hint:    "example: " + f.Example,
 				})
 			}
-			if f.Required && strings.TrimSpace(s) == "" {
-				return Definition{}, diag.New(diag.Diagnostic{
-					Code:    diag.CodeEmptyField,
-					File:    name,
-					Field:   f.Name,
-					Summary: fmt.Sprintf("required field %q must not be empty", f.Name),
-					Hint:    "give it a value",
-				})
+			switch f.Type {
+			case schema.IdentifierType:
+				// The pattern itself excludes "", so a blank or whitespace-only
+				// value is reported as an illegal identifier rather than as a
+				// separate empty-field case — one diagnostic, not two disagreeing
+				// ones for the same field.
+				if !identifierPattern.MatchString(s) {
+					return Definition{}, diag.New(diag.Diagnostic{
+						Code:    diag.CodeFieldNotIdentifier,
+						File:    name,
+						Field:   f.Name,
+						Summary: fmt.Sprintf("field %q must be a Terraform identifier: %q", f.Name, s),
+						Hint:    "start with a letter or underscore; letters, digits, underscores and dashes only",
+					})
+				}
+			case schema.StringType:
+				if f.Required && strings.TrimSpace(s) == "" {
+					return Definition{}, diag.New(diag.Diagnostic{
+						Code:    diag.CodeEmptyField,
+						File:    name,
+						Field:   f.Name,
+						Summary: fmt.Sprintf("required field %q must not be empty", f.Name),
+						Hint:    "give it a value",
+					})
+				}
 			}
 		}
 	}

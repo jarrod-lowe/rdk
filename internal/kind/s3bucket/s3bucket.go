@@ -36,8 +36,8 @@ func (Kind) Schema() schema.Kind {
 		Name:        "s3-bucket",
 		Description: "An S3 bucket with safe defaults (public access blocked).",
 		Fields: []schema.Field{
-			{Name: "name", Type: schema.StringType, Required: true,
-				Description: "Resource name; becomes the bucket name until naming policy lands.",
+			{Name: "name", Type: schema.IdentifierType, Required: true,
+				Description: "Resource name; becomes the bucket name until naming policy lands, and the Terraform module label always.",
 				Example:     "assets"},
 			{Name: "description", Type: schema.StringType, Required: true,
 				Description: "What this bucket is for; feeds generated documentation.",

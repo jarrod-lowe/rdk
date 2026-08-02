@@ -20,6 +20,11 @@ func (Kind) Schema() schema.Kind {
 		Name:        "config",
 		Description: "Global repository configuration. Exactly one config definition is required.",
 		Fields: []schema.Field{
+			// Plain StringType, not IdentifierType: config produces no module
+			// block, so this name is not a Terraform label today. A future
+			// naming policy may constrain it, but that policy doesn't exist yet
+			// — imposing identifier rules now would reject legitimate project
+			// names ("Acme, Inc.") against a requirement nothing enforces.
 			{Name: "name", Type: schema.StringType, Required: true,
 				Description: "Project name; used in generated documentation and, later, naming policy.",
 				Example:     "my-service"},

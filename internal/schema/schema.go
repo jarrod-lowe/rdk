@@ -9,6 +9,10 @@ type FieldType string
 
 const (
 	StringType FieldType = "string"
+
+	// IdentifierType is a string that must also be a legal Terraform identifier,
+	// because it reaches generated Terraform as a label rather than as a value.
+	IdentifierType FieldType = "identifier"
 )
 
 // Field describes one settable field of a kind.

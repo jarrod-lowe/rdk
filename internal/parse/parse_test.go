@@ -2,6 +2,7 @@ package parse
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -362,9 +363,50 @@ func TestTrailingDocumentSeparatorAccepted(t *testing.T) {
 	}
 }
 
+// name is IdentifierType now (see TestIdentifierField* below), so the
+// generic required-string-empty case is exercised on description instead.
 func TestEmptyRequiredFieldRejected(t *testing.T) {
-	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: s3-bucket\nname: \"\"\ndescription: d\n"}), "rdk")
-	errContains(t, err, "x.yaml", "name", "empty")
+	_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: s3-bucket\nname: x\ndescription: \"\"\n"}), "rdk")
+	errContains(t, err, "x.yaml", "description", "empty")
+}
+
+// A name that cannot be a Terraform identifier is an invalid definition: it
+// reaches generated Terraform as the module block's label, not as a value, so
+// a dot, a leading digit, or a space would produce HCL that fails to parse
+// far from here.
+func TestIdentifierFieldRejectsIllegalForms(t *testing.T) {
+	cases := []struct{ label, value string }{
+		{"dot", "logs.example"},
+		{"leading digit", "123-assets"},
+		{"space", "my assets"},
+		{"empty after trim", "   "},
+	}
+	for _, c := range cases {
+		body := fmt.Sprintf("kind: s3-bucket\nname: %q\ndescription: d\n", c.value)
+		_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": body}), "rdk")
+		var d *diag.Error
+		if !errors.As(err, &d) {
+			t.Fatalf("%s: error is not a diagnostic: %v", c.label, err)
+		}
+		if d.Code != diag.CodeFieldNotIdentifier {
+			t.Errorf("%s: code = %q, want %q", c.label, d.Code, diag.CodeFieldNotIdentifier)
+		}
+		if d.Field != "name" {
+			t.Errorf("%s: field = %q, want %q", c.label, d.Field, "name")
+		}
+		if !strings.Contains(d.Error(), c.value) {
+			t.Errorf("%s: error %q does not name the offending value %q", c.label, d.Error(), c.value)
+		}
+	}
+}
+
+func TestIdentifierFieldAcceptsLegalForms(t *testing.T) {
+	for _, n := range []string{"assets", "_private", "web-server", "a1"} {
+		_, _, err := Dir(memWith(t, map[string]string{"config.yaml": goodConfig, "x.yaml": "kind: s3-bucket\nname: " + n + "\ndescription: d\n"}), "rdk")
+		if err != nil {
+			t.Errorf("%s: Dir: %v", n, err)
+		}
+	}
 }
 
 // The code is the part a machine can match on, so it has to be set at the

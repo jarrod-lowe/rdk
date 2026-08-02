@@ -31,6 +31,7 @@ An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
 | `missing-field` | A required field is absent. | Add the field the message names. |
 | `field-not-string` | A string field holds another YAML type. | Quote the value. |
 | `empty-field` | A required string field is blank. | Give it a value. |
+| `field-not-identifier` | A field that becomes a Terraform label holds a value that is not a legal Terraform identifier. | Use only letters, digits, underscores and dashes, starting with a letter or underscore. |
 | `multi-document` | One file holds several `---`-separated documents. | Split them into one definition per file. |
 | `duplicate-name` | Two definitions share a resource name. | Rename one; the message names the other file. |
 | `config-cardinality` | The definitions dir does not hold exactly one `kind: config`. | Add the missing one, or remove the extras. |
