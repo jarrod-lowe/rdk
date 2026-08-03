@@ -238,6 +238,21 @@ func TestExitCodes(t *testing.T) {
 	}
 }
 
+// --help short-circuits inside cobra before PersistentPreRunE ever builds
+// a.log, so execute's post-Execute check for a delivery failure has to cope
+// with a nil logger rather than assume RunE always ran. This is a regression
+// test for exactly that: it panicked on a nil a.log until the check was
+// guarded.
+func TestHelpDoesNotPanic(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if got := execute([]string{"--help"}, &out, &errOut); got != 0 {
+		t.Errorf("--help exit = %d, want 0 (stderr: %s)", got, errOut.String())
+	}
+	if !strings.Contains(out.String(), "Usage:") {
+		t.Errorf("stdout = %q, want cobra's help text", out.String())
+	}
+}
+
 // Silently acting on a different directory than the one named is the failure
 // this guards: it used to succeed, exit 0, and initialise the wrong place.
 func TestCommandsRejectPositionalArguments(t *testing.T) {
@@ -451,6 +466,43 @@ func TestLockIDSurvivesWarnLevel(t *testing.T) {
 	id := lockIDFromDisk(t, dir)
 	if !strings.Contains(out, id) {
 		t.Errorf("stdout = %q, want it to contain the lock id %q", out, id)
+	}
+}
+
+// failingWriter always fails, standing in for stdout redirected to a full
+// disk or a broken pipe.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write: no space left on device")
+}
+
+// The same failure TestLockIDSurvivesWarnLevel guards against from the
+// level-filtering angle, reached here by a broken stream instead: rdk lock's
+// entire job is printing the id, so a run that takes the lock but can't print
+// it must not exit 0 — that would be indistinguishable from success to a
+// script holding a lock whose id it never received.
+func TestLockDoesNotReportSuccessWhenStdoutFails(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	var errOut bytes.Buffer
+	gotExit := execute([]string{"lock", "-m", "agent working"}, failingWriter{}, &errOut)
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotExit == 0 {
+		t.Fatalf("rdk lock exited 0 despite failing to print its id (stderr: %s)", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "output") {
+		t.Errorf("stderr does not explain the delivery failure: %q", errOut.String())
 	}
 }
 

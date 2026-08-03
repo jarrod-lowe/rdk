@@ -9,7 +9,7 @@ import (
 )
 
 func newTextLogger(w *bytes.Buffer, colour bool) *slog.Logger {
-	return slog.New(newTextHandler(w, slog.LevelDebug, colour, &sync.Mutex{}))
+	return slog.New(newTextHandler(w, slog.LevelDebug, colour, &sync.Mutex{}, nil))
 }
 
 func logOne(t *testing.T, colour bool, level slog.Level, msg string, attrs ...slog.Attr) string {
@@ -95,7 +95,7 @@ func TestErrorColourIsRed(t *testing.T) {
 
 func TestLevelFiltering(t *testing.T) {
 	var buf bytes.Buffer
-	l := slog.New(newTextHandler(&buf, slog.LevelWarn, false, &sync.Mutex{}))
+	l := slog.New(newTextHandler(&buf, slog.LevelWarn, false, &sync.Mutex{}, nil))
 	l.LogAttrs(context.Background(), slog.LevelInfo, "a result")
 	if buf.Len() != 0 {
 		t.Errorf("info survived a warn threshold: %q", buf.String())
@@ -153,7 +153,7 @@ func TestHintTrailingNewlineDoesNotAddBlankLine(t *testing.T) {
 
 // The closed API means these are unreachable; the panic is what keeps that true.
 func TestDerivedHandlersPanic(t *testing.T) {
-	h := newTextHandler(&bytes.Buffer{}, slog.LevelDebug, false, &sync.Mutex{})
+	h := newTextHandler(&bytes.Buffer{}, slog.LevelDebug, false, &sync.Mutex{}, nil)
 	for name, call := range map[string]func(){
 		"WithAttrs": func() { h.WithAttrs(nil) },
 		"WithGroup": func() { h.WithGroup("g") },

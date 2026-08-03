@@ -52,6 +52,7 @@ An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
 | `invalid-flag` | A flag, command, or flag value on the command line was not recognised. | Check the message; run `rdk --help` for the accepted commands and flags. |
 | `apply-locked` | Something else holds this repository's lock, and you did not name any lock yourself — a blocked `rdk apply`, or a blocked `rdk lock`. | Wait for it. If it is stranded — the process is gone — `--break-lock=<id>` removes it, naming the id the message gives. If the holder is a held lock rather than a running apply, do not try `--with-lock` unless it's yours. |
 | `lock-mismatch` | You named a lock (`--break-lock=<id>`, or `rdk unlock <id>`), and the repository disagrees: no lock exists, the id doesn't match the one held, or (for `rdk unlock`) the named lock belongs to a running apply rather than to `rdk lock`. | Read the cause; it says which of the three happened. If no lock exists, drop the flag and re-run — there is nothing to break or unlock. If the id is stale, re-run without it to see the current lock and its real id. If `rdk unlock` named an apply lock, use `--break-lock=<id>` instead. |
+| `output-failed` | The command itself completed, but writing its result to stdout failed partway — most often a full disk or a broken pipe on a redirected stdout. | Check the destination (redirect target, disk space). The command already ran: for one with a side effect (`rdk lock`, for instance), re-running reports that it's already done, and still names the id you need. |
 
 ## Warnings
 

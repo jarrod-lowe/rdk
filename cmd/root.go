@@ -107,7 +107,31 @@ func execute(args []string, stdout, stderr io.Writer) int {
 
 	err := root.Execute()
 	if err == nil {
-		return 0
+		// RunE returning nil only proves the logic that produced a command's
+		// output ran without a Go error — not that the output reached the
+		// reader. Result sits on slog.Logger.LogAttrs, whose API is void, so
+		// a handler's write failure (a full disk, a broken pipe on a
+		// redirected stdout) has nowhere to surface except Delivered, checked
+		// here rather than by every RunE: that is what makes a command whose
+		// output is the deliverable — rdk lock above all — unable to exit 0
+		// having taken its action but never shown the caller the result.
+		//
+		// a.log is nil here for exactly one case: cobra's own --help/-h
+		// handling short-circuits before PersistentPreRunE ever builds it, so
+		// no Result was ever at risk of not being delivered — there is
+		// nothing for Delivered to have latched.
+		if a.log == nil {
+			return 0
+		}
+		if werr := a.log.Delivered(); werr != nil {
+			err = diag.Wrap(werr, diag.Diagnostic{
+				Code:    diag.CodeOutputFailed,
+				Summary: "rdk could not deliver its output",
+				Hint:    "check the destination (redirect target, disk space); the command already ran, so for one with a side effect (rdk lock, for instance) re-running reports what it already did and still names the id you need",
+			})
+		} else {
+			return 0
+		}
 	}
 	err = a.renderFailure(err, stdout, stderr)
 	return diag.ExitCode(err)

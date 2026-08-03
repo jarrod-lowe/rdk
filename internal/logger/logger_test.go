@@ -249,3 +249,72 @@ func TestZeroOptionsIsUsable(t *testing.T) {
 		t.Error("New(Options{}) returned nil")
 	}
 }
+
+// failingWriter always fails, standing in for a full disk or a broken pipe on
+// a redirected stream — the concrete case that motivates Delivered.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write: no space left on device")
+}
+
+// Delivered is the only route a handler's write error has back to a caller:
+// Result sits on slog.Logger.LogAttrs, which is void, so the failure this
+// test forces would otherwise vanish the instant Handle returns it.
+func TestDeliveredReportsAFailedResultWrite(t *testing.T) {
+	for _, f := range []Format{FormatText, FormatJSONL} {
+		l := New(Options{Format: f, Level: slog.LevelDebug, Color: ColorNever,
+			Stdout: failingWriter{}, Stderr: &bytes.Buffer{}, Env: noEnv})
+		if err := l.Delivered(); err != nil {
+			t.Errorf("%v: Delivered before any write = %v, want nil", f, err)
+		}
+		l.Result(diag.Diagnostic{Code: diag.CodeVersion, Summary: "rdk version 0.1.0"})
+		if err := l.Delivered(); err == nil {
+			t.Errorf("%v: Delivered after a failed write = nil, want the write error", f)
+		}
+	}
+}
+
+// A stderr failure must not trip Delivered: losing a warning, or losing the
+// very error message that already made the run fail, does not change whether
+// the run's actual deliverable — a result on stdout — got through.
+func TestDeliveredIgnoresStderrFailures(t *testing.T) {
+	l := New(Options{Format: FormatText, Level: slog.LevelDebug, Color: ColorNever,
+		Stdout: &bytes.Buffer{}, Stderr: failingWriter{}, Env: noEnv})
+	l.Warn(diag.Diagnostic{Code: diag.CodeSetAside, File: "a.yaml", Summary: "ignored"})
+	l.Fail(errors.New("boom"))
+	if err := l.Delivered(); err != nil {
+		t.Errorf("Delivered = %v, want nil — a stderr failure must not surface here", err)
+	}
+}
+
+// flakyWriter fails its first Write and succeeds after that, so a test can
+// prove which failure sticks once more than one write happens.
+type flakyWriter struct{ calls int }
+
+func (w *flakyWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls == 1 {
+		return 0, errors.New("write: no space left on device")
+	}
+	return len(p), nil
+}
+
+// The first failure is the one that matters; Delivered must not paper over it
+// with whatever a later, successful write happens to report — a caller
+// checking once, after a run finishes, must still learn about a result that
+// failed earlier even if a subsequent write went fine.
+func TestDeliveredLatchesTheFirstFailure(t *testing.T) {
+	w := &flakyWriter{}
+	l := New(Options{Format: FormatText, Level: slog.LevelDebug, Color: ColorNever,
+		Stdout: w, Stderr: &bytes.Buffer{}, Env: noEnv})
+	l.Result(diag.Diagnostic{Code: diag.CodeVersion, Summary: "first"})
+	first := l.Delivered()
+	if first == nil {
+		t.Fatal("Delivered after a failed write = nil, want the error")
+	}
+	l.Result(diag.Diagnostic{Code: diag.CodeVersion, Summary: "second"})
+	if got := l.Delivered(); got != first {
+		t.Errorf("Delivered = %v, want the first failure (%v) to survive a later successful write", got, first)
+	}
+}

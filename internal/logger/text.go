@@ -26,6 +26,7 @@ type textHandler struct {
 	level slog.Level
 	color bool
 	mu    *sync.Mutex
+	errs  *streamError // nil is valid; see streamError's doc in logger.go
 }
 
 var _ slog.Handler = (*textHandler)(nil)
@@ -34,8 +35,8 @@ var _ slog.Handler = (*textHandler)(nil)
 // sibling handler rather than owned per-handler: stdout and stderr are usually
 // the same terminal, so serialising each stream alone would still let a result
 // line land between an error and its hint.
-func newTextHandler(w io.Writer, level slog.Level, color bool, mu *sync.Mutex) *textHandler {
-	return &textHandler{w: w, level: level, color: color, mu: mu}
+func newTextHandler(w io.Writer, level slog.Level, color bool, mu *sync.Mutex, errs *streamError) *textHandler {
+	return &textHandler{w: w, level: level, color: color, mu: mu, errs: errs}
 }
 
 func (h *textHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
@@ -101,6 +102,10 @@ func (h *textHandler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	_, err := io.WriteString(h.w, b.String())
+	// Handle's return value is exactly what slog.Logger.LogAttrs discards —
+	// the whole reason emit's caller can never see it — so errs.record is the
+	// only path left to Logger.Delivered.
+	h.errs.record(err)
 	return err
 }
 
