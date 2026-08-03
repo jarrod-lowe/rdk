@@ -158,6 +158,12 @@ func (m *Mem) BreakLock(id string) (LockInfo, error) {
 	return info, nil
 }
 
+// Seed mirrors osStore.Seed's create-once contract. It needs none of
+// osStore's write-to-a-scratch-name-then-Link machinery: that exists to keep
+// a write that fails partway from leaving a half-written file at name, and a
+// map assignment has no partway — it either happens or the earlier error
+// return means it never runs, so there is no truncated state for Mem to
+// produce or guard against.
 func (m *Mem) Seed(name string, data []byte) error {
 	if _, ok := m.files[name]; ok {
 		return nil

@@ -203,7 +203,11 @@ type Store interface {
 	// parent directory component of path is a symlink rather than creating
 	// through it. A pre-existing file or symlink at the target is a no-op;
 	// anything else there (a directory, a device, a socket) is reported via
-	// ErrSeedTarget rather than treated as already seeded.
+	// ErrSeedTarget rather than treated as already seeded. A write that fails
+	// partway leaves nothing at the target: the content is written and closed
+	// at a scratch name first and only linked into place once complete, so a
+	// reader of the target never sees a truncated file, only nothing or the
+	// whole thing.
 	Seed(path string, data []byte) error
 	// ReadFile / ReadDir read within the repo root. ReadDir returns entries
 	// sorted by name. Paths are repo-relative.
@@ -800,8 +804,9 @@ func (s *osStore) Seed(name string, data []byte) error {
 		// Checked before MkdirAll for the same reason as Materialize's scratch
 		// check: MkdirAll succeeds through a symlinked parent (e.g. `rdk ->
 		// docs`), and by then the create below would already be aimed at
-		// whatever the symlink points to. O_EXCL on the final component (below)
-		// protects the leaf; this protects everything above it.
+		// whatever the symlink points to. Link's no-follow-at-the-leaf
+		// behaviour (see seedNew) protects the leaf; this protects everything
+		// above it.
 		if err := s.checkPathComponents(dir); err != nil {
 			return err
 		}
@@ -809,29 +814,112 @@ func (s *osStore) Seed(name string, data []byte) error {
 			return err
 		}
 	}
-	f, err := s.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+
+	// Common case first, and cheap: on a repo that's already seeded — by far
+	// the most frequent way Seed is called, since every `rdk init` re-run
+	// takes this path — there is nothing to write, so this returns without
+	// ever touching the scratch dir. Lstat, not Stat: a symlink must be
+	// judged as itself, not as whatever it points to, so that leaving it
+	// alone (DD-3) doesn't depend on where it happens to resolve.
+	if info, err := s.root.Lstat(name); err == nil {
+		return seedExisting(info)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return s.seedNew(name, data)
+}
+
+// seedExisting turns what's already occupying a seed target into Seed's
+// result: a file or symlink is a no-op (DD-3), anything else is
+// ErrSeedTarget. The path itself isn't repeated in the error: the caller
+// already has it (Store.Seed's argument, or diag's File field), so this only
+// needs to say what's actually occupying it.
+func seedExisting(info fs.FileInfo) error {
+	if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil // already present (file or symlink) — leave it (DD-3)
+	}
+	return &seedTargetError{err: fmt.Errorf("it is a %s", modeKind(info.Mode()))}
+}
+
+// seedNew writes data where Seed's own Lstat just found nothing. This is
+// where the old implementation's bug lived: it created name itself with
+// O_CREATE|O_EXCL and wrote straight into it, deferring Close and discarding
+// its error. A write that failed partway — a full disk, or an error only
+// Close reports — left a truncated regular file sitting at name. The next
+// Seed call's O_EXCL then hit EEXIST, judged the truncated file "already
+// there" (it looked exactly like a legitimately seeded one), and returned
+// success — so `rdk init` reported the repository ready over a config it had
+// only half written, and the eventual failure surfaced later, far from its
+// cause.
+//
+// The fix writes the full content to a scratch name first — Write and Close
+// both checked now, not deferred and dropped — and only once that has fully
+// succeeded links it into place. Link, unlike the rename
+// publishScratchGitignore uses for the same "write complete-or-nothing"
+// shape, never overwrites an existing name: it fails with EEXIST if anything
+// is already there. That's exactly the difference Seed needs: a bare rename
+// onto the target would silently destroy a config that was legitimately the
+// user's, which is the one thing "create once, then it is the user's" can
+// never do. So the visible name comes into existence only once, and only
+// complete — a half-written temp file never reaches it, and if something else
+// wins the race to create name first, this defers to whatever it left (via
+// the same seedExisting check the fast path above uses) rather than erroring.
+//
+// The scratch name lives in ScratchDir, not beside the target: the target's
+// own directory is rdk/, which parse.classify scans and errors on anything it
+// doesn't recognise, so debris left behind by a failed cleanup there would
+// break the very next apply. ScratchDir is already rdk's own working space
+// and is gitignored, so litter left there by, e.g., a Remove that itself
+// fails is wasted space, not a correctness problem — see the comment on the
+// final Remove below.
+func (s *osStore) seedNew(name string, data []byte) error {
+	if err := s.ensureScratchDir(); err != nil {
+		return err
+	}
+	// Random, not sequential or fixed, for the same reason as
+	// publishScratchGitignore's suffix: two concurrent Seed calls must not
+	// choose the same scratch name and stomp each other's in-flight write.
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		return err
+	}
+	tmp := ScratchDir + "/seed." + hex.EncodeToString(suffix) + ".tmp"
+	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		_ = s.root.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = s.root.Remove(tmp)
+		return err
+	}
+	if err := s.root.Link(tmp, name); err != nil {
+		_ = s.root.Remove(tmp)
 		if os.IsExist(err) {
-			// Lstat, not Stat: a symlink must be judged as itself, not as
-			// whatever it points to, so that leaving it alone (DD-3) doesn't
-			// depend on where it happens to resolve.
+			// Lost the create-once race: something else — a concurrent Seed,
+			// almost certainly — put a name there between this call's Lstat
+			// and this Link. Whatever it left is exactly as valid a seed as
+			// this call's own data would have been, so this defers to it
+			// rather than erroring.
 			info, statErr := s.root.Lstat(name)
 			if statErr != nil {
 				return statErr
 			}
-			if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-				return nil // already present (file or symlink) — leave it (DD-3)
-			}
-			// The path itself isn't repeated here: the caller already has it
-			// (Store.Seed's argument, or diag's File field), so this only
-			// needs to say what's actually occupying it.
-			return &seedTargetError{err: fmt.Errorf("it is a %s", modeKind(info.Mode()))}
+			return seedExisting(info)
 		}
 		return err
 	}
-	defer f.Close()
-	_, err = f.Write(data)
-	return err
+	// Best-effort: name is already complete and correct by the time Link
+	// returns — Link only adds a second directory entry for the same bytes,
+	// it doesn't move them — so a temp file stranded here by a failed Remove
+	// is clutter in the gitignored scratch dir, not a reason to tell the
+	// caller the seed itself failed.
+	_ = s.root.Remove(tmp)
+	return nil
 }
 
 // modeKind names what occupies a seed target, for a message that says what's
