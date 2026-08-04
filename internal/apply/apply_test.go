@@ -178,8 +178,11 @@ func TestRunReportsAnExistingApplyLockWithAttrs(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, repofs.ScratchDir), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The transaction lock, not the held lock: since the storage split, a
+	// running apply's lock lives at .rdk/apply.lock — see
+	// docs/superpowers/specs/2026-08-02-apply-lock-design.md.
 	lock := `{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`
-	if err := os.WriteFile(filepath.Join(root, repofs.ScratchDir, "lock"), []byte(lock), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, repofs.ScratchDir, "apply.lock"), []byte(lock), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -191,7 +194,7 @@ func TestRunReportsAnExistingApplyLockWithAttrs(t *testing.T) {
 	if d.Code != diag.CodeApplyLocked {
 		t.Errorf("code = %q, want %q", d.Code, diag.CodeApplyLocked)
 	}
-	if !strings.Contains(d.Summary, "another rdk apply holds this repository") {
+	if !strings.Contains(d.Summary, "another rdk apply is running") {
 		t.Errorf("summary %q does not name it as an apply, not a held lock", d.Summary)
 	}
 	if !strings.Contains(d.Summary, "9f3a1c4e7b2d8a05") {

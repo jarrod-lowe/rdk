@@ -296,7 +296,9 @@ func TestApplyReportsAnExistingLock(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
 		[]byte("kind: config\nname: demo\n"), 0o644)
 	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
-	os.WriteFile(filepath.Join(dir, ".rdk", "lock"),
+	// The transaction lock, not the held lock: since the storage split, a
+	// running apply's lock lives at .rdk/apply.lock.
+	os.WriteFile(filepath.Join(dir, ".rdk", "apply.lock"),
 		[]byte(`{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`), 0o644)
 
 	_, errOut, err := runSplit(t, dir, "apply")
@@ -365,7 +367,9 @@ func TestApplyBreakLockNoticeSurvivesAFailedApply(t *testing.T) {
 	// A stray file makes apply.Run fail after the lock is already broken.
 	os.WriteFile(filepath.Join(dir, "rdk", "notes.txt"), []byte("scratch\n"), 0o644)
 	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
-	os.WriteFile(filepath.Join(dir, ".rdk", "lock"),
+	// A stranded transaction lock — the state a hard kill leaves — lives at
+	// .rdk/apply.lock since the storage split.
+	os.WriteFile(filepath.Join(dir, ".rdk", "apply.lock"),
 		[]byte(`{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`), 0o644)
 
 	_, errOut, err := runSplit(t, dir, "apply", "--break-lock=9f3a1c4e7b2d8a05")
@@ -377,8 +381,8 @@ func TestApplyBreakLockNoticeSurvivesAFailedApply(t *testing.T) {
 			t.Errorf("failure does not mention %q: %q", want, errOut)
 		}
 	}
-	if _, statErr := os.Stat(filepath.Join(dir, ".rdk", "lock")); !os.IsNotExist(statErr) {
-		t.Errorf(".rdk/lock still exists after --break-lock: %v", statErr)
+	if _, statErr := os.Stat(filepath.Join(dir, ".rdk", "apply.lock")); !os.IsNotExist(statErr) {
+		t.Errorf(".rdk/apply.lock still exists after --break-lock: %v", statErr)
 	}
 }
 
@@ -614,13 +618,16 @@ func TestUnlockRejectsAWrongID(t *testing.T) {
 
 // rdk unlock refuses to end an apply lock, and points at --break-lock instead
 // — ending someone's running apply is breaking, not unlocking.
+// The required scenario: rdk unlock naming a running apply's transaction
+// lock still gets the redirecting message, even though unlock only ever
+// touches .rdk/lock — it reads .rdk/apply.lock too, purely to diagnose.
 func TestUnlockRefusesAnApplyLock(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := runSplit(t, dir, "init"); err != nil {
 		t.Fatalf("init: %v", err)
 	}
 	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
-	os.WriteFile(filepath.Join(dir, ".rdk", "lock"),
+	os.WriteFile(filepath.Join(dir, ".rdk", "apply.lock"),
 		[]byte(`{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`), 0o644)
 
 	_, errOut, err := runSplit(t, dir, "unlock", "9f3a1c4e7b2d8a05")
@@ -631,6 +638,59 @@ func TestUnlockRefusesAnApplyLock(t *testing.T) {
 		t.Errorf("unlock's refusal does not point at --break-lock: %q", errOut)
 	}
 	assertLockMismatch(t, err, "unlock naming an apply lock")
+	if _, statErr := os.Stat(filepath.Join(dir, ".rdk", "apply.lock")); statErr != nil {
+		t.Errorf("unlock touched the apply lock: %v", statErr)
+	}
+}
+
+// rdk lock must refuse while an apply is genuinely in flight — otherwise it
+// would return claiming the repository is held while a Materialize is
+// halfway through, the exact lie the feature exists to prevent.
+func TestLockRefusedWhileAnApplyIsRunning(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".rdk", "apply.lock"),
+		[]byte(`{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`), 0o644)
+
+	_, errOut, err := runSplit(t, dir, "lock", "-m", "agent working")
+	if err == nil {
+		t.Fatal("lock succeeded while an apply was running")
+	}
+	if !strings.Contains(errOut, "another rdk apply is running") {
+		t.Errorf("lock's refusal does not say an apply is running: %q", errOut)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".rdk", "lock")); !os.IsNotExist(statErr) {
+		t.Errorf("rdk lock created a held lock despite the running apply: %v", statErr)
+	}
+}
+
+// A stranded transaction lock — the state a hard kill leaves, since an
+// ordinary exit always releases via defer or the signal handler —
+// --break-lock clears exactly as it always could when there was one file.
+func TestApplyBreakLockClearsAStrandedApplyLock(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".rdk", "apply.lock"),
+		[]byte(`{"id":"9f3a1c4e7b2d8a05","kind":"apply","host":"builder-3","pid":4127,"since":"2026-08-02T10:04:11Z"}`), 0o644)
+
+	out, _, err := runSplit(t, dir, "apply", "--break-lock=9f3a1c4e7b2d8a05")
+	if err != nil {
+		t.Fatalf("apply --break-lock: %v", err)
+	}
+	if !strings.Contains(out, "rdk apply: wrote") {
+		t.Errorf("apply did not proceed: %q", out)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".rdk", "apply.lock")); !os.IsNotExist(statErr) {
+		t.Errorf(".rdk/apply.lock still exists after --break-lock: %v", statErr)
+	}
 }
 
 // Naming a lock id when nothing is locked at all is still lock-mismatch, not

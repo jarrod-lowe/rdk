@@ -13,9 +13,12 @@ import (
 
 // lockCmd takes a held lock and exits leaving it, deliberately. It must not
 // call a.setStore: that would give the SIGINT/SIGTERM handler a route to
-// release the very lock this command exists to leave behind, which is
-// exactly the failure the kind-aware ReleaseLock in repofs makes structural
-// rather than a convention every future command has to remember.
+// release the very lock this command exists to leave behind. repofs already
+// makes that structural — ReleaseLock only ever touches the transaction
+// lock's file, and a held lock is never written under that name — but not
+// registering this Store at all is the belt to that braces: the handler has
+// no route to any Store here, so there is nothing for a future repofs change
+// to have to remember not to reach.
 func (a *app) lockCmd() *cobra.Command {
 	var message string
 	cmd := &cobra.Command{

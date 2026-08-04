@@ -92,10 +92,11 @@ func TestMemReadDirReportsDirectories(t *testing.T) {
 
 // The fake must exclude a concurrent Materialize exactly like the real Store,
 // or a component test could pass against Mem while misrepresenting
-// production's locking.
+// production's locking. sampleLock and the scratchLock/scratchApplyLock
+// constants are shared with store_test.go - same package, same fixtures.
 func TestMemMaterializeRefusesWhileLocked(t *testing.T) {
 	m := NewMem()
-	b, err := json.Marshal(heldLock())
+	b, err := json.Marshal(sampleLock(lockKindHeld))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +112,27 @@ func TestMemMaterializeRefusesWhileLocked(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err.Error(), want)
 		}
+	}
+	if _, ok := m.Files()["managed/f.txt"]; ok {
+		t.Error("published despite the lock")
+	}
+}
+
+// The transient case: a lock found in scratchApplyLock blocks Materialize via
+// the O_CREAT|O_EXCL collision, not the held-lock check above.
+func TestMemMaterializeRefusesWhileAnotherApplyIsRunning(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(sampleLock(lockKindApply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchApplyLock] = b
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err = m.Materialize("managed", set)
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked", err)
 	}
 	if _, ok := m.Files()["managed/f.txt"]; ok {
 		t.Error("published despite the lock")
@@ -136,8 +158,8 @@ func TestMemMaterializeReleasesTheLockOnSuccess(t *testing.T) {
 	if err := m.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := m.Files()[scratchLock]; ok {
-		t.Error("lock survived a successful apply")
+	if _, ok := m.Files()[scratchApplyLock]; ok {
+		t.Error("apply lock survived a successful apply")
 	}
 	// And a second run must work, which is the point.
 	if err := m.Materialize("managed", set); err != nil {
@@ -148,7 +170,7 @@ func TestMemMaterializeReleasesTheLockOnSuccess(t *testing.T) {
 // The id is the whole safety property, same as the real Store.
 func TestMemBreakLockOnlyRemovesTheNamedLock(t *testing.T) {
 	m := NewMem()
-	b, err := json.Marshal(heldLock())
+	b, err := json.Marshal(sampleLock(lockKindHeld))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +202,28 @@ func TestMemBreakLockWithNoLockPresentIsAnError(t *testing.T) {
 	}
 }
 
+// A hard kill is the only way a transaction lock is ever found stranded, and
+// --break-lock has to clear it, same as the real Store.
+func TestMemBreakLockRemovesAStrandedApplyLock(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(sampleLock(lockKindApply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchApplyLock] = b
+
+	info, err := m.BreakLock("9f3a1c4e7b2d8a05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Held || info.PID != 4127 || info.Host != "builder-3" {
+		t.Errorf("info = %+v, want the holder's details", info)
+	}
+	if _, ok := m.Files()[scratchApplyLock]; ok {
+		t.Error("apply lock not removed")
+	}
+}
+
 // rdk lock takes a lock and exits leaving it. Nothing automatic may remove it:
 // not a defer, not a signal. Only rdk unlock or --break-lock, both of which
 // name it. Mirrors TestReleaseLockLeavesAHeldLockAlone.
@@ -202,13 +246,31 @@ func TestMemReleaseLockLeavesAHeldLockAlone(t *testing.T) {
 
 func TestMemHoldLockRefusesWhenAlreadyLocked(t *testing.T) {
 	m := NewMem()
-	b, err := json.Marshal(heldLock())
+	b, err := json.Marshal(sampleLock(lockKindHeld))
 	if err != nil {
 		t.Fatal(err)
 	}
 	m.Files()[scratchLock] = b
 	if _, err := m.HoldLock("second"); !errors.Is(err, ErrLocked) {
 		t.Fatalf("err = %v, want ErrLocked", err)
+	}
+}
+
+// rdk lock must not return success while an apply is genuinely mid-flight.
+// Mirrors TestHoldLockRefusesWhileAnApplyIsRunning.
+func TestMemHoldLockRefusesWhileAnApplyIsRunning(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(sampleLock(lockKindApply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchApplyLock] = b
+
+	if _, err := m.HoldLock("agent working"); !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want ErrLocked", err)
+	}
+	if _, ok := m.Files()[scratchLock]; ok {
+		t.Error("HoldLock created a held lock despite the running apply")
 	}
 }
 
@@ -235,20 +297,42 @@ func TestMemUnlockOnlyReleasesTheNamedHeldLock(t *testing.T) {
 }
 
 // An apply's lock is not yours to end routinely — that is what --break-lock is
-// for, and it warns. Mirrors TestUnlockRefusesAnApplyLock.
+// for, and it warns. Mirrors TestUnlockRefusesAnApplyLock: this is the
+// required scenario, naming an apply lock via the redirecting message even
+// though Unlock only ever touches the held-lock file.
 func TestMemUnlockRefusesAnApplyLock(t *testing.T) {
 	m := NewMem()
-	b, err := json.Marshal(heldLock()) // kind: apply
+	b, err := json.Marshal(sampleLock(lockKindApply))
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Files()[scratchLock] = b
+	m.Files()[scratchApplyLock] = b
 	err = m.Unlock("9f3a1c4e7b2d8a05")
 	if err == nil {
 		t.Fatal("unlocked an apply lock")
 	}
 	if !strings.Contains(err.Error(), "--break-lock") {
 		t.Errorf("error %q does not point at the right door", err.Error())
+	}
+	if _, ok := m.Files()[scratchApplyLock]; !ok {
+		t.Error("unlock touched the apply lock")
+	}
+}
+
+// Migration note: mirrors TestUnlockClearsAStaleApplyKindLockFoundInTheHeldFile.
+func TestMemUnlockClearsAStaleApplyKindLockFoundInTheHeldFile(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(sampleLock(lockKindApply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchLock] = b // pre-split binary's stale content
+
+	if err := m.Unlock("9f3a1c4e7b2d8a05"); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	if _, ok := m.Files()[scratchLock]; ok {
+		t.Error("stale lock not removed")
 	}
 }
 
@@ -271,25 +355,43 @@ func TestMemUseLockRunsWithoutAcquiringOrReleasing(t *testing.T) {
 	if _, ok := m.Files()[scratchLock]; !ok {
 		t.Error("the held lock did not survive the apply")
 	}
+	if _, ok := m.Files()[scratchApplyLock]; ok {
+		t.Error("the transaction lock survived a successful apply run under an adopted lock")
+	}
 	if string(m.Files()["managed/f.txt"]) != "x" {
 		t.Error("apply did not publish")
 	}
 }
 
-// Mirrors TestUseLockRefusesAnApplyLock.
-func TestMemUseLockRefusesAnApplyLock(t *testing.T) {
+// UseLock only ever reads scratchLock, so a running apply's lock can never be
+// what it finds. Mirrors TestUseLockCannotAdoptARunningApplysLock.
+func TestMemUseLockCannotAdoptARunningApplysLock(t *testing.T) {
 	m := NewMem()
-	b, err := json.Marshal(heldLock()) // heldLock() is kind "apply" despite the name
+	b, err := json.Marshal(sampleLock(lockKindApply))
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Files()[scratchLock] = b
+	m.Files()[scratchApplyLock] = b
 	_, err = m.UseLock("9f3a1c4e7b2d8a05")
 	if err == nil {
 		t.Fatal("adopted a running apply's lock")
 	}
-	if !strings.Contains(err.Error(), "apply") {
-		t.Errorf("error %q does not say why", err.Error())
+	if !strings.Contains(err.Error(), "broken out from under you") {
+		t.Errorf("error %q is not the generic no-held-lock message", err.Error())
+	}
+}
+
+// Migration note: mirrors TestUseLockAdoptsAStaleApplyKindLockFoundInTheHeldFile.
+func TestMemUseLockAdoptsAStaleApplyKindLockFoundInTheHeldFile(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(sampleLock(lockKindApply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchLock] = b
+
+	if _, err := m.UseLock("9f3a1c4e7b2d8a05"); err != nil {
+		t.Fatalf("UseLock: %v", err)
 	}
 }
 
@@ -301,7 +403,7 @@ func TestMemUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 	if _, err := m.UseLock("9f3a1c4e7b2d8a05"); err == nil {
 		t.Error("adopted a lock that does not exist")
 	}
-	b, err := json.Marshal(heldLock())
+	b, err := json.Marshal(sampleLock(lockKindHeld))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,17 +428,18 @@ func TestMemReleaseLockLeavesAReplacedLockAlone(t *testing.T) {
 	m.lockHeld = true
 	m.lockID = "stale-id-this-run-took"
 
-	// Someone else broke that lock and a third run acquired a fresh one.
-	b, err := json.Marshal(heldLock())
+	// Someone else broke that lock and a third run acquired a fresh one. Has
+	// to be scratchApplyLock: ReleaseLock only ever reads that file now.
+	b, err := json.Marshal(sampleLock(lockKindApply))
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Files()[scratchLock] = b
+	m.Files()[scratchApplyLock] = b
 
 	if err := m.ReleaseLock(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := m.Files()[scratchLock]; !ok {
+	if _, ok := m.Files()[scratchApplyLock]; !ok {
 		t.Error("released a lock it did not take")
 	}
 }

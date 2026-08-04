@@ -118,15 +118,22 @@ func Run(store repofs.Store, version string) (Result, error) {
 // repofs.ErrLocked, naming the holder the way a blocked apply does. `rdk lock`
 // failing to acquire because something already holds the repository is the
 // identical condition — not a second, differently-worded message — so it
-// calls this too rather than growing its own copy.
+// calls this too rather than growing its own copy. Since the storage split
+// (docs/superpowers/specs/2026-08-02-apply-lock-design.md), that call site
+// covers a case it could not before: HoldLock now also fails this way when a
+// transaction lock is in flight, so `rdk lock` never claims the repository
+// held while an apply is genuinely running.
 //
-// The wording is keyed off info.Kind: an "apply" lock really is another rdk
-// apply, but a "held" lock is nothing applying at all, and saying so would be
-// false. Neither branch explains how to use --with-lock, even though a held
-// lock's id is exactly what it needs — that instruction belongs only in rdk
-// lock's own success output (cmd/lock.go), the one place only the holder
-// sees it. Whoever is blocked here is very often not the holder, and warning
-// them off the wrong door (held case only — an apply lock is never a door
+// The wording is keyed off info.Kind: a "held" lock is nothing applying at
+// all, and calling it an apply would be false; an "apply" lock is
+// transient — someone else's Materialize is mid-flight right now — so its
+// summary says "is running", not "holds", to avoid the word "held" reading
+// as if it were the same durable thing rdk lock leaves behind. Neither
+// branch explains how to use --with-lock, even though a held lock's id is
+// exactly what it needs — that instruction belongs only in rdk lock's own
+// success output (cmd/lock.go), the one place only the holder sees it.
+// Whoever is blocked here is very often not the holder, and warning them off
+// the wrong door (held case only — an apply lock is never a door
 // --with-lock could open) costs a clause; explaining the right one to a
 // reader who may not be entitled to it would not be reversible once it ships.
 func LockedDiagnostic(err error) (diag.Diagnostic, bool) {
@@ -148,7 +155,7 @@ func LockedDiagnostic(err error) (diag.Diagnostic, bool) {
 		hint = fmt.Sprintf("wait for it to be unlocked; if it is stranded use --break-lock=%s — do not use --with-lock unless this lock is yours",
 			info.ID)
 	} else {
-		summary = fmt.Sprintf("another rdk apply holds this repository (lock %s, pid %d on %s since %s)",
+		summary = fmt.Sprintf("another rdk apply is running (lock %s, pid %d on %s since %s)",
 			info.ID, info.PID, info.Host, info.Since)
 		hint = fmt.Sprintf("wait for it; if it is stranded use --break-lock=%s", info.ID)
 	}

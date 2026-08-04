@@ -25,14 +25,33 @@ import (
 const ScratchDir = ".rdk"
 
 const (
-	scratchNew  = ScratchDir + "/new"
-	scratchOld  = ScratchDir + "/old"
-	scratchLock = ScratchDir + "/lock"
+	scratchNew = ScratchDir + "/new"
+	scratchOld = ScratchDir + "/old"
 
-	// The two kinds of lock. An apply lock lives only as long as the
-	// Materialize that took it; a held lock is taken by `rdk lock` and
-	// deliberately outlives its process, which is why ReleaseLock has to tell
-	// them apart rather than removing whatever it finds.
+	// scratchLock is the held lock — rdk lock / unlock / --break-lock, long-
+	// lived. scratchApplyLock is the transaction lock — taken by every
+	// Materialize and released by defer or the signal handler. They used to
+	// be the same file, and the two kinds shared it by tagging themselves
+	// with Kind. That was the bug: --with-lock adopts the held lock without
+	// acquiring anything, and because acquisition and holding were the same
+	// file, adopting it meant Materialize skipped acquisition entirely — so
+	// two `rdk apply --with-lock=<same id>` runs both proceeded unserialised
+	// and collided on .rdk/new and .rdk/old, the exact corruption a lock
+	// exists to prevent, reached through the flag meant to be safe. Splitting
+	// the storage means --with-lock can leave the held lock untouched while
+	// still contending with every other applier — including another
+	// --with-lock run under the same id — for the transaction lock.
+	scratchLock      = ScratchDir + "/lock"
+	scratchApplyLock = ScratchDir + "/apply.lock"
+
+	// The two kinds of lock, still recorded in LockInfo.Kind even though
+	// which file a lock is found in is now what actually governs behaviour
+	// (see the constants above). Kept for display: a human or agent reading
+	// either file's raw JSON sees a self-describing record without having to
+	// know the filename convention, and JSONL consumers already match on
+	// lock_kind. A lock file written by a pre-split binary can disagree with
+	// its file now — see the migration note in
+	// docs/superpowers/specs/2026-08-02-apply-lock-design.md.
 	lockKindApply = "apply"
 	lockKindHeld  = "held"
 )
@@ -157,7 +176,7 @@ func LockInfoFromError(err error) (LockInfo, bool) {
 type LockInfo struct {
 	Held    bool   `json:"-"`
 	ID      string `json:"id"`
-	Kind    string `json:"kind"` // "apply" now; "held" arrives with rdk lock
+	Kind    string `json:"kind"` // "apply" or "held" — see the constants above
 	Host    string `json:"host"`
 	PID     int    `json:"pid"`
 	Since   string `json:"since"`             // RFC3339
@@ -173,6 +192,16 @@ func describeLock(info LockInfo) string {
 		msg += ": " + info.Message
 	}
 	return msg
+}
+
+// lockedErrorFor wraps a lock this call found blocking it as the same
+// *lockedError shape acquireLock's EEXIST branch produces, so every blocked
+// path — acquiring a lock that already exists, or rdk lock finding an apply
+// in flight — carries the holder's details identically and
+// apply.LockedDiagnostic renders them the same regardless of which check
+// caught it.
+func lockedErrorFor(info LockInfo) error {
+	return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(info)), info: info}
 }
 
 // Store is the injected set of filesystem actions rdk performs. The real
@@ -191,12 +220,13 @@ type Store interface {
 	// there cannot redirect the write either. A symlinked parent directory
 	// component of managedDir is refused via ErrUnsafePath for the same
 	// reason. Parent dirs are created; files use 0o644, dirs 0o755. managedDir
-	// is repo-relative. Materialize acquires the repository lock for its
-	// duration (after the ScratchDir check, MkdirAll, and .gitignore write)
-	// and releases it before returning, on every path including failure — a
-	// stranded lock is not the price of an ordinary error. If something else
-	// already holds it, Materialize returns an error wrapping ErrLocked
-	// without touching the tree.
+	// is repo-relative. Materialize checks the held lock is absent (unless
+	// this Store adopted it via UseLock), then acquires the transaction lock
+	// for its duration (after the ScratchDir check, MkdirAll, and .gitignore
+	// write) and releases it before returning, on every path including
+	// failure — a stranded lock is not the price of an ordinary error. If
+	// either check finds something in the way, Materialize returns an error
+	// wrapping ErrLocked without touching the tree.
 	Materialize(managedDir string, set *FileSet) error
 	// Seed creates a user-owned file once: it never overwrites and never
 	// follows a symlink at the target, and it refuses via ErrUnsafePath if any
@@ -213,26 +243,38 @@ type Store interface {
 	// sorted by name. Paths are repo-relative.
 	ReadFile(path string) ([]byte, error)
 	ReadDir(path string) ([]Entry, error)
-	// ReleaseLock removes the repository lock, but only if this Store value
-	// acquired it — never a lock left by another process or another call.
-	// Idempotent, so both a deferred call and (in a later step) a signal
-	// handler can call it unconditionally.
+	// ReleaseLock removes the transaction lock, but only if this Store value
+	// acquired it — never one left by another process or another call. It
+	// only ever touches the transaction lock file: a held lock lives
+	// elsewhere now, so nothing automatic (this defer, the signal handler)
+	// can reach it by construction, not by a check that has to remember to
+	// exclude it. Idempotent, so both a deferred call and a signal handler
+	// can call it unconditionally.
 	ReleaseLock() error
-	// BreakLock removes the repository lock only if its id matches, and
-	// returns what it found. The id is required, not optional: the safety
-	// property is compare-and-swap, not "remove whatever is there" — between
-	// reading a blocked-apply error and typing the recovery, the lock it named
-	// may have been released and a live one taken. Erroring when id doesn't
-	// match, or when no lock exists at all, means a caller can never break a
-	// lock it hasn't observed.
+	// BreakLock removes a lock only if its id matches, checking the held
+	// lock and the transaction lock and removing whichever carries the id —
+	// ids are unique across both, so the id alone is an unambiguous handle
+	// and the caller never has to say which file they mean. The id is
+	// required, not optional: the safety property is compare-and-swap, not
+	// "remove whatever is there" — between reading a blocked-apply error and
+	// typing the recovery, the lock it named may have been released and a
+	// live one taken. Erroring when id doesn't match either file, or when
+	// neither exists, means a caller can never break a lock it hasn't
+	// observed.
 	BreakLock(id string) (LockInfo, error)
 	// HoldLock takes a lock that outlives this process, so a person or agent
 	// can work on the tree without an apply running underneath them. Nothing
-	// automatic releases it — see ReleaseLock.
+	// automatic releases it — see ReleaseLock. Refuses while the transaction
+	// lock is held: an apply is then genuinely in flight, and rdk lock
+	// returning success while that is true would be exactly the lie the
+	// feature exists to prevent.
 	HoldLock(message string) (LockInfo, error)
-	// Unlock ends a held lock. It names the lock because between reading an id
-	// and typing it the lock may have been replaced, and it refuses an apply
-	// lock: ending someone's running apply is breaking, not unlocking.
+	// Unlock ends a held lock, and only ever writes to the held lock file.
+	// It names the lock because between reading an id and typing it the lock
+	// may have been replaced. It reads the transaction lock too, purely to
+	// diagnose: an id that names a running apply gets a message redirecting
+	// to --break-lock instead of a generic "no lock" — ending someone's
+	// running apply is breaking, not unlocking.
 	Unlock(id string) error
 	// UseLock runs under an existing held lock without taking or releasing it.
 	// It returns the lock's details from the very read that verified id, rather
@@ -255,15 +297,17 @@ type osStore struct {
 	root *os.Root
 
 	// lockMu guards lockHeld and lockID, which record whether *this* Store
-	// value currently holds the repository lock and, if so, its id.
+	// value itself acquired the transaction lock and, if so, its id.
 	// ReleaseLock consults them rather than unconditionally removing
-	// scratchLock: a lock left by another process (or, once held locks land,
-	// deliberately outliving this one) must survive a release it did not
-	// grant.
+	// scratchApplyLock: a lock left by another process must survive a
+	// release it did not grant. HoldLock also uses acquireLock and sets these
+	// the same way, but nothing reads them for a held lock's sake: ReleaseLock
+	// only ever targets scratchApplyLock, so lockID recording a held lock's id
+	// just means the id compare there fails (or the file it would compare
+	// against is absent) — safe either way, never a removal.
 	lockMu   sync.Mutex
 	lockHeld bool
 	lockID   string
-	lockKind string
 
 	// usingLock records that this Store adopted a lock it did not take itself
 	// (UseLock), so Materialize runs without acquiring or releasing one.
@@ -331,23 +375,37 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 
-	// Acquired here — after ScratchDir (and its .gitignore) exist, before
-	// anything else is written into it. Released on every path out of this
-	// function, including a panic, which is what makes a stranded lock the
-	// cost of only a hard kill rather than of an ordinary error.
-	// Skipped entirely when this Store adopted someone else's lock via
-	// UseLock: the file already belongs to that lock's holder, so acquiring
-	// would fail against it, and releasing it on the way out is exactly what
-	// --with-lock promises not to do.
+	// The held lock is checked, then the transaction lock is acquired, both
+	// after ScratchDir (and its .gitignore) exist and before anything else is
+	// written into it. The transaction lock is released on every path out of
+	// this function, including a panic, which is what makes a stranded lock
+	// the cost of only a hard kill rather than of an ordinary error.
+	//
+	// Both are skipped when this Store adopted the held lock via UseLock:
+	// that call already verified it against the id given, so re-reading it
+	// here would only repeat a check UseLock already made — see its doc
+	// comment. The transaction lock is still acquired on the usingLock path,
+	// though: --with-lock asserts "I hold the repository", not "serialise
+	// nobody against me", so every apply — including two --with-lock runs
+	// under the same id — still contends for it. That is the fix: the two
+	// locks used to be one file, so adopting the held lock meant skipping
+	// acquisition entirely, and two --with-lock runs under the same id both
+	// proceeded unserialised and collided on .rdk/new and .rdk/old.
 	s.lockMu.Lock()
 	usingLock := s.usingLock
 	s.lockMu.Unlock()
 	if !usingLock {
-		if _, err := s.acquireLock(lockKindApply, ""); err != nil {
+		switch held, err := s.readLockFile(scratchLock); {
+		case err == nil:
+			return lockedErrorFor(held)
+		case !os.IsNotExist(err):
 			return err
 		}
-		defer s.ReleaseLock()
 	}
+	if _, err := s.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+		return err
+	}
+	defer s.ReleaseLock()
 
 	// Deliberately not read any earlier: the answer drives two decisions below
 	// (whether .rdk/old needs clearing, and — the very same result, not a
@@ -457,23 +515,24 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	return nil
 }
 
-// acquireLock takes the repository lock by creating scratchLock exclusively.
-// O_CREAT|O_EXCL is atomic on NFSv3 and later and depends on no mount option
-// or lock daemon, unlike flock: flock over NFS is emulated as a whole-file
-// POSIX lock that degrades to purely local (excluding nothing) under the
-// local_lock=flock/all mount options, with no error to say so. A lock that
-// silently does not lock is worse than no lock, because it manufactures
-// confidence — see docs/superpowers/specs/2026-08-02-apply-lock-design.md.
-func (s *osStore) acquireLock(kind, message string) (LockInfo, error) {
-	s.lockMu.Lock()
-	usingLock := s.usingLock
-	s.lockMu.Unlock()
-	if usingLock {
-		// Already running under a lock adopted via UseLock; acquiring another
-		// would mean holding two under one Store value, and ReleaseLock only
-		// ever tracks one id.
-		return LockInfo{}, errors.New("this store is already running under an adopted lock and cannot also acquire one")
-	}
+// acquireLock takes a lock by creating file exclusively — scratchLock for a
+// held lock, scratchApplyLock for a transaction lock; kind is recorded in the
+// JSON as which one this was (see the Kind field's doc comment), but file is
+// what actually governs. O_CREAT|O_EXCL is atomic on NFSv3 and later and
+// depends on no mount option or lock daemon, unlike flock: flock over NFS is
+// emulated as a whole-file POSIX lock that degrades to purely local
+// (excluding nothing) under the local_lock=flock/all mount options, with no
+// error to say so. A lock that silently does not lock is worse than no lock,
+// because it manufactures confidence — see
+// docs/superpowers/specs/2026-08-02-apply-lock-design.md.
+func (s *osStore) acquireLock(file, kind, message string) (LockInfo, error) {
+	// No usingLock guard here any more: before the split, adopting the held
+	// lock (UseLock) meant Materialize skipped acquiring anything at all, so
+	// this function running at all while usingLock was true could only mean
+	// a bug. Now every Materialize acquires the transaction lock regardless
+	// of whether it also adopted the held lock — that is the fix, so the two
+	// --with-lock runs under the same id still contend for it — so this is
+	// the ordinary path, not a bug to guard against.
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {
 		return LockInfo{}, err
@@ -490,7 +549,7 @@ func (s *osStore) acquireLock(kind, message string) (LockInfo, error) {
 	if err != nil {
 		return LockInfo{}, err
 	}
-	f, err := s.root.OpenFile(scratchLock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := s.root.OpenFile(file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
 			// Read whatever is there for the message; a malformed or
@@ -498,8 +557,8 @@ func (s *osStore) acquireLock(kind, message string) (LockInfo, error) {
 			// corrupt file silently disable the exclusion, so parse failures
 			// here are swallowed and describeLock is handed whatever did come
 			// through, even if that's nothing.
-			existing, _ := s.readLock()
-			return LockInfo{}, &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
+			existing, _ := s.readLockFile(file)
+			return LockInfo{}, lockedErrorFor(existing)
 		}
 		return LockInfo{}, err
 	}
@@ -513,18 +572,17 @@ func (s *osStore) acquireLock(kind, message string) (LockInfo, error) {
 	s.lockMu.Lock()
 	s.lockHeld = true
 	s.lockID = info.ID
-	s.lockKind = kind
 	s.lockMu.Unlock()
 	return info, nil
 }
 
-// readLock reads whatever lock file is present. A parse failure is not
-// reported as an error: the file existing is itself the fact that matters
-// (something is blocking), so the caller gets a zero-valued LockInfo rather
-// than losing that fact to a JSON error. Held is set whenever a file was
-// found at all, parseable or not.
-func (s *osStore) readLock() (LockInfo, error) {
-	b, err := s.root.ReadFile(scratchLock)
+// readLockFile reads whatever is at file, held lock or transaction lock. A
+// parse failure is not reported as an error: the file existing is itself the
+// fact that matters (something is blocking), so the caller gets a
+// zero-valued LockInfo rather than losing that fact to a JSON error. Held is
+// set whenever a file was found at all, parseable or not.
+func (s *osStore) readLockFile(file string) (LockInfo, error) {
+	b, err := s.root.ReadFile(file)
 	if err != nil {
 		return LockInfo{}, err
 	}
@@ -534,21 +592,36 @@ func (s *osStore) readLock() (LockInfo, error) {
 	return info, nil
 }
 
-// ReleaseLock removes the repository lock, but only the one this Store value
-// itself acquired. lockHeld/lockID record what acquireLock actually created,
-// but that alone isn't enough: between this process taking the lock and this
-// call running, someone could have broken it (--break-lock, once that
-// exists) and a third apply could have acquired a fresh one. Deleting on the
-// strength of the boolean alone would remove that third run's live lock —
-// the same mistake as a blind --break-lock, just from the release side, and
-// it reopens exactly the two-applies-at-once corruption this feature exists
-// to prevent. So this re-reads the file and removes it only if it still
-// carries the id this call took; if it doesn't (or the read fails, or it's
-// gone already), releasing nothing is the safe outcome — whoever holds the
-// lock now will release their own. There is a TOCTOU window between the read
-// and the remove, but it is only the interval of one Remove syscall, far
-// narrower than the read-a-stale-error-then-type-a-command window
-// --break-lock guards against, and not worth adding machinery for.
+// ReleaseLock removes the transaction lock, but only the one this Store
+// value itself acquired, and only ever from scratchApplyLock. A held lock
+// exists precisely to outlive the process that took it, so no automatic path
+// may remove one — not this defer, not the signal handler that also calls
+// here. That used to be enforced by a kind check, back when both locks lived
+// in the same file: acquiring or releasing had to ask "is what I'm looking at
+// actually mine to touch" because the answer wasn't implied by the name
+// alone. Now it is: this function is hardcoded to scratchApplyLock, a name a
+// held lock is never written under, so there is no held lock this code could
+// reach even if lockHeld/lockID were wrong — the exclusion is structural, not
+// a check that has to remember to exclude it. (If a SIGTERM arrived while
+// `rdk lock` was still running, the lock command's own Store was never
+// registered with the signal handler in the first place — see cmd/lock.go —
+// so this function is not even reachable from that path; the file-name
+// argument above is the belt to that braces.)
+//
+// lockHeld/lockID record what acquireLock actually created, but that alone
+// isn't enough: between this process taking the lock and this call running,
+// someone could have broken it (--break-lock) and a third apply could have
+// acquired a fresh one. Deleting on the strength of the boolean alone would
+// remove that third run's live lock — the same mistake as a blind
+// --break-lock, just from the release side, and it reopens exactly the
+// two-applies-at-once corruption this feature exists to prevent. So this
+// re-reads the file and removes it only if it still carries the id this call
+// took; if it doesn't (or the read fails, or it's gone already), releasing
+// nothing is the safe outcome — whoever holds the lock now will release
+// their own. There is a TOCTOU window between the read and the remove, but it
+// is only the interval of one Remove syscall, far narrower than the
+// read-a-stale-error-then-type-a-command window --break-lock guards against,
+// and not worth adding machinery for.
 //
 // lockMu is held across that read-and-remove rather than only across the
 // flag check: Materialize's defer and the SIGINT/SIGTERM handler both call
@@ -572,16 +645,10 @@ func (s *osStore) readLock() (LockInfo, error) {
 func (s *osStore) ReleaseLock() error {
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()
-	// A held lock exists precisely to outlive the process that took it, so no
-	// automatic path may remove one — not this defer, not the signal handler
-	// that also calls here. Otherwise a SIGTERM arriving while `rdk lock` was
-	// still running would release the lock the user had just asked for, and
-	// the only thing standing between that and silent failure would be every
-	// future command remembering not to register its store.
-	if !s.lockHeld || s.lockKind != lockKindApply {
+	if !s.lockHeld {
 		return nil
 	}
-	info, err := s.readLock()
+	info, err := s.readLockFile(scratchApplyLock)
 	if err != nil || !info.Held || info.ID != s.lockID {
 		// Nothing of this call's is left to remove — already gone, or
 		// replaced by a live lock this call must not touch — so there is
@@ -589,7 +656,7 @@ func (s *osStore) ReleaseLock() error {
 		s.lockHeld = false
 		return nil
 	}
-	if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
+	if err := s.root.Remove(scratchApplyLock); err != nil && !os.IsNotExist(err) {
 		// Ownership is kept: the file may still be there, so a retry (another
 		// signal, or a caller that checks the error) must still see this call
 		// as the one responsible for removing it.
@@ -599,26 +666,48 @@ func (s *osStore) ReleaseLock() error {
 	return nil
 }
 
-// BreakLock removes the lock only if its id matches, and returns what it
+// BreakLock removes a lock only if its id matches, and returns what it
 // found. The id is required so this can never be "remove whatever is
 // there": between reading a blocked-apply error and typing the recovery, the
 // stranded lock it named may have been released and a live one taken, and a
 // blind removal would destroy that live one.
+//
+// It checks the held lock and the transaction lock, in that order, and
+// removes whichever carries id: ids are unique across both files, so the id
+// alone is an unambiguous handle and --break-lock never has to say (or the
+// caller ask) which file it means. This is what keeps --break-lock's
+// existing job — clearing a transaction lock stranded by a SIGKILL or a
+// power loss, the only way one is ever left behind, since an ordinary exit
+// releases it via defer or the signal handler — working unchanged now that
+// there are two files to look in, rather than regressing to "only clears a
+// held lock" the moment the split landed.
 func (s *osStore) BreakLock(id string) (LockInfo, error) {
-	info, err := s.readLock()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return LockInfo{}, fmt.Errorf("no lock %q is held", id)
+	var found []LockInfo
+	for _, file := range []string{scratchLock, scratchApplyLock} {
+		info, err := s.readLockFile(file)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return LockInfo{}, err
 		}
-		return LockInfo{}, err
+		if info.ID != id {
+			found = append(found, info)
+			continue
+		}
+		if err := s.root.Remove(file); err != nil {
+			return LockInfo{}, err
+		}
+		return info, nil
 	}
-	if info.ID != id {
-		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
+	if len(found) == 0 {
+		return LockInfo{}, fmt.Errorf("no lock %q is held", id)
 	}
-	if err := s.root.Remove(scratchLock); err != nil {
-		return LockInfo{}, err
+	ids := make([]string, len(found))
+	for i, f := range found {
+		ids[i] = f.ID
 	}
-	return info, nil
+	return LockInfo{}, fmt.Errorf("lock %s does not match the current lock(s): %s", id, strings.Join(ids, ", "))
 }
 
 // ensureScratchDir makes .rdk usable, refusing anything there that is not a
@@ -718,51 +807,87 @@ func (s *osStore) publishScratchGitignore() error {
 }
 
 // HoldLock takes a lock that outlives this process, so a person or agent can
-// work on the tree without an apply running underneath them.
+// work on the tree without an apply running underneath them. Refuses while a
+// transaction lock exists: without this, rdk lock could return success while
+// a Materialize is genuinely halfway through, claiming the repository is
+// held when what's actually true is that an apply is running — the exact lie
+// this feature exists to prevent. This check and the O_EXCL create below are
+// two separate reads of two separate files, not one atomic operation; see
+// BreakLock's doc comment on the equivalent, already-accepted TOCTOU window
+// elsewhere in this file. The window here is no wider, and closing it would
+// need the same nonexistent atomic compare-and-create.
 func (s *osStore) HoldLock(message string) (LockInfo, error) {
 	if err := s.ensureScratchDir(); err != nil {
 		return LockInfo{}, err
 	}
-	return s.acquireLock(lockKindHeld, message)
+	switch applying, err := s.readLockFile(scratchApplyLock); {
+	case err == nil:
+		return LockInfo{}, lockedErrorFor(applying)
+	case !os.IsNotExist(err):
+		return LockInfo{}, err
+	}
+	return s.acquireLock(scratchLock, lockKindHeld, message)
 }
 
-// Unlock ends a held lock. It names the lock for the same compare-and-swap
-// reason BreakLock does, and refuses an apply lock: ending a running apply is
-// breaking, not unlocking, and the two differ in how loudly they report.
+// Unlock ends a held lock, and only ever writes to scratchLock — never
+// scratchApplyLock, which is not this call's to touch. It names the lock for
+// the same compare-and-swap reason BreakLock does.
+//
+// Used to refuse via a kind check once acquireLock's target could be either
+// lock: reading a single shared file, "is this actually a held lock" was a
+// real question. Now scratchLock is written only by HoldLock, so anything
+// found there already is one (barring a stale file from before this split —
+// see the migration note in the design doc, where the accepted consequence
+// is that Unlock treats it as an ordinary held lock and clears it, same as
+// it always could). What still needs checking is the id itself: if it
+// doesn't match what's in scratchLock (or nothing is there at all), this
+// reads scratchApplyLock too, purely to diagnose — an id naming a running
+// apply gets the redirecting message, rather than degrading to "no lock is
+// held" just because Unlock looked in the wrong file for it.
 func (s *osStore) Unlock(id string) error {
-	info, err := s.readLock()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("no lock %q is held", id)
+	held, heldErr := s.readLockFile(scratchLock)
+	if heldErr != nil && !os.IsNotExist(heldErr) {
+		return heldErr
+	}
+	if heldErr == nil && held.ID == id {
+		if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
+			return err
 		}
-		return err
+		s.lockMu.Lock()
+		if s.lockID == id {
+			s.lockHeld = false
+		}
+		s.lockMu.Unlock()
+		return nil
 	}
-	if info.ID != id {
-		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+	if applying, err := s.readLockFile(scratchApplyLock); err == nil && applying.ID == id {
+		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", id, id)
 	}
-	if info.Kind != lockKindHeld {
-		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", info.ID, info.ID)
+	if heldErr != nil {
+		return fmt.Errorf("no lock %q is held", id)
 	}
-	if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	s.lockMu.Lock()
-	if s.lockID == id {
-		s.lockHeld = false
-	}
-	s.lockMu.Unlock()
-	return nil
+	return fmt.Errorf("lock %s does not match %s", held.ID, id)
 }
 
 // UseLock runs under an existing held lock without taking or releasing it.
-// Both refusals matter: a mismatched id means someone else's lock, and no lock
-// at all means yours was broken out from under you — which the caller needs to
-// hear rather than have silently treated as permission to proceed. It returns
-// the LockInfo this same readLock call verified, so the caller can announce
-// the holder's details without a second read that could disagree with this
-// one.
+// It only ever reads scratchLock: a mismatched id means someone else's lock,
+// and no lock at all means yours was broken out from under you — which the
+// caller needs to hear rather than have silently treated as permission to
+// proceed. It returns the LockInfo this same read verified, so the caller can
+// announce the holder's details without a second read that could disagree
+// with this one.
+//
+// Used to also refuse a matching id whose Kind wasn't "held" — adopting a
+// running apply's lock would mean running concurrently with the apply that
+// holds it, the corruption this feature exists to prevent, reached through
+// the flag meant to be safe. That refusal is now structural rather than a
+// check: a running apply's lock lives in scratchApplyLock, which this
+// function never reads, so its id cannot appear in what UseLock finds here
+// to begin with (the same migration edge case as Unlock's aside applies, and
+// is equally accepted: a pre-split file's stale id is adoptable, but nothing
+// is actually running under it).
 func (s *osStore) UseLock(id string) (LockInfo, error) {
-	info, err := s.readLock()
+	info, err := s.readLockFile(scratchLock)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return LockInfo{}, fmt.Errorf("no lock is held: %s was broken out from under you", id)
@@ -771,13 +896,6 @@ func (s *osStore) UseLock(id string) (LockInfo, error) {
 	}
 	if info.ID != id {
 		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
-	}
-	if info.Kind != lockKindHeld {
-		// An apply lock exists only for the duration of one Materialize, so
-		// adopting it would mean running concurrently with the apply that holds
-		// it — the corruption the lock exists to prevent, reached through the
-		// flag meant to be safe.
-		return LockInfo{}, fmt.Errorf("lock %s belongs to a running apply, not to a person or agent — wait for it, or use --break-lock=%s if it is stranded", info.ID, info.ID)
 	}
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()

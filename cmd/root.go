@@ -140,12 +140,14 @@ func execute(args []string, stdout, stderr io.Writer) int {
 // handleSignals installs a SIGINT/SIGTERM handler for the duration of a run
 // and returns a func that tears it down. SIGINT and SIGTERM don't run
 // deferred functions, so without this, Ctrl-C during an apply strands
-// .rdk/lock and every apply after it needs --break-lock — turning the rare
-// recovery path into the routine one. The handler is confined to releasing
-// the lock this process holds (a's Store already refuses to release anyone
-// else's, including one left by `rdk lock`, once that exists) and exiting; it
-// must not grow into general cleanup, which is what a signal handler
-// duplicating defer's job would become.
+// .rdk/apply.lock and every apply after it needs --break-lock — turning the
+// rare recovery path into the routine one. The handler is confined to
+// releasing the transaction lock this process holds (a's Store already
+// refuses to release anyone else's, and — since the storage split — cannot
+// reach a held lock left by `rdk lock` at all, because that lives in a
+// different file this releases from) and exiting; it must not grow into
+// general cleanup, which is what a signal handler duplicating defer's job
+// would become.
 //
 // The channel is buffered by one and read at most once: os/signal never
 // blocks sending to it, so a second signal arriving while the first is still

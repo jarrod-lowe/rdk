@@ -13,9 +13,12 @@ unanticipated error exits 2, and warnings and results do not affect the exit
 status on their own — a run that warns and then fails still exits 1.
 `SIGINT` and `SIGTERM` follow the shell convention of 128 + signal instead —
 130 and 143 — so a script can tell an interruption apart from either of those.
-An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
+An interrupted `rdk apply` releases `.rdk/apply.lock` before exiting; only a
 `SIGKILL`, a power loss, or an OOM kill leaves it stranded, and
-`--break-lock=<id>` is the recovery.
+`--break-lock=<id>` is the recovery. `.rdk/lock` is the separate, longer-lived
+lock `rdk lock` leaves behind on purpose; see
+docs/superpowers/specs/2026-08-02-apply-lock-design.md for why the two are
+different files.
 
 ## Failures
 
@@ -50,7 +53,7 @@ An interrupted `rdk apply` releases `.rdk/lock` before exiting; only a
 | `seed-not-a-file` | The path a seeded file would occupy exists but is not a file — most often a directory of the same name. | Remove or rename it, then re-run `rdk init`. |
 | `seed-failed` | A seeded file could not be created. | Read the cause; check permissions and free space. |
 | `invalid-flag` | A flag, command, or flag value on the command line was not recognised. | Check the message; run `rdk --help` for the accepted commands and flags. |
-| `apply-locked` | Something else holds this repository's lock, and you did not name any lock yourself — a blocked `rdk apply`, or a blocked `rdk lock`. | Wait for it. If it is stranded — the process is gone — `--break-lock=<id>` removes it, naming the id the message gives. If the holder is a held lock rather than a running apply, do not try `--with-lock` unless it's yours. |
+| `apply-locked` | Something else holds this repository, and you did not name any lock yourself. Two distinct causes share this code, worded differently: "another rdk apply is running" (`.rdk/apply.lock` — transient, a Materialize is genuinely in flight, from a blocked `rdk apply` or a blocked `rdk lock`) and "this repository is locked" (`.rdk/lock` — held, `rdk lock` is out until someone runs `rdk unlock`). | Wait for it. If it is stranded — the process is gone — `--break-lock=<id>` removes it, naming the id the message gives. If the holder is a held lock rather than a running apply, do not try `--with-lock` unless it's yours. |
 | `lock-mismatch` | You named a lock (`--break-lock=<id>`, or `rdk unlock <id>`), and the repository disagrees: no lock exists, the id doesn't match the one held, or (for `rdk unlock`) the named lock belongs to a running apply rather than to `rdk lock`. | Read the cause; it says which of the three happened. If no lock exists, drop the flag and re-run — there is nothing to break or unlock. If the id is stale, re-run without it to see the current lock and its real id. If `rdk unlock` named an apply lock, use `--break-lock=<id>` instead. |
 | `output-failed` | The command itself completed, but writing its result to stdout failed partway — most often a full disk or a broken pipe on a redirected stdout. | Check the destination (redirect target, disk space). The command already ran: for one with a side effect (`rdk lock`, for instance), re-running reports that it's already done, and still names the id you need. |
 

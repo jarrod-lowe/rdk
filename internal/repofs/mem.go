@@ -21,12 +21,11 @@ type Mem struct {
 	files map[string][]byte // repo-relative path -> content
 
 	// lockHeld and lockID mirror osStore's: they record whether this Mem
-	// value took the lock it is about to release, so ReleaseLock never
+	// value itself acquired the transaction lock, so ReleaseLock never
 	// removes one it didn't grant. No mutex — Mem is single-goroutine test
 	// scaffolding, unlike the real Store.
 	lockHeld bool
 	lockID   string
-	lockKind string
 
 	// usingLock mirrors osStore's: this Mem adopted a lock it did not take
 	// (UseLock), so Materialize neither acquires nor releases.
@@ -48,12 +47,20 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 	if err := set.checkNoOutsideEntries(); err != nil {
 		return err
 	}
+	// Mirrors osStore.Materialize: check the held lock (unless this Mem
+	// adopted it via UseLock), then always acquire the transaction lock — see
+	// store.go for why both still run on the usingLock path.
 	if !m.usingLock {
-		if _, err := m.acquireLock(lockKindApply, ""); err != nil {
+		if held, err := m.readLockFile(scratchLock); err == nil {
+			return lockedErrorFor(held)
+		} else if err != fs.ErrNotExist {
 			return err
 		}
-		defer m.ReleaseLock()
 	}
+	if _, err := m.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+		return err
+	}
+	defer m.ReleaseLock()
 	prefix := managedDir + "/"
 	for p := range m.files {
 		if strings.HasPrefix(p, prefix) {
@@ -67,15 +74,17 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 }
 
 // acquireLock mirrors osStore.acquireLock's exclusive-create semantics using
-// the same map that models the rest of the tree, keyed under scratchLock so a
-// planted lock and a materialized file can never collide.
-func (m *Mem) acquireLock(kind, message string) (LockInfo, error) {
-	if m.usingLock {
-		return LockInfo{}, errors.New("this store is already running under an adopted lock and cannot also acquire one")
-	}
-	if _, ok := m.files[scratchLock]; ok {
-		existing, _ := m.readLock()
-		return LockInfo{}, &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(existing)), info: existing}
+// the same map that models the rest of the tree, keyed under file (scratchLock
+// for a held lock, scratchApplyLock for a transaction lock) so a planted lock
+// and a materialized file can never collide.
+func (m *Mem) acquireLock(file, kind, message string) (LockInfo, error) {
+	// No usingLock guard here — see osStore.acquireLock: every Materialize
+	// now acquires the transaction lock regardless of whether it also
+	// adopted the held lock via UseLock, so this running with usingLock true
+	// is the ordinary --with-lock path, not a bug to guard against.
+	if _, ok := m.files[file]; ok {
+		existing, _ := m.readLockFile(file)
+		return LockInfo{}, lockedErrorFor(existing)
 	}
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {
@@ -93,18 +102,17 @@ func (m *Mem) acquireLock(kind, message string) (LockInfo, error) {
 	if err != nil {
 		return LockInfo{}, err
 	}
-	m.files[scratchLock] = b
+	m.files[file] = b
 	m.lockHeld = true
 	m.lockID = info.ID
-	m.lockKind = kind
 	return info, nil
 }
 
-// readLock mirrors osStore.readLock: a lock file that exists but fails to
-// parse still reports Held, since the malformed file is itself what has to
-// keep blocking (rule 6).
-func (m *Mem) readLock() (LockInfo, error) {
-	b, ok := m.files[scratchLock]
+// readLockFile mirrors osStore.readLockFile: a lock file that exists but
+// fails to parse still reports Held, since the malformed file is itself what
+// has to keep blocking (rule 6).
+func (m *Mem) readLockFile(file string) (LockInfo, error) {
+	b, ok := m.files[file]
 	if !ok {
 		return LockInfo{}, fs.ErrNotExist
 	}
@@ -114,10 +122,13 @@ func (m *Mem) readLock() (LockInfo, error) {
 	return info, nil
 }
 
-// ReleaseLock removes the lock only if this Mem value acquired it and the
-// lock still carries the id it took — see osStore.ReleaseLock for why the id
-// recheck matters (a broken-and-replaced lock must not be deleted by the run
-// whose lock was broken). Idempotent.
+// ReleaseLock removes the transaction lock only if this Mem value acquired
+// it and it still carries the id this call took — see osStore.ReleaseLock
+// for why the id recheck matters (a broken-and-replaced lock must not be
+// deleted by the run whose lock was broken) and why this only ever touches
+// scratchApplyLock, never scratchLock: a held lock is not this function's to
+// remove, and now that the two live in different files that is structural,
+// not a check. Idempotent.
 //
 // lockHeld is cleared only once the removal (or the discovery that there is
 // nothing of this call's left to remove) is settled, mirroring osStore: Mem
@@ -126,36 +137,46 @@ func (m *Mem) readLock() (LockInfo, error) {
 // surrendered, not just on the end state, so a test written against one
 // cannot describe a sequencing osStore does not actually have.
 func (m *Mem) ReleaseLock() error {
-	// A held lock outlives the process that took it, so no automatic path may
-	// remove one — see osStore.ReleaseLock.
-	if !m.lockHeld || m.lockKind != lockKindApply {
+	if !m.lockHeld {
 		return nil
 	}
-	info, err := m.readLock()
+	info, err := m.readLockFile(scratchApplyLock)
 	if err != nil || !info.Held || info.ID != m.lockID {
 		m.lockHeld = false
 		return nil
 	}
-	delete(m.files, scratchLock)
+	delete(m.files, scratchApplyLock)
 	m.lockHeld = false
 	return nil
 }
 
-// BreakLock mirrors osStore.BreakLock: the id is required, and only a match
-// is removed.
+// BreakLock mirrors osStore.BreakLock: the id is required, checked against
+// both the held lock and the transaction lock, and only a match is removed.
 func (m *Mem) BreakLock(id string) (LockInfo, error) {
-	info, err := m.readLock()
-	if err != nil {
-		if err == fs.ErrNotExist {
-			return LockInfo{}, fmt.Errorf("no lock %q is held", id)
+	var found []LockInfo
+	for _, file := range []string{scratchLock, scratchApplyLock} {
+		info, err := m.readLockFile(file)
+		if err != nil {
+			if err == fs.ErrNotExist {
+				continue
+			}
+			return LockInfo{}, err
 		}
-		return LockInfo{}, err
+		if info.ID != id {
+			found = append(found, info)
+			continue
+		}
+		delete(m.files, file)
+		return info, nil
 	}
-	if info.ID != id {
-		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
+	if len(found) == 0 {
+		return LockInfo{}, fmt.Errorf("no lock %q is held", id)
 	}
-	delete(m.files, scratchLock)
-	return info, nil
+	ids := make([]string, len(found))
+	for i, f := range found {
+		ids[i] = f.ID
+	}
+	return LockInfo{}, fmt.Errorf("lock %s does not match the current lock(s): %s", id, strings.Join(ids, ", "))
 }
 
 // Seed mirrors osStore.Seed's create-once contract. It needs none of
@@ -211,37 +232,49 @@ func (m *Mem) ReadDir(dir string) ([]Entry, error) {
 	return out, nil
 }
 
-// HoldLock mirrors osStore.HoldLock.
+// HoldLock mirrors osStore.HoldLock: refuses while the transaction lock
+// exists, so rdk lock never claims the repository is held while an apply is
+// genuinely running.
 func (m *Mem) HoldLock(message string) (LockInfo, error) {
-	return m.acquireLock(lockKindHeld, message)
+	if applying, err := m.readLockFile(scratchApplyLock); err == nil {
+		return LockInfo{}, lockedErrorFor(applying)
+	} else if err != fs.ErrNotExist {
+		return LockInfo{}, err
+	}
+	return m.acquireLock(scratchLock, lockKindHeld, message)
 }
 
-// Unlock mirrors osStore.Unlock: it names the lock, and refuses an apply lock
-// because ending a running apply is breaking, not unlocking.
+// Unlock mirrors osStore.Unlock: it only ever writes to scratchLock, and
+// reads scratchApplyLock too purely to diagnose an id that names a running
+// apply, redirecting to --break-lock instead of degrading to "no lock is
+// held".
 func (m *Mem) Unlock(id string) error {
-	info, err := m.readLock()
-	if err != nil {
-		if err == fs.ErrNotExist {
-			return fmt.Errorf("no lock %q is held", id)
+	held, heldErr := m.readLockFile(scratchLock)
+	if heldErr != nil && heldErr != fs.ErrNotExist {
+		return heldErr
+	}
+	if heldErr == nil && held.ID == id {
+		delete(m.files, scratchLock)
+		if m.lockID == id {
+			m.lockHeld = false
 		}
-		return err
+		return nil
 	}
-	if info.ID != id {
-		return fmt.Errorf("lock %s does not match %s", info.ID, id)
+	if applying, err := m.readLockFile(scratchApplyLock); err == nil && applying.ID == id {
+		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", id, id)
 	}
-	if info.Kind != lockKindHeld {
-		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", info.ID, info.ID)
+	if heldErr != nil {
+		return fmt.Errorf("no lock %q is held", id)
 	}
-	delete(m.files, scratchLock)
-	if m.lockID == id {
-		m.lockHeld = false
-	}
-	return nil
+	return fmt.Errorf("lock %s does not match %s", held.ID, id)
 }
 
-// UseLock mirrors osStore.UseLock.
+// UseLock mirrors osStore.UseLock: only ever reads scratchLock, so a running
+// apply's lock (scratchApplyLock) can never be what this finds — see
+// osStore.UseLock for why that makes the old Kind check structural now
+// rather than something this still has to test for.
 func (m *Mem) UseLock(id string) (LockInfo, error) {
-	info, err := m.readLock()
+	info, err := m.readLockFile(scratchLock)
 	if err != nil {
 		if err == fs.ErrNotExist {
 			return LockInfo{}, fmt.Errorf("no lock is held: %s was broken out from under you", id)
@@ -250,13 +283,6 @@ func (m *Mem) UseLock(id string) (LockInfo, error) {
 	}
 	if info.ID != id {
 		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
-	}
-	if info.Kind != lockKindHeld {
-		// An apply lock exists only for the duration of one Materialize, so
-		// adopting it would mean running concurrently with the apply that holds
-		// it — the corruption the lock exists to prevent, reached through the
-		// flag meant to be safe.
-		return LockInfo{}, fmt.Errorf("lock %s belongs to a running apply, not to a person or agent — wait for it, or use --break-lock=%s if it is stranded", info.ID, info.ID)
 	}
 	if m.lockHeld && m.lockID != id {
 		return LockInfo{}, errors.New("this store already holds a different lock and cannot also run under one")

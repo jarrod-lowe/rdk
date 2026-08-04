@@ -1,7 +1,8 @@
 # One apply at a time, per repository
 
-**Status:** approved design, pre-implementation. Implemented in two steps — see
-"Sequencing".
+**Status:** implemented. Landed in three steps — see "Sequencing" — the third
+of which split one lock file into two; see "Two kinds, two files" and
+"Migration".
 
 ## Problem
 
@@ -68,9 +69,9 @@ hard kill then leaves arbitrarily-named directories behind, and sweeping them
 safely needs a staleness heuristic. One known path left behind is recoverable; a
 growing pile of unknown ones is not.
 
-### The lock file
+### The lock files
 
-`.rdk/lock`, created exclusively, JSON:
+Two files, same JSON shape, created exclusively:
 
 ```json
 {
@@ -83,7 +84,13 @@ growing pile of unknown ones is not.
 }
 ```
 
-`message` is set only for `kind: held`.
+`message` is set only for `kind: held`. `kind` itself is written by whichever
+call created the file and is never consulted to decide what a file *is* —
+which file it's in decides that now (see "Two kinds, two files" below). It
+survives in the JSON anyway: a human or agent reading either file's raw
+content sees a self-describing record without knowing the filename
+convention, and it is already the shape JSONL attrs (`lock_kind`) are keyed
+on.
 
 **This must not go through `FileSet.JSON`**, whose comment claims it is the
 single owner of rdk's JSON output format (DD-1). It is — for *generated output*,
@@ -99,29 +106,61 @@ stale because a pid looks dead — on shared storage the pid is not even
 meaningful. Any staleness heuristic is the cleverness rule 12 refuses; the human
 decides, and the id is how they say which lock they decided about.
 
-### Two kinds, one file
+### Two kinds, two files
 
-| Kind | Taken by | Released by |
-|---|---|---|
-| `apply` | `rdk apply`, for the duration of `Materialize` | defer, and the signal handler |
-| `held` | `rdk lock -m "…"`, which exits leaving it | `rdk unlock <id>`, or `--break-lock` |
+| Kind | File | Taken by | Released by |
+|---|---|---|---|
+| `apply` | `.rdk/apply.lock` | `rdk apply`, for the duration of `Materialize` | defer, and the signal handler |
+| `held` | `.rdk/lock` | `rdk lock -m "…"`, which exits leaving it | `rdk unlock <id>`, or `--break-lock` |
 
-They share one file because otherwise they would not exclude each other.
+They started as one file, and that was a bug. `--with-lock` asserts "I hold
+the repository" and is meant to leave the held lock untouched while still
+letting Materialize run — but with one file, "leave the held lock untouched"
+and "don't take a transaction lock" were the same instruction, because
+acquiring anything would have collided with the very lock `--with-lock` was
+adopting. So Materialize, running under `--with-lock`, skipped lock
+acquisition entirely. Two `rdk apply --with-lock=<same id>` runs then both
+observed "I hold this" and both proceeded straight to staging, unserialised —
+the original two-runs-collide corruption, reached through the flag meant to
+be safe from it. Splitting the storage lets `--with-lock` keep its promise
+(the held lock survives, untouched) while still contending for the
+transaction lock like every other apply, including another `--with-lock` run
+under the same id: one wins, the other is told another apply is running.
 
-The consequence to get right: **the signal handler must release only an `apply`
-lock this process took.** `rdk lock`'s entire purpose is to leave one behind, so
-"release on Ctrl-C" must not mean "remove whatever is there" — an agent's lock
-evaporating because someone pressed Ctrl-C in another terminal would be a silent
-failure of the whole feature.
+ids are unique across both files — `acquireLock` draws its 8 random bytes the
+same way regardless of which file it's writing — so `--break-lock=<id>` and
+`rdk unlock <id>`'s diagnosis (below) can treat "which file" as an
+implementation detail the id resolves on its own, never something the caller
+has to know or say.
+
+The consequence to get right, unchanged by the split: **the signal handler
+must release only an `apply` lock this process took.** `rdk lock`'s entire
+purpose is to leave one behind, so "release on Ctrl-C" must not mean "remove
+whatever is there" — an agent's lock evaporating because someone pressed
+Ctrl-C in another terminal would be a silent failure of the whole feature.
+Before the split this was a check (`ReleaseLock` looked at `kind` before
+touching the file); after it, `ReleaseLock` is hardcoded to
+`.rdk/apply.lock` and a held lock is never written under that name, so
+nothing automatic can reach one — the exclusion is structural, not a rule
+every future caller has to remember. The same reasoning drops the equivalent
+checks in `UseLock` (a running apply's lock can't appear in `.rdk/lock` to
+adopt by accident) and, for the routine case, `Unlock` (anything found in
+`.rdk/lock` already is a held lock). `Unlock` still reads `.rdk/apply.lock`,
+though — not to act on it, but to diagnose: naming a running apply's id gets
+the "use --break-lock" message instead of a bare "no lock is held". Read both
+to explain; write to one.
 
 ### Every way past a lock names the lock
 
+The user-visible surface is exactly the pre-split one; only the storage
+underneath it changed:
+
 ```
-rdk apply                        takes kind=apply, releases on exit, defer and signal
-rdk apply --with-lock=<id>       runs under an existing held lock, leaves it in place
-rdk apply --break-lock=<id>      removes a stranded lock, warns whose it was, then applies
-rdk lock -m "…"                  takes kind=held, prints the id, exits leaving it
-rdk unlock <id>                  releases a held lock — the routine end of your own
+rdk apply                        .rdk/lock must be absent; takes .rdk/apply.lock, releases on exit, defer and signal
+rdk apply --with-lock=<id>       .rdk/lock must match <id>, left untouched; takes .rdk/apply.lock, releases on exit
+rdk apply --break-lock=<id>      removes a stranded lock (either file, by id), warns whose it was, then applies
+rdk lock -m "…"                  .rdk/apply.lock must be absent; takes .rdk/lock, prints the id, exits leaving it
+rdk unlock <id>                  releases a held lock (.rdk/lock only) — the routine end of your own
 ```
 
 The id is **required**, not optional, on both flags. The safety property is
@@ -135,17 +174,26 @@ means you cannot get past a lock you never observed.
 
 `--with-lock` semantics:
 
-- id matches → apply proceeds and **does not release the lock afterwards**. The
-  held lock has to survive; that is the point.
+- id matches → apply proceeds and **does not release the held lock
+  afterwards** (it still takes and releases its own transaction lock, same as
+  any other apply). The held lock has to survive; that is the point.
 - id does not match → error. Someone else's lock, or yours was broken and
   replaced.
 - no lock at all → **also an error**. You asserted you hold a lock and you do
   not, which means it was broken out from under you. Proceeding would hide that.
 
-Everyone without the id stays blocked, which is what the holder wanted.
+Everyone without the id stays blocked, which is what the holder wanted — and
+two runs both holding the id are no longer everyone: they contend for the
+transaction lock exactly like two ordinary applies would.
 
 `rdk lock` twice is an error, which falls out of exclusive creation for free: the
 second gets the same "already locked" error, showing the first's message.
+`rdk lock` while an apply is genuinely running is also an error, for a
+different reason: without the check, it would return success while claiming
+the repository is held, which is false — a Materialize is mid-flight, not
+waiting on `rdk unlock`. The two are told apart in the message: "another rdk
+apply is running" (transient — wait) versus "this repository is locked"
+(held — wait, or `--with-lock` if it's yours).
 
 ### Visibility, not prevention, is the guarantee against misuse
 
@@ -162,8 +210,8 @@ because the text handler indents only a hint's first line, so the holder's
 details go in the summary:
 
 ```
-error: another rdk apply holds this repository (lock 9f3a1c4e7b2d8a05, pid 4127 on builder-3 since 2026-08-02T10:04:11Z): agent refactoring the s3-bucket module
-  wait for it; if it is stranded use --break-lock=9f3a1c4e7b2d8a05 — never --with-lock, which is only for the process that took the lock
+error: another rdk apply is running (lock 9f3a1c4e7b2d8a05, pid 4127 on builder-3 since 2026-08-02T10:04:11Z)
+  wait for it; if it is stranded use --break-lock=9f3a1c4e7b2d8a05
 ```
 
 **Running under a lock announces itself**, which is what wording alone cannot
@@ -205,22 +253,34 @@ the per-file manifest hash check for outside files — when that lands.
 
 ```
 1. reject outside entries
-2. Stat the managed dir (drives two later decisions)
-3. check and create .rdk/          ← must precede the lock; the dir must exist
-4. ACQUIRE .rdk/lock               ← defer release
-5. write .rdk/.gitignore
+2. check and create .rdk/, write .rdk/.gitignore   ← must precede the lock; the dir must exist
+3. check .rdk/lock is absent (skipped if this run adopted it via UseLock)
+4. ACQUIRE .rdk/apply.lock                         ← defer release
+5. Stat the managed dir (drives two later decisions)
 6. clear new (and old, when the managed dir exists)
 7. stage into .rdk/new
 8. check the managed dir's parent components
 9. displace by rename, publish by rename
 10. sweep .rdk/old
-11. RELEASE .rdk/lock
+11. RELEASE .rdk/apply.lock
 ```
 
-Step 3 sits outside the lock and is safe there: `MkdirAll` is idempotent and the
-symlink check is a read. Step 5 is deliberately *inside* it — the `.gitignore`
-write is remove-then-create, so two concurrent runs would otherwise race and one
-would fail `O_EXCL` spuriously.
+Step 2 sits outside the lock and is safe there: `MkdirAll` is idempotent and the
+symlink check is a read. Writing `.gitignore` is deliberately *inside* it,
+though — it's remove-then-create, so two concurrent runs would otherwise race
+and one would fail `O_EXCL` spuriously.
+
+Step 5 — Stat-ing the managed dir — sits *after* both lock steps, not before,
+and that ordering is itself load-bearing, not incidental: the answer drives
+whether `.rdk/old` needs clearing and whether there is a tree to displace once
+staging succeeds, and both are only safe to act on once nothing else can be
+changing the managed dir underneath this run. Reading it any earlier is
+exactly the bug this design fixes — stat sees the tree, block on the lock,
+another run displaces it and dies before publishing, this run then acquires
+the lock still believing the tree exists and clears `.rdk/old`, destroying the
+only remaining copy. This still holds on the `--with-lock` path, where step 3
+is skipped rather than step 4: an adopted lock is just as much a lock as one
+acquired here, so the state it protects is exactly as settled.
 
 ### Release on every exit
 
@@ -245,11 +305,6 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
 
 ## Stated limits (rule 12)
 
-- Two applies both passing `--with-lock=<same id>` concurrently reintroduce the
-  original race. There is one lock file, so rdk cannot serialise the holder
-  against itself without nesting state that does not earn its complexity.
-  `--with-lock` asserts "I am the coordinator here": rdk serialises everyone
-  else, not you against yourself.
 - A hard kill strands a lock. The recovery is manual and the message says so.
 - **Neither `BreakLock` nor `ReleaseLock` is atomic between checking the id and
   removing the file.** If the observed holder releases in that window and a
@@ -258,17 +313,45 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
   a second lock guarding the first — turtles down. The window is two syscalls
   wide, against a `--break-lock` window that spans a human reading an error and
   typing a command, so the id check remains worth having even though it is not
-  airtight. Accepted, not overlooked.
+  airtight. Accepted, not overlooked. `HoldLock`'s check that `.rdk/apply.lock`
+  is absent (see "Two kinds, two files") has the same shape: it is a read of
+  one file followed by an exclusive create of another, not one atomic
+  operation, so an apply could start in the gap between them. Closing it would
+  need the same nonexistent atomic compare-and-create, so it is accepted for
+  the same reason — the window is narrow, and the check exists to catch the
+  ordinary case, not to be airtight against an adversary.
+
+## Migration
+
+A `.rdk/lock` written by a pre-split binary always has `kind: "apply"` — that
+binary never had a second file to put it in. Read by the post-split binary,
+it is found at the held lock's path, so it is treated as a held lock
+regardless of what its `kind` field says: `rdk apply` reports the repository
+locked rather than another apply running, and `--break-lock=<id>` clears it
+the same way it always could. The consequence is mild — a slightly misleading
+message, not a wrong outcome — and `.rdk/` is gitignored, so a stale file
+never travels between checkouts; it is local to whichever repository was
+mid-apply when the binary changed underneath it. No migration code; the next
+apply or `rdk lock`/`rdk unlock`/`--break-lock` in that repository simply
+sees a held lock.
 
 ## Sequencing
 
-Two steps, one file format designed for both, so the second is a command and a
-warning rather than a format migration:
+Three steps. The first two share one file format designed for both, so the
+second was a command and a warning rather than a format migration; the third
+splits that one file into two without changing the format or the
+user-visible surface at all:
 
 1. **The apply lock** — the JSON file, acquire/release in `Materialize`,
-   `--break-lock=<id>`, and the signal handler. This is the P1.
+   `--break-lock=<id>`, and the signal handler. This was the original P1.
 2. **Held locks** — `rdk lock -m`, `rdk unlock <id>`, `--with-lock=<id>` and its
    announcement.
+3. **Split the storage** — `.rdk/lock` (held) and `.rdk/apply.lock`
+   (transaction), so `--with-lock` can leave the held lock untouched while
+   still contending for the transaction lock like every other apply. This
+   closed a second P1: two `--with-lock` runs under the same id used to both
+   proceed, reintroducing the original corruption through the flag meant to
+   be safe from it — see "Two kinds, two files".
 
 ## Consequences
 

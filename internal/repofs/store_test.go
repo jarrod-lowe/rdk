@@ -3,6 +3,7 @@ package repofs
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -744,8 +745,10 @@ func TestSecurityRejectsEscapes(t *testing.T) {
 	}
 }
 
-// writeLock plants a lock file the way another process would have.
-func writeLock(t *testing.T, root string, info LockInfo) {
+// writeLockFile plants a lock file the way another process would have, at
+// name (relative to ScratchDir) — "lock" for the held lock, "apply.lock" for
+// the transaction lock.
+func writeLockFile(t *testing.T, root, name string, info LockInfo) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
 		t.Fatal(err)
@@ -754,23 +757,41 @@ func writeLock(t *testing.T, root string, info LockInfo) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ScratchDir, "lock"), b, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ScratchDir, name), b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func heldLock() LockInfo {
+// writeLock plants a held lock at .rdk/lock.
+func writeLock(t *testing.T, root string, info LockInfo) {
+	t.Helper()
+	writeLockFile(t, root, "lock", info)
+}
+
+// writeApplyLock plants a transaction lock at .rdk/apply.lock — the state a
+// hard kill leaves behind, since an ordinary exit always releases it via
+// defer or the signal handler.
+func writeApplyLock(t *testing.T, root string, info LockInfo) {
+	t.Helper()
+	writeLockFile(t, root, "apply.lock", info)
+}
+
+// sampleLock is a fixture LockInfo with fields a test can recognise in an
+// error message (id, pid, host) once written directly to disk. kind should
+// match whichever file the caller is about to plant it in via writeLock or
+// writeApplyLock — acquireLock always keeps the two in agreement; a test that
+// deliberately mismatches them is exercising the migration case, and says so.
+func sampleLock(kind string) LockInfo {
 	return LockInfo{
-		ID: "9f3a1c4e7b2d8a05", Kind: "apply", Host: "builder-3",
+		ID: "9f3a1c4e7b2d8a05", Kind: kind, Host: "builder-3",
 		PID: 4127, Since: "2026-08-02T10:04:11Z",
 	}
 }
 
-// Two applies in one checkout used to interleave on the fixed scratch names
-// and publish a mixture of both runs' files.
+// A held lock blocks an ordinary apply — the table's "must be absent" row.
 func TestMaterializeRefusesWhileLocked(t *testing.T) {
 	s, root := newTestStore(t)
-	writeLock(t, root, heldLock())
+	writeLock(t, root, sampleLock(lockKindHeld))
 
 	set := NewFileSet()
 	add(t, set, Managed("f.txt"), []byte("x"))
@@ -791,14 +812,38 @@ func TestMaterializeRefusesWhileLocked(t *testing.T) {
 	}
 }
 
+// The transient case: a second apply started while a first is genuinely
+// mid-flight collides on .rdk/apply.lock's O_CREAT|O_EXCL rather than the
+// held-lock check above. Planting the transaction lock directly is the same
+// state a real concurrent Materialize would leave while it still holds it.
+func TestMaterializeRefusesWhileAnotherApplyIsRunning(t *testing.T) {
+	s, root := newTestStore(t)
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err := s.Materialize("managed", set)
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked", err)
+	}
+	for _, want := range []string{"9f3a1c4e7b2d8a05", "4127", "builder-3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "managed")); !os.IsNotExist(err) {
+		t.Error("published despite the lock")
+	}
+}
+
 // Testing the actual race directly needs two processes racing between a Stat
 // and a lock acquisition — not worth the harness. This instead asserts the
-// invariant that makes the race impossible: Materialize resolves the lock
-// (acquire, or fail, or adopt via UseLock) before it ever reads managedDir's
-// state. It plants a lock so acquisition fails immediately, and — separately
-// — makes managedDir itself unreadable (EACCES, not ENOENT, same trick as
-// TestMaterializeReportsAnUnreadableManagedDir) so that a Stat which ran
-// before the lock check would surface *that* error instead of ErrLocked.
+// invariant that makes the race impossible: Materialize resolves the held
+// lock (checked, or adopted via UseLock) before it ever reads managedDir's
+// state. It plants a held lock so the check fails immediately, and —
+// separately — makes managedDir itself unreadable (EACCES, not ENOENT, same
+// trick as TestMaterializeReportsAnUnreadableManagedDir) so that a Stat which
+// ran before the lock check would surface *that* error instead of ErrLocked.
 // Getting ErrLocked back is only possible if the lock was checked first.
 //
 // What this does not cover: two real processes actually racing between the
@@ -811,7 +856,7 @@ func TestMaterializeChecksTheLockBeforeReadingManagedDir(t *testing.T) {
 		t.Skip("running as root: permission bits are not enforced")
 	}
 	s, root := newTestStore(t)
-	writeLock(t, root, heldLock())
+	writeLock(t, root, sampleLock(lockKindHeld))
 
 	sub := filepath.Join(root, "nested")
 	if err := os.MkdirAll(filepath.Join(sub, "managed"), 0o700); err != nil {
@@ -854,8 +899,8 @@ func TestMaterializeReleasesTheLockOnSuccess(t *testing.T) {
 	if err := s.Materialize("managed", set); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
-		t.Error("lock survived a successful apply")
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("apply lock survived a successful apply")
 	}
 	// And a second run must work, which is the point.
 	if err := s.Materialize("managed", set); err != nil {
@@ -879,8 +924,8 @@ func TestMaterializeReleasesTheLockOnFailure(t *testing.T) {
 	if err := s.Materialize("managed", second); err == nil {
 		t.Fatal("want an error")
 	}
-	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
-		t.Error("lock survived a failed apply")
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("apply lock survived a failed apply")
 	}
 }
 
@@ -888,7 +933,7 @@ func TestMaterializeReleasesTheLockOnFailure(t *testing.T) {
 // recovery, the stranded lock may have been replaced by a live one.
 func TestBreakLockOnlyRemovesTheNamedLock(t *testing.T) {
 	s, root := newTestStore(t)
-	writeLock(t, root, heldLock())
+	writeLock(t, root, sampleLock(lockKindHeld))
 
 	if _, err := s.BreakLock("some-other-id"); err == nil {
 		t.Error("broke a lock whose id did not match")
@@ -915,6 +960,60 @@ func TestBreakLockWithNoLockPresentIsAnError(t *testing.T) {
 	s, _ := newTestStore(t)
 	if _, err := s.BreakLock("9f3a1c4e7b2d8a05"); err == nil {
 		t.Error("want an error: the named lock does not exist")
+	}
+}
+
+// A hard kill is the only way a transaction lock is ever found stranded — an
+// ordinary exit always releases it via defer or the signal handler — and
+// --break-lock has to clear it exactly as it always could when there was
+// only one file to look in.
+func TestBreakLockRemovesAStrandedApplyLock(t *testing.T) {
+	s, root := newTestStore(t)
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+
+	info, err := s.BreakLock("9f3a1c4e7b2d8a05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Held || info.PID != 4127 || info.Host != "builder-3" {
+		t.Errorf("info = %+v, want the holder's details", info)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("apply lock not removed")
+	}
+	// The repository must be usable again, not just the file gone.
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatalf("materialize after --break-lock: %v", err)
+	}
+}
+
+// ids are unique across both files, so --break-lock never has to be told (or
+// figure out) which one to look in — it resolves the id regardless of which
+// file it is actually sitting in, and leaves the other alone.
+func TestBreakLockFindsTheIDInEitherFile(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, sampleLock(lockKindHeld)) // id 9f3a1c4e7b2d8a05
+	other := sampleLock(lockKindApply)
+	other.ID = "aaaa1111bbbb2222"
+	writeApplyLock(t, root, other)
+
+	if _, err := s.BreakLock("9f3a1c4e7b2d8a05"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("held lock not removed")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+		t.Errorf("breaking the held lock also touched the apply lock: %v", err)
+	}
+
+	if _, err := s.BreakLock("aaaa1111bbbb2222"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("apply lock not removed")
 	}
 }
 
@@ -1021,9 +1120,29 @@ func TestEnsureScratchDirIsIdempotentUnderConcurrency(t *testing.T) {
 
 func TestHoldLockRefusesWhenAlreadyLocked(t *testing.T) {
 	s, root := newTestStore(t)
-	writeLock(t, root, heldLock())
+	writeLock(t, root, sampleLock(lockKindHeld))
 	if _, err := s.HoldLock("second"); !errors.Is(err, ErrLocked) {
 		t.Fatalf("err = %v, want ErrLocked", err)
+	}
+}
+
+// rdk lock must not return success while an apply is genuinely mid-flight —
+// that would be exactly the lie the feature exists to prevent, reporting the
+// repository held when what's actually true is that a Materialize is
+// running.
+func TestHoldLockRefusesWhileAnApplyIsRunning(t *testing.T) {
+	s, root := newTestStore(t)
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+
+	_, err := s.HoldLock("agent working")
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want ErrLocked", err)
+	}
+	if !strings.Contains(err.Error(), "9f3a1c4e7b2d8a05") {
+		t.Errorf("error %q does not name the running apply", err.Error())
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("HoldLock created a held lock despite the running apply")
 	}
 }
 
@@ -1050,16 +1169,43 @@ func TestUnlockOnlyReleasesTheNamedHeldLock(t *testing.T) {
 }
 
 // An apply's lock is not yours to end routinely — that is what --break-lock is
-// for, and it warns.
+// for, and it warns. This is the required scenario: rdk unlock naming a
+// running apply's lock still gets the redirecting message, even though
+// Unlock only ever reads and writes the held-lock file — it reads the
+// transaction lock too, purely to diagnose.
 func TestUnlockRefusesAnApplyLock(t *testing.T) {
 	s, root := newTestStore(t)
-	writeLock(t, root, heldLock()) // kind: apply
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+
 	err := s.Unlock("9f3a1c4e7b2d8a05")
 	if err == nil {
 		t.Fatal("unlocked an apply lock")
 	}
 	if !strings.Contains(err.Error(), "--break-lock") {
 		t.Errorf("error %q does not point at the right door", err.Error())
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+		t.Errorf("unlock touched the apply lock: %v", err)
+	}
+}
+
+// Migration note (docs/superpowers/specs/2026-08-02-apply-lock-design.md): a
+// lock file left by a pre-split binary can carry kind:"apply" while
+// physically sitting in .rdk/lock, since that binary only ever had one file.
+// Unlock no longer consults Kind to decide whether a lock is "actually"
+// held — the file it's found in is what governs now — so this is treated as
+// an ordinary held lock and clears normally. Accepted as mild: the file is
+// genuinely stale (nothing is running), so unlocking it directly has the
+// same effect --break-lock would have had.
+func TestUnlockClearsAStaleApplyKindLockFoundInTheHeldFile(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, sampleLock(lockKindApply)) // pre-split binary's stale content
+
+	if err := s.Unlock("9f3a1c4e7b2d8a05"); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+		t.Error("stale lock not removed")
 	}
 }
 
@@ -1081,24 +1227,46 @@ func TestUseLockRunsWithoutAcquiringOrReleasing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
 		t.Errorf("the held lock did not survive the apply: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("the transaction lock survived a successful apply run under an adopted lock")
+	}
 	if _, err := os.Stat(filepath.Join(root, "managed", "f.txt")); err != nil {
 		t.Errorf("apply did not publish: %v", err)
 	}
 }
 
-// --with-lock means "run under a lock I hold". An apply's lock exists only for
-// the duration of one Materialize, so adopting it would mean running
-// concurrently with the apply that holds it — the corruption the lock exists
-// to prevent, reached through the flag meant to be safe.
-func TestUseLockRefusesAnApplyLock(t *testing.T) {
+// UseLock only ever reads scratchLock, so a running apply's lock — which
+// lives in scratchApplyLock — can never be what it finds: the old
+// Kind-based refusal in UseLock is structural now, not a check. This plants
+// the apply lock (with no held lock at all) and confirms adopting its id
+// fails the same way any other nonexistent held lock would — the safety
+// property (never adopt a live apply's lock) survives, just through a
+// different mechanism than before the split.
+func TestUseLockCannotAdoptARunningApplysLock(t *testing.T) {
 	s, root := newTestStore(t)
-	writeLock(t, root, heldLock()) // heldLock() is kind "apply" despite the name
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+
 	_, err := s.UseLock("9f3a1c4e7b2d8a05")
 	if err == nil {
 		t.Fatal("adopted a running apply's lock")
 	}
-	if !strings.Contains(err.Error(), "apply") {
-		t.Errorf("error %q does not say why", err.Error())
+	if !strings.Contains(err.Error(), "broken out from under you") {
+		t.Errorf("error %q is not the generic no-held-lock message", err.Error())
+	}
+}
+
+// Migration note, UseLock's side of TestUnlockClearsAStaleApplyKindLockFoundInTheHeldFile:
+// a stale kind:"apply" lock physically sitting in .rdk/lock (left by a
+// pre-split binary) is adoptable via --with-lock now — Kind no longer gates
+// UseLock, the file does. Accepted as mild: nothing is actually running
+// under it, so adopting it is no more dangerous than adopting any other held
+// lock.
+func TestUseLockAdoptsAStaleApplyKindLockFoundInTheHeldFile(t *testing.T) {
+	s, root := newTestStore(t)
+	writeLock(t, root, sampleLock(lockKindApply))
+
+	if _, err := s.UseLock("9f3a1c4e7b2d8a05"); err != nil {
+		t.Fatalf("UseLock: %v", err)
 	}
 }
 
@@ -1109,7 +1277,7 @@ func TestUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 	if _, err := s.UseLock("9f3a1c4e7b2d8a05"); err == nil {
 		t.Error("adopted a lock that does not exist")
 	}
-	writeLock(t, root, heldLock())
+	writeLock(t, root, sampleLock(lockKindHeld))
 	if _, err := s.UseLock("some-other-id"); err == nil {
 		t.Error("adopted someone else's lock under the wrong id")
 	}
@@ -1181,7 +1349,7 @@ func TestReleaseLockConcurrentCallsAlwaysRemoveTheLock(t *testing.T) {
 	if err := st.ensureScratchDir(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.acquireLock(lockKindApply, ""); err != nil {
+	if _, err := st.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1205,8 +1373,8 @@ func TestReleaseLockConcurrentCallsAlwaysRemoveTheLock(t *testing.T) {
 			t.Errorf("goroutine %d: ReleaseLock returned %v, want nil", i, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
-		t.Error("lock file survived concurrent ReleaseLock calls")
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("apply lock file survived concurrent ReleaseLock calls")
 	}
 }
 
@@ -1230,13 +1398,154 @@ func TestReleaseLockLeavesAReplacedLockAlone(t *testing.T) {
 	st.lockID = "stale-id-this-run-took"
 	st.lockMu.Unlock()
 
-	// Someone else broke that lock and a third run acquired a fresh one.
-	writeLock(t, root, heldLock())
+	// Someone else broke that lock and a third run acquired a fresh one. Has
+	// to be the transaction lock: ReleaseLock only ever reads scratchApplyLock
+	// now, so planting the replacement in scratchLock would make this test
+	// pass for the wrong reason (ReleaseLock never even looking there) rather
+	// than for the id check actually working.
+	writeApplyLock(t, root, sampleLock(lockKindApply))
 
 	if err := s.ReleaseLock(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
 		t.Errorf("released a lock it did not take: %v", err)
+	}
+}
+
+// The property that matters most: two `rdk apply --with-lock=<same id>`
+// processes must not both proceed to Materialize at once. Each --with-lock
+// apply opens its own Store (cmd/apply.go calls repofs.New per invocation),
+// so this drives several independent *osStore values that have all already
+// adopted the same held lock via UseLock — exactly what --with-lock does —
+// and calls Materialize on all of them at the same instant, each generating
+// a different, internally-tagged tree. The synchronisation under test,
+// O_CREAT|O_EXCL on .rdk/apply.lock, is a real syscall against the real
+// filesystem regardless of whether the racing callers are separate
+// goroutines in one process or separate processes; nothing about the
+// mechanism being exercised is faked or mocked.
+//
+// This does not assert "exactly one call succeeds": --with-lock's whole
+// point (TestUseLockSupportsRepeatedApplies) is that the holder can apply
+// repeatedly, and if one goroutine's acquire-write-release cycle finishes
+// before another even attempts to acquire, that second one legitimately
+// succeeds too — sequential, not concurrent, and not a bug. Asserting a
+// fixed success count made an earlier version of this test flaky by
+// construction. What must never happen, at any success count, is two
+// Materialize calls being inside the acquire..release window at once — the
+// original bug, where two runs staged into the same .rdk/new and published a
+// mixture of both. This test proves that by giving each generation a lot of
+// files sharing one tag, and checking that whatever is on disk once every
+// goroutine has returned is exactly one generation's complete output — never
+// a mixture of tags, and never a partial file count, which is what
+// overlapping writers would leave.
+//
+// What it does not prove: the precise scheduling two real OS processes would
+// hit — the kernel interleaves processes differently than the Go runtime
+// interleaves goroutines — or anything about SIGINT/SIGTERM handling, which
+// lives in cmd and is exercised by hand instead (see the task's verification
+// transcripts). What is under test is the file-level exclusion itself, and
+// that does not depend on which kind of caller is racing it: O_CREAT|O_EXCL
+// is a single atomic kernel operation either way, and this test's tag check
+// would catch a corrupted result regardless of how many callers actually won
+// the race.
+func TestMaterializeUnderAdoptedLockNeverLetsTwoApplyRunsBothProceed(t *testing.T) {
+	root := t.TempDir()
+	holder, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := holder.HoldLock("agent refactoring the s3-bucket module")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 8
+	const filesPerGen = 300 // wide enough to give a broken lock a real chance to interleave
+	stores := make([]Store, n)
+	sets := make([]*FileSet, n)
+	for i := range stores {
+		s, err := New(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.UseLock(held.ID); err != nil {
+			t.Fatalf("UseLock #%d: %v", i, err)
+		}
+		stores[i] = s
+
+		tag := []byte(fmt.Sprintf("gen-%d", i))
+		set := NewFileSet()
+		for f := 0; f < filesPerGen; f++ {
+			add(t, set, Managed(fmt.Sprintf("f%03d.txt", f)), tag)
+		}
+		sets[i] = set
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([]error, n)
+	for i := range stores {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i] = stores[i].Materialize("managed", sets[i])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	successes, lockedErrs := 0, 0
+	for _, err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrLocked):
+			lockedErrs++
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if successes == 0 {
+		t.Fatal("no run ever acquired the transaction lock")
+	}
+	if successes+lockedErrs != n {
+		t.Errorf("successes(%d) + lockedErrs(%d) != n(%d) — an error other than nil or ErrLocked came back", successes, lockedErrs, n)
+	}
+
+	// The property that matters: whatever ended up on disk is exactly one
+	// generation's complete output. Two overlapping Materialize calls would
+	// leave a mixture of tags (files from more than one generation) or a
+	// short count (one generation's files partially overwritten by another
+	// mid-write) — either is exactly the corruption the lock exists to
+	// prevent.
+	entries, err := os.ReadDir(filepath.Join(root, "managed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != filesPerGen {
+		t.Errorf("managed dir has %d entries, want %d — a sign of a partial write from an overlapping run", len(entries), filesPerGen)
+	}
+	tags := map[string]int{}
+	for _, e := range entries {
+		b, err := os.ReadFile(filepath.Join(root, "managed", e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tags[string(b)]++
+	}
+	if len(tags) != 1 {
+		t.Errorf("managed dir contains a mixture of generations: %v", tags)
+	}
+
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("apply.lock survived every Materialize call returning")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("the held lock did not survive: %v", err)
+	}
+	if err := holder.Unlock(held.ID); err != nil {
+		t.Fatalf("unlock: %v", err)
 	}
 }
