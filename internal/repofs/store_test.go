@@ -1322,6 +1322,121 @@ func TestUseLockSupportsRepeatedApplies(t *testing.T) {
 	}
 }
 
+// The decisive case for the P1 this fixes: UseLock verifies the held lock
+// before the transaction lock exists at all, so between that read and
+// Materialize acquiring .rdk/apply.lock, the held lock can be released and
+// replaced by a different one — and the stale adopter must not publish
+// believing it still excludes everyone, while the new holder believes the
+// same thing. Three independent Store values opened on the same root, the
+// way three separate `rdk` invocations would be: holder1 takes lock A,
+// adopter reads and adopts it, then A is released and holder2 takes a fresh
+// lock B before adopter ever calls Materialize. Using the real HoldLock/
+// Unlock/UseLock surface rather than writing lock files directly keeps this
+// honest about what a real sequence of commands produces.
+func TestMaterializeRefusesAnAdoptedLockThatWasReplaced(t *testing.T) {
+	root := t.TempDir()
+	holder1, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldA, err := holder1.HoldLock("first holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adopter, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adopter.UseLock(heldA.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The window: A goes away and B takes its place before adopter's
+	// Materialize ever runs.
+	if err := holder1.Unlock(heldA.ID); err != nil {
+		t.Fatal(err)
+	}
+	holder2, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldB, err := holder2.HoldLock("second holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err = adopter.Materialize("managed", set)
+	if err == nil {
+		t.Fatal("materialize published under a stale adopted lock")
+	}
+	// B is genuinely blocking this run now, so this is exactly the shape any
+	// other apply colliding with a held lock produces — same ErrLocked, same
+	// holder details, just discovered by the re-check instead of the
+	// pre-acquire path.
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked (lock B, the one actually blocking this run)", err)
+	}
+	if !strings.Contains(err.Error(), heldB.ID) {
+		t.Errorf("error %q does not name lock B (%s)", err.Error(), heldB.ID)
+	}
+	if _, err := os.Stat(filepath.Join(root, "managed")); !os.IsNotExist(err) {
+		t.Error("published despite the replaced lock")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("lock B did not survive the refused adopted apply: %v", err)
+	}
+}
+
+// The residual half of the same bug: the adopted lock can simply vanish
+// (rdk unlock, with nothing replacing it) instead of being replaced. Also
+// must refuse: Materialize was told "run under lock A" and A no longer
+// exists, so there is nothing left for --with-lock's promise to mean.
+func TestMaterializeRefusesAnAdoptedLockThatWasUnlocked(t *testing.T) {
+	root := t.TempDir()
+	holder, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := holder.HoldLock("working")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adopter, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adopter.UseLock(held.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := holder.Unlock(held.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err = adopter.Materialize("managed", set)
+	if err == nil {
+		t.Fatal("materialize published under an adopted lock that no longer exists")
+	}
+	// Distinct from the replaced case: nothing holds the repository right
+	// now, so wrapping ErrLocked ("another rdk apply holds this repository")
+	// would be a claim this state doesn't support.
+	if errors.Is(err, ErrLocked) {
+		t.Errorf("err = %v wraps ErrLocked, but nothing holds the repository to describe", err)
+	}
+	if !strings.Contains(err.Error(), held.ID) {
+		t.Errorf("error %q does not name the lock that vanished", err.Error())
+	}
+	if _, err := os.Stat(filepath.Join(root, "managed")); !os.IsNotExist(err) {
+		t.Error("published despite the vanished lock")
+	}
+}
+
 // The shape of the race between Materialize's defer and the SIGINT/SIGTERM
 // handler in cmd: both call ReleaseLock on the same Store value, and in
 // production one of them (the handler) calls os.Exit right after. That

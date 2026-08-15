@@ -220,13 +220,22 @@ type Store interface {
 	// there cannot redirect the write either. A symlinked parent directory
 	// component of managedDir is refused via ErrUnsafePath for the same
 	// reason. Parent dirs are created; files use 0o644, dirs 0o755. managedDir
-	// is repo-relative. Materialize checks the held lock is absent (unless
-	// this Store adopted it via UseLock), then acquires the transaction lock
-	// for its duration (after the ScratchDir check, MkdirAll, and .gitignore
-	// write) and releases it before returning, on every path including
-	// failure — a stranded lock is not the price of an ordinary error. If
-	// either check finds something in the way, Materialize returns an error
-	// wrapping ErrLocked without touching the tree.
+	// is repo-relative. Materialize checks the held lock is absent before
+	// acquiring the transaction lock, unless this Store adopted it via
+	// UseLock — in which case that pre-acquire read is skipped (UseLock
+	// already made it) but Materialize re-reads the held lock once the
+	// transaction lock is acquired and refuses to proceed unless it still
+	// carries the id UseLock verified: the gap between UseLock running and
+	// the transaction lock existing is otherwise wide enough for the held
+	// lock to be released or replaced without this run ever noticing. The
+	// transaction lock is acquired for Materialize's duration (after the
+	// ScratchDir check, MkdirAll, and .gitignore write) and released before
+	// returning, on every path including failure — a stranded lock is not
+	// the price of an ordinary error. A lock still found in the way (the
+	// pre-acquire check, or a replacement found by the adopted path's
+	// re-check) is reported as an error wrapping ErrLocked; an adopted lock
+	// found simply gone is reported as a plain error, since nothing is
+	// actually holding the repository for ErrLocked to describe.
 	Materialize(managedDir string, set *FileSet) error
 	// Seed creates a user-owned file once: it never overwrites and never
 	// follows a symlink at the target, and it refuses via ErrUnsafePath if any
@@ -296,22 +305,32 @@ type Entry struct {
 type osStore struct {
 	root *os.Root
 
-	// lockMu guards lockHeld and lockID, which record whether *this* Store
-	// value itself acquired the transaction lock and, if so, its id.
-	// ReleaseLock consults them rather than unconditionally removing
-	// scratchApplyLock: a lock left by another process must survive a
-	// release it did not grant. HoldLock also uses acquireLock and sets these
-	// the same way, but nothing reads them for a held lock's sake: ReleaseLock
-	// only ever targets scratchApplyLock, so lockID recording a held lock's id
-	// just means the id compare there fails (or the file it would compare
-	// against is absent) — safe either way, never a removal.
+	// lockMu guards lockHeld/lockID and usingLock/usingLockID alike: all four
+	// are UseLock/acquireLock/Materialize state read and written from more
+	// than one call, not just the transaction-lock bookkeeping the older half
+	// of this comment used to describe alone.
+	//
+	// lockHeld and lockID record whether *this* Store value itself acquired
+	// the transaction lock and, if so, its id. ReleaseLock consults them
+	// rather than unconditionally removing scratchApplyLock: a lock left by
+	// another process must survive a release it did not grant. HoldLock also
+	// uses acquireLock and sets these the same way, but nothing reads them
+	// for a held lock's sake: ReleaseLock only ever targets scratchApplyLock,
+	// so lockID recording a held lock's id just means the id compare there
+	// fails (or the file it would compare against is absent) — safe either
+	// way, never a removal.
 	lockMu   sync.Mutex
 	lockHeld bool
 	lockID   string
 
 	// usingLock records that this Store adopted a lock it did not take itself
 	// (UseLock), so Materialize runs without acquiring or releasing one.
-	usingLock bool
+	// usingLockID is the id UseLock verified, kept so Materialize can
+	// re-verify the same fact once the transaction lock is held — see the
+	// re-read in Materialize for why the id has to travel this far rather
+	// than UseLock's own check being trusted to still hold by then.
+	usingLock   bool
+	usingLockID string
 }
 
 // New opens a Store rooted at repoRoot. All operations are confined to it and
@@ -381,18 +400,22 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	// this function, including a panic, which is what makes a stranded lock
 	// the cost of only a hard kill rather than of an ordinary error.
 	//
-	// Both are skipped when this Store adopted the held lock via UseLock:
-	// that call already verified it against the id given, so re-reading it
-	// here would only repeat a check UseLock already made — see its doc
-	// comment. The transaction lock is still acquired on the usingLock path,
-	// though: --with-lock asserts "I hold the repository", not "serialise
-	// nobody against me", so every apply — including two --with-lock runs
-	// under the same id — still contends for it. That is the fix: the two
-	// locks used to be one file, so adopting the held lock meant skipping
-	// acquisition entirely, and two --with-lock runs under the same id both
-	// proceeded unserialised and collided on .rdk/new and .rdk/old.
+	// The pre-acquire check is skipped when this Store adopted the held lock
+	// via UseLock: that call already verified it against the id given, so
+	// repeating the same read here, still before the transaction lock
+	// exists, would only repeat a check made under the exact same lack of
+	// guarantee — see the re-verification right after acquireLock below for
+	// where that gets settled instead. The transaction lock is still
+	// acquired on the usingLock path, though: --with-lock asserts "I hold
+	// the repository", not "serialise nobody against me", so every apply —
+	// including two --with-lock runs under the same id — still contends for
+	// it. That is the fix: the two locks used to be one file, so adopting
+	// the held lock meant skipping acquisition entirely, and two
+	// --with-lock runs under the same id both proceeded unserialised and
+	// collided on .rdk/new and .rdk/old.
 	s.lockMu.Lock()
 	usingLock := s.usingLock
+	usingLockID := s.usingLockID
 	s.lockMu.Unlock()
 	if !usingLock {
 		switch held, err := s.readLockFile(scratchLock); {
@@ -406,6 +429,28 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 	defer s.ReleaseLock()
+
+	// Same kinship as the managedDir Lstat just below, whose comment explains
+	// why that read is deliberately not taken any earlier: UseLock's
+	// verification ran before the transaction lock existed, so it could
+	// already be stale by the time this runs — the held lock released or
+	// replaced in the gap. From here on nothing can replace it: HoldLock
+	// refuses to create a new held lock while the transaction lock exists,
+	// so this read, taken now, is the one that gets to stay true for the
+	// rest of the run. Checking any earlier (e.g. where UseLock itself
+	// checked) would leave the same window open, just narrower.
+	if usingLock {
+		switch held, err := s.readLockFile(scratchLock); {
+		case err == nil && held.ID == usingLockID:
+			// still the lock this run adopted
+		case err == nil:
+			return lockedErrorFor(held)
+		case os.IsNotExist(err):
+			return fmt.Errorf("lock %s is gone: it was released or broken after this apply had already begun running under it", usingLockID)
+		default:
+			return err
+		}
+	}
 
 	// Deliberately not read any earlier: the answer drives two decisions below
 	// (whether .rdk/old needs clearing, and — the very same result, not a
@@ -903,6 +948,7 @@ func (s *osStore) UseLock(id string) (LockInfo, error) {
 		return LockInfo{}, errors.New("this store already holds a different lock and cannot also run under one")
 	}
 	s.usingLock = true
+	s.usingLockID = id
 	return info, nil
 }
 

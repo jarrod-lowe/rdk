@@ -1,8 +1,9 @@
 # One apply at a time, per repository
 
-**Status:** implemented. Landed in three steps — see "Sequencing" — the third
-of which split one lock file into two; see "Two kinds, two files" and
-"Migration".
+**Status:** implemented. Landed in four steps — see "Sequencing" — the third
+of which split one lock file into two (see "Two kinds, two files" and
+"Migration"), and the fourth of which closed a P1 in the split's own
+`--with-lock` path: adding step 5 to "Where the lock sits in the sequence".
 
 ## Problem
 
@@ -157,7 +158,7 @@ underneath it changed:
 
 ```
 rdk apply                        .rdk/lock must be absent; takes .rdk/apply.lock, releases on exit, defer and signal
-rdk apply --with-lock=<id>       .rdk/lock must match <id>, left untouched; takes .rdk/apply.lock, releases on exit
+rdk apply --with-lock=<id>       .rdk/lock must match <id> now and again once .rdk/apply.lock is held, left untouched; takes .rdk/apply.lock, releases on exit
 rdk apply --break-lock=<id>      removes a stranded lock (either file, by id), warns whose it was, then applies
 rdk lock -m "…"                  .rdk/apply.lock must be absent; takes .rdk/lock, prints the id, exits leaving it
 rdk unlock <id>                  releases a held lock (.rdk/lock only) — the routine end of your own
@@ -181,6 +182,17 @@ means you cannot get past a lock you never observed.
   replaced.
 - no lock at all → **also an error**. You asserted you hold a lock and you do
   not, which means it was broken out from under you. Proceeding would hide that.
+
+The match is checked twice, not once: `UseLock` checks it up front (that's
+where the messages above are worded from the CLI's point of view), and
+`Materialize` checks it again after acquiring `.rdk/apply.lock` — see "Where
+the lock sits in the sequence" below. `UseLock` runs before any transaction
+lock exists, so its check alone leaves a window the same width as the one
+between `HoldLock`'s absence check and its own create (see "Stated limits"):
+wide enough for the held lock to be released, or replaced by a different one,
+before this run ever contends for `.rdk/apply.lock`. The second check is what
+makes "id matches" a fact this run can act on rather than a fact it merely
+observed once.
 
 Everyone without the id stays blocked, which is what the holder wanted — and
 two runs both holding the id are no longer everyone: they contend for the
@@ -256,13 +268,14 @@ the per-file manifest hash check for outside files — when that lands.
 2. check and create .rdk/, write .rdk/.gitignore   ← must precede the lock; the dir must exist
 3. check .rdk/lock is absent (skipped if this run adopted it via UseLock)
 4. ACQUIRE .rdk/apply.lock                         ← defer release
-5. Stat the managed dir (drives two later decisions)
-6. clear new (and old, when the managed dir exists)
-7. stage into .rdk/new
-8. check the managed dir's parent components
-9. displace by rename, publish by rename
-10. sweep .rdk/old
-11. RELEASE .rdk/apply.lock
+5. on the --with-lock path only: re-check .rdk/lock still carries the adopted id
+6. Stat the managed dir (drives two later decisions)
+7. clear new (and old, when the managed dir exists)
+8. stage into .rdk/new
+9. check the managed dir's parent components
+10. displace by rename, publish by rename
+11. sweep .rdk/old
+12. RELEASE .rdk/apply.lock
 ```
 
 Step 2 sits outside the lock and is safe there: `MkdirAll` is idempotent and the
@@ -270,7 +283,27 @@ symlink check is a read. Writing `.gitignore` is deliberately *inside* it,
 though — it's remove-then-create, so two concurrent runs would otherwise race
 and one would fail `O_EXCL` spuriously.
 
-Step 5 — Stat-ing the managed dir — sits *after* both lock steps, not before,
+Step 5 exists because step 3 alone is not enough on the `--with-lock` path.
+`UseLock` (step 3's check, when it runs at all) executes in `cmd`, before
+`Materialize` is even called — there is no transaction lock yet at that
+point, so nothing stops `.rdk/lock` from being released or replaced between
+that read and step 4 acquiring `.rdk/apply.lock`. A stale adopter that
+skipped straight to staging on the strength of `UseLock`'s answer could
+publish while a *different* held lock's owner believed applies were
+excluded — the same shape of corruption the rest of this design exists to
+prevent, just reached through `--with-lock` instead of two ordinary applies.
+Step 5 closes it: once `.rdk/apply.lock` is held, `HoldLock` structurally
+cannot create a new `.rdk/lock` (see "Two kinds, two files"), so a re-read
+taken right here is a fact that stays true for the rest of the run — the
+same reasoning as step 6 below, just one lock earlier. Checking any earlier
+(e.g. folding it into step 3) would leave the same window open, only
+narrower. If the id no longer matches — the lock was replaced — the error is
+`ErrLocked` naming the new holder, identical in shape to any other run
+colliding with a held lock. If the lock is simply gone, it's a distinct
+plain error: nothing currently holds the repository, so `ErrLocked`'s claim
+would not be true.
+
+Step 6 — Stat-ing the managed dir — sits *after* every lock step, not before,
 and that ordering is itself load-bearing, not incidental: the answer drives
 whether `.rdk/old` needs clearing and whether there is a tree to displace once
 staging succeeds, and both are only safe to act on once nothing else can be
@@ -279,8 +312,9 @@ exactly the bug this design fixes — stat sees the tree, block on the lock,
 another run displaces it and dies before publishing, this run then acquires
 the lock still believing the tree exists and clears `.rdk/old`, destroying the
 only remaining copy. This still holds on the `--with-lock` path, where step 3
-is skipped rather than step 4: an adopted lock is just as much a lock as one
-acquired here, so the state it protects is exactly as settled.
+is skipped rather than step 4: an adopted lock, once step 5 has confirmed it
+still stands, is just as much a lock as one acquired here, so the state it
+protects is exactly as settled.
 
 ### Release on every exit
 
@@ -337,10 +371,10 @@ sees a held lock.
 
 ## Sequencing
 
-Three steps. The first two share one file format designed for both, so the
+Four steps. The first two share one file format designed for both, so the
 second was a command and a warning rather than a format migration; the third
 splits that one file into two without changing the format or the
-user-visible surface at all:
+user-visible surface at all; the fourth closes a gap the split itself opened:
 
 1. **The apply lock** — the JSON file, acquire/release in `Materialize`,
    `--break-lock=<id>`, and the signal handler. This was the original P1.
@@ -352,6 +386,15 @@ user-visible surface at all:
    closed a second P1: two `--with-lock` runs under the same id used to both
    proceed, reintroducing the original corruption through the flag meant to
    be safe from it — see "Two kinds, two files".
+4. **Revalidate the adopted lock under the transaction lock** — a third P1,
+   found in review of the split itself: `UseLock` (step 3 of "Where the lock
+   sits in the sequence") runs in `cmd`, before any transaction lock exists,
+   so between that check and `Materialize` acquiring `.rdk/apply.lock` the
+   held lock could be released and replaced by a different one, and the
+   stale adopter would publish none the wiser. `Materialize` now re-reads
+   `.rdk/lock` immediately after acquiring `.rdk/apply.lock` (step 5) and
+   refuses unless it still carries the id `UseLock` verified — see that
+   step's explanation above.
 
 ## Consequences
 

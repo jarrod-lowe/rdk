@@ -413,6 +413,82 @@ func TestMemUseLockRejectsAMismatchedOrAbsentLock(t *testing.T) {
 	}
 }
 
+// Mirrors TestMaterializeRefusesAnAdoptedLockThatWasReplaced — the decisive
+// case for the P1 this fixes. Mem has no notion of separate processes
+// sharing one root the way store_test's three *osStore values do, so one Mem
+// value plays all three roles in sequence (hold A, adopt A, unlock A, hold
+// B) the same way TestMemUseLockRunsWithoutAcquiringOrReleasing already lets
+// one Mem value both hold and adopt: what matters is the state Materialize
+// sees, not which Go value produced it.
+func TestMemMaterializeRefusesAnAdoptedLockThatWasReplaced(t *testing.T) {
+	m := NewMem()
+	heldA, err := m.HoldLock("first holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.UseLock(heldA.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Unlock(heldA.ID); err != nil {
+		t.Fatal(err)
+	}
+	heldB, err := m.HoldLock("second holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err = m.Materialize("managed", set)
+	if err == nil {
+		t.Fatal("materialize published under a stale adopted lock")
+	}
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("err = %v, want it to wrap ErrLocked (lock B, the one actually blocking this run)", err)
+	}
+	if !strings.Contains(err.Error(), heldB.ID) {
+		t.Errorf("error %q does not name lock B (%s)", err.Error(), heldB.ID)
+	}
+	if _, ok := m.Files()["managed/f.txt"]; ok {
+		t.Error("published despite the replaced lock")
+	}
+	if _, ok := m.Files()[scratchLock]; !ok {
+		t.Error("lock B did not survive the refused adopted apply")
+	}
+}
+
+// Mirrors TestMaterializeRefusesAnAdoptedLockThatWasUnlocked: the adopted
+// lock can also simply vanish, with nothing replacing it.
+func TestMemMaterializeRefusesAnAdoptedLockThatWasUnlocked(t *testing.T) {
+	m := NewMem()
+	held, err := m.HoldLock("working")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.UseLock(held.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Unlock(held.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	set := NewFileSet()
+	add(t, set, Managed("f.txt"), []byte("x"))
+	err = m.Materialize("managed", set)
+	if err == nil {
+		t.Fatal("materialize published under an adopted lock that no longer exists")
+	}
+	if errors.Is(err, ErrLocked) {
+		t.Errorf("err = %v wraps ErrLocked, but nothing holds the repository to describe", err)
+	}
+	if !strings.Contains(err.Error(), held.ID) {
+		t.Errorf("error %q does not name the lock that vanished", err.Error())
+	}
+	if _, ok := m.Files()["managed/f.txt"]; ok {
+		t.Error("published despite the vanished lock")
+	}
+}
+
 // Same property as osStore: releasing must not remove a lock this Mem value
 // did not take, or a broken-and-replaced lock gets deleted by the run whose
 // lock was broken.

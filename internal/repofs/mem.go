@@ -27,9 +27,12 @@ type Mem struct {
 	lockHeld bool
 	lockID   string
 
-	// usingLock mirrors osStore's: this Mem adopted a lock it did not take
-	// (UseLock), so Materialize neither acquires nor releases.
-	usingLock bool
+	// usingLock and usingLockID mirror osStore's: this Mem adopted a lock it
+	// did not take (UseLock), so Materialize neither acquires nor releases
+	// it, and usingLockID is the id UseLock verified, kept so Materialize can
+	// re-verify it later — see store.go's Materialize for why.
+	usingLock   bool
+	usingLockID string
 }
 
 // Compile-time assertion that *Mem satisfies Store.
@@ -61,6 +64,21 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 		return err
 	}
 	defer m.ReleaseLock()
+	// Mirrors osStore.Materialize's re-verification: see its comment for why
+	// this has to happen now, under the transaction lock, rather than trust
+	// UseLock's own read to still hold.
+	if m.usingLock {
+		switch held, err := m.readLockFile(scratchLock); {
+		case err == nil && held.ID == m.usingLockID:
+			// still the lock this run adopted
+		case err == nil:
+			return lockedErrorFor(held)
+		case err == fs.ErrNotExist:
+			return fmt.Errorf("lock %s is gone: it was released or broken after this apply had already begun running under it", m.usingLockID)
+		default:
+			return err
+		}
+	}
 	prefix := managedDir + "/"
 	for p := range m.files {
 		if strings.HasPrefix(p, prefix) {
@@ -288,5 +306,6 @@ func (m *Mem) UseLock(id string) (LockInfo, error) {
 		return LockInfo{}, errors.New("this store already holds a different lock and cannot also run under one")
 	}
 	m.usingLock = true
+	m.usingLockID = id
 	return info, nil
 }
