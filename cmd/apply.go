@@ -59,6 +59,9 @@ func (a *app) applyCmd() *cobra.Command {
 			if withLock != "" {
 				info, err := store.UseLock(withLock)
 				if err != nil {
+					if d, ok := apply.LockTargetDiagnostic(err); ok {
+						return diag.Wrap(err, d)
+					}
 					// UseLock's own refusals (no lock at all — yours was broken
 					// out from under you — or an id that doesn't match) are the
 					// user's mistake, not rdk's: exit 1, not 2. This is
@@ -90,6 +93,9 @@ func (a *app) applyCmd() *cobra.Command {
 			if breakLock != "" {
 				info, err := store.BreakLock(breakLock)
 				if err != nil {
+					if d, ok := apply.LockTargetDiagnostic(err); ok {
+						return diag.Wrap(err, d)
+					}
 					// BreakLock's own error (no lock, or an id that doesn't
 					// match) is the user's mistake, not rdk's — it must exit 1,
 					// not 2. This is lock-mismatch, not apply-locked: nothing is

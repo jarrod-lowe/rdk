@@ -181,6 +181,20 @@ type LockInfo struct {
 	PID     int    `json:"pid"`
 	Since   string `json:"since"`             // RFC3339
 	Message string `json:"message,omitempty"` // only for kind "held"
+
+	// Path is the lock file this record was read from, repo-relative. Not
+	// serialised: it is a property of where the record was found, not of the
+	// record, and writing it would let a copied file lie about its own
+	// location. Set by every readLockFile call as of this commit; nothing
+	// reads it yet — that lands in a later commit in this series (a lock
+	// file whose id cannot be read still needs a recovery instruction that
+	// can be typed, and "remove the path" is the one that always works). It
+	// is carried on the record now, rather than left for that future call
+	// site to recompute from the file argument it happens to have in scope,
+	// because readLockFile is the one place that already knows which file it
+	// read; a second computation elsewhere would be rule 12's kind of
+	// unbudgeted complexity for a fact this call already has.
+	Path string `json:"-"`
 }
 
 // describeLock formats a held lock's details for the blocked-apply error.
@@ -203,6 +217,26 @@ func describeLock(info LockInfo) string {
 func lockedErrorFor(info LockInfo) error {
 	return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(info)), info: info}
 }
+
+// ErrLockTarget reports that a lock path exists as something other than a
+// regular file. It is separate from ErrLocked because nothing is actually
+// holding the repository: a dangling symlink at .rdk/lock reads as absent to
+// ReadFile but is refused by the exclusive create, so the held lock silently
+// stops excluding while still being impossible to replace — the same
+// "manufactures confidence" failure flock was rejected for. At
+// .rdk/apply.lock the pair is worse: applies block on a lock no reader can
+// see, so no id is ever printed and --break-lock has nothing to name. Both
+// are user-fixable by removing one path, which is why this exits 1 with that
+// instruction rather than 2 as an rdk bug.
+var ErrLockTarget = errors.New("lock path is not a regular file")
+
+// lockTargetError carries what is actually occupying the path, since the
+// caller's summary cannot know that — the same shape as scratchTargetError.
+type lockTargetError struct{ err error }
+
+func (e *lockTargetError) Error() string        { return e.err.Error() }
+func (e *lockTargetError) Unwrap() error        { return e.err }
+func (e *lockTargetError) Is(target error) bool { return target == ErrLockTarget }
 
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
@@ -425,7 +459,7 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 			return err
 		}
 	}
-	if _, err := s.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := s.acquireLock(scratchApplyLock, ""); err != nil {
 		return err
 	}
 	defer s.ReleaseLock()
@@ -561,16 +595,21 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 }
 
 // acquireLock takes a lock by creating file exclusively — scratchLock for a
-// held lock, scratchApplyLock for a transaction lock; kind is recorded in the
-// JSON as which one this was (see the Kind field's doc comment), but file is
-// what actually governs. O_CREAT|O_EXCL is atomic on NFSv3 and later and
-// depends on no mount option or lock daemon, unlike flock: flock over NFS is
-// emulated as a whole-file POSIX lock that degrades to purely local
+// held lock, scratchApplyLock for a transaction lock. Kind is recorded in the
+// JSON as which one this was (see the Kind field's doc comment) purely for
+// display; there is no separate kind argument to pass it in as, because
+// lockKindFor(file) is the single authority on what a lock found at file is
+// (readLockFile overrides the JSON with it on every read, so a caller-chosen
+// value here would only ever disagree with itself once read back) — file is
+// what actually governs, and a second parameter carrying the same fact would
+// just be a second source for it. O_CREAT|O_EXCL is atomic on NFSv3 and later
+// and depends on no mount option or lock daemon, unlike flock: flock over NFS
+// is emulated as a whole-file POSIX lock that degrades to purely local
 // (excluding nothing) under the local_lock=flock/all mount options, with no
 // error to say so. A lock that silently does not lock is worse than no lock,
 // because it manufactures confidence — see
 // docs/superpowers/specs/2026-08-02-apply-lock-design.md.
-func (s *osStore) acquireLock(file, kind, message string) (LockInfo, error) {
+func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 	// No usingLock guard here any more: before the split, adopting the held
 	// lock (UseLock) meant Materialize skipped acquiring anything at all, so
 	// this function running at all while usingLock was true could only mean
@@ -578,13 +617,21 @@ func (s *osStore) acquireLock(file, kind, message string) (LockInfo, error) {
 	// of whether it also adopted the held lock — that is the fix, so the two
 	// --with-lock runs under the same id still contend for it — so this is
 	// the ordinary path, not a bug to guard against.
+	//
+	// Checked before creating, not just when reading: the exclusive create
+	// refuses a symlink with EEXIST, which is indistinguishable from a real
+	// lock being present — so without this the caller would report "another
+	// apply is running" about a lock that does not exist and cannot be named.
+	if err := s.lockPathUsable(file); err != nil {
+		return LockInfo{}, err
+	}
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {
 		return LockInfo{}, err
 	}
 	info := LockInfo{
 		ID:      hex.EncodeToString(idBytes),
-		Kind:    kind,
+		Kind:    lockKindFor(file),
 		Host:    hostname(),
 		PID:     os.Getpid(),
 		Since:   time.Now().UTC().Format(time.RFC3339),
@@ -621,12 +668,34 @@ func (s *osStore) acquireLock(file, kind, message string) (LockInfo, error) {
 	return info, nil
 }
 
-// readLockFile reads whatever is at file, held lock or transaction lock. A
-// parse failure is not reported as an error: the file existing is itself the
-// fact that matters (something is blocking), so the caller gets a
+// readLockFile reads whatever is at file, held lock or transaction lock.
+//
+// lockPathUsable is checked first because ReadFile follows symlinks and the
+// exclusive create does not: without it, a dangling symlink at a lock path
+// reads as "no lock" while still blocking every acquisition — an exclusion
+// that has silently stopped excluding, which is worse than no lock at all
+// (see ErrLockTarget). Anything that is not a regular file is refused for the
+// same reason, and named, because the fix is to remove one specific path.
+//
+// A parse failure is still not reported as an error: the file existing is
+// itself the fact that matters (something is blocking), so the caller gets a
 // zero-valued LockInfo rather than losing that fact to a JSON error. Held is
-// set whenever a file was found at all, parseable or not.
+// set whenever a regular file was found at all, parseable or not.
+//
+// Kind and Path are set from the file this read actually came from, after
+// unmarshalling, so they override whatever the JSON claimed. Which file a
+// lock lives in is what governs behaviour (see the constants at the top of
+// this file), so a record whose kind field disagrees — a pre-split binary's
+// file, or a hand-edited one — must not be able to make a caller describe it
+// as the other thing.
 func (s *osStore) readLockFile(file string) (LockInfo, error) {
+	// lockPathUsable returns nil for a path that simply doesn't exist, so the
+	// not-exist error below still comes from ReadFile, unwrapped: every caller
+	// distinguishes "absent" from "unusable" with os.IsNotExist, and wrapping
+	// it would make an absent lock read as a failure.
+	if err := s.lockPathUsable(file); err != nil {
+		return LockInfo{}, err
+	}
 	b, err := s.root.ReadFile(file)
 	if err != nil {
 		return LockInfo{}, err
@@ -634,7 +703,41 @@ func (s *osStore) readLockFile(file string) (LockInfo, error) {
 	var info LockInfo
 	_ = json.Unmarshal(b, &info) // best effort; see doc comment
 	info.Held = true
+	info.Path = file
+	info.Kind = lockKindFor(file)
 	return info, nil
+}
+
+// lockPathUsable Lstats file and says only whether the path can be used as a
+// lock, without opening or unmarshalling whatever is there: a not-exist is
+// fine (nil — there is simply no lock), a real file is fine (nil), and
+// anything else — most often a symlink — is refused via lockTargetError,
+// naming what is in the way. Kept separate from readLockFile so a caller that
+// only needs "is this path usable" (acquireLock's pre-create guard, UseLock's
+// check of scratchApplyLock) never has to read or parse a file whose contents
+// it has no use for — and, for UseLock specifically, so it structurally
+// cannot come away with an id: an Lstat has none to give.
+func (s *osStore) lockPathUsable(file string) error {
+	st, err := s.root.Lstat(file)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return &lockTargetError{err: fmt.Errorf("%s is a %s, not a lock file; remove it", file, modeKind(st.Mode()))}
+	}
+	return nil
+}
+
+// lockKindFor names the kind a lock found in file is, regardless of what its
+// own JSON says. The file is the fact; the field is a display copy.
+func lockKindFor(file string) string {
+	if file == scratchLock {
+		return lockKindHeld
+	}
+	return lockKindApply
 }
 
 // ReleaseLock removes the transaction lock, but only the one this Store
@@ -871,7 +974,7 @@ func (s *osStore) HoldLock(message string) (LockInfo, error) {
 	case !os.IsNotExist(err):
 		return LockInfo{}, err
 	}
-	return s.acquireLock(scratchLock, lockKindHeld, message)
+	return s.acquireLock(scratchLock, message)
 }
 
 // Unlock ends a held lock, and only ever writes to scratchLock — never
@@ -905,8 +1008,16 @@ func (s *osStore) Unlock(id string) error {
 		s.lockMu.Unlock()
 		return nil
 	}
-	if applying, err := s.readLockFile(scratchApplyLock); err == nil && applying.ID == id {
+	switch applying, err := s.readLockFile(scratchApplyLock); {
+	case err == nil && applying.ID == id:
 		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", id, id)
+	case err != nil && !os.IsNotExist(err):
+		// Not swallowed with the rest of this diagnostic-only read: an unusable
+		// apply-lock path (see ErrLockTarget) is not "no apply is running", it
+		// is "rdk cannot tell" — reporting "no lock is held" over that would
+		// send the reader looking for a lock to type, when what's actually
+		// blocking them is a path to remove.
+		return err
 	}
 	if heldErr != nil {
 		return fmt.Errorf("no lock %q is held", id)
@@ -915,23 +1026,44 @@ func (s *osStore) Unlock(id string) error {
 }
 
 // UseLock runs under an existing held lock without taking or releasing it.
-// It only ever reads scratchLock: a mismatched id means someone else's lock,
-// and no lock at all means yours was broken out from under you — which the
-// caller needs to hear rather than have silently treated as permission to
-// proceed. It returns the LockInfo this same read verified, so the caller can
-// announce the holder's details without a second read that could disagree
-// with this one.
+// It only ever reads scratchLock's contents: a mismatched id means someone
+// else's lock, and no lock at all means yours was broken out from under
+// you — which the caller needs to hear rather than have silently treated as
+// permission to proceed. It returns the LockInfo this same read verified, so
+// the caller can announce the holder's details without a second read that
+// could disagree with this one. It also checks that scratchApplyLock's path
+// is usable before any of that — see the lockPathUsable call below — so a
+// caller adopting a lock over an unusable transaction-lock path fails here,
+// before doing any of the work (parsing definitions, building the tree) that
+// Materialize's own guard on the same path would otherwise let run to
+// completion only to refuse at the very last step. The diagnostic that
+// reaches the top is the same lock-target report either way (both routes
+// wrap ErrLockTarget through apply.LockTargetDiagnostic) — what this buys is
+// not a different answer, only a cheaper way to arrive at it.
 //
 // Used to also refuse a matching id whose Kind wasn't "held" — adopting a
 // running apply's lock would mean running concurrently with the apply that
 // holds it, the corruption this feature exists to prevent, reached through
 // the flag meant to be safe. That refusal is now structural rather than a
-// check: a running apply's lock lives in scratchApplyLock, which this
-// function never reads, so its id cannot appear in what UseLock finds here
-// to begin with (the same migration edge case as Unlock's aside applies, and
-// is equally accepted: a pre-split file's stale id is adoptable, but nothing
-// is actually running under it).
+// check: a running apply's lock lives in scratchApplyLock, whose *contents*
+// this function never reads — the lockPathUsable check below is an Lstat,
+// which has no id to give — so a running apply's id cannot appear in what
+// UseLock finds here to begin with (the same migration edge case as Unlock's
+// aside applies, and is equally accepted: a pre-split file's stale id is
+// adoptable, but nothing is actually running under it).
 func (s *osStore) UseLock(id string) (LockInfo, error) {
+	// Checked even though UseLock's own logic never reads scratchApplyLock's
+	// contents: without this, adopting the held lock would succeed over an
+	// unusable transaction-lock path, and the caller would only discover it
+	// after doing the rest of an apply's work, when Materialize's own guard
+	// (see acquireLock) reaches the same path and refuses. Both routes report
+	// the identical lock-target diagnostic (see apply.LockTargetDiagnostic,
+	// called from every site that can reach either one) — checking here is
+	// about failing before that work runs, not about saying something
+	// different.
+	if err := s.lockPathUsable(scratchApplyLock); err != nil {
+		return LockInfo{}, err
+	}
 	info, err := s.readLockFile(scratchLock)
 	if err != nil {
 		if os.IsNotExist(err) {

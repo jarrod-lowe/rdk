@@ -46,6 +46,9 @@ func (a *app) lockCmd() *cobra.Command {
 			}
 			info, err := store.HoldLock(message)
 			if err != nil {
+				if d, ok := apply.LockTargetDiagnostic(err); ok {
+					return diag.Wrap(err, d)
+				}
 				// Something already holds the repository — a held lock or a
 				// running apply, it makes no difference. That is the exact
 				// condition a blocked apply reports, so this reuses its
@@ -98,6 +101,9 @@ func (a *app) unlockCmd() *cobra.Command {
 				return err
 			}
 			if err := store.Unlock(id); err != nil {
+				if d, ok := apply.LockTargetDiagnostic(err); ok {
+					return diag.Wrap(err, d)
+				}
 				// Unlock's own refusals (no lock, a mismatched id, or an
 				// apply lock — use --break-lock for that) are the user's
 				// mistake, not rdk's: exit 1, not 2. This is lock-mismatch,

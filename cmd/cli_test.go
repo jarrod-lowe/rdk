@@ -24,6 +24,19 @@ func assertLockMismatch(t *testing.T, err error, what string) {
 	}
 }
 
+// assertLockTarget checks that err is a diagnostic coded lock-target: a lock
+// path is occupied by something other than a regular file, so nothing holds
+// the repository and there is no id to name — the case lock-mismatch's hint
+// (check the id) and apply-locked's hint (wait, or --break-lock) are both
+// wrong for.
+func assertLockTarget(t *testing.T, err error, what string) {
+	t.Helper()
+	var d *diag.Error
+	if !errors.As(err, &d) || d.Code != diag.CodeLockTarget {
+		t.Errorf("%s: code = %v, want %q", what, err, diag.CodeLockTarget)
+	}
+}
+
 func runSplit(t *testing.T, dir string, args ...string) (string, string, error) {
 	t.Helper()
 	wd, _ := os.Getwd()
@@ -939,6 +952,88 @@ func TestApplyWithLockRejectsWhenNoLockExists(t *testing.T) {
 	}
 	if gotExit != 1 {
 		t.Errorf("--with-lock with no lock exit = %d, want 1 (stderr: %s)", gotExit, errOut2.String())
+	}
+}
+
+// --with-lock's own UseLock call checks the transaction-lock path is usable
+// before it ever reads scratchLock (see repofs.osStore.UseLock) — so a
+// symlink at .rdk/apply.lock fails here, before parsing or generation ever
+// runs, not lock-mismatch (there is no id to check) and not apply-locked
+// (nothing is actually holding the repository).
+func TestApplyWithLockReportsASymlinkedApplyLockAsLockTarget(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
+	if err := os.Symlink("nowhere", filepath.Join(dir, ".rdk", "apply.lock")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, errOut, err := runSplit(t, dir, "apply", "--with-lock=9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("apply ran --with-lock over a symlinked apply-lock path")
+	}
+	assertLockTarget(t, err, "--with-lock over a symlinked .rdk/apply.lock")
+	if !strings.Contains(errOut, ".rdk/apply.lock") {
+		t.Errorf("stderr does not name the offending path: %q", errOut)
+	}
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut2 bytes.Buffer
+	gotExit := execute([]string{"apply", "--with-lock=9f3a1c4e7b2d8a05"}, &out, &errOut2)
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+	if gotExit != 1 {
+		t.Errorf("lock-target exit = %d, want 1 (stderr: %s)", gotExit, errOut2.String())
+	}
+}
+
+// --break-lock's BreakLock call reads both lock files directly (see
+// repofs.osStore.BreakLock) and refuses the same way: a symlinked lock path
+// is not "no lock is held" and not "the id doesn't match" — it's a path that
+// has to be removed before rdk can tell either way.
+func TestApplyBreakLockReportsASymlinkedApplyLockAsLockTarget(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "rdk", "config.yaml"),
+		[]byte("kind: config\nname: demo\n"), 0o644)
+	os.MkdirAll(filepath.Join(dir, ".rdk"), 0o755)
+	if err := os.Symlink("nowhere", filepath.Join(dir, ".rdk", "apply.lock")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, errOut, err := runSplit(t, dir, "apply", "--break-lock=9f3a1c4e7b2d8a05")
+	if err == nil {
+		t.Fatal("apply ran --break-lock over a symlinked apply-lock path")
+	}
+	assertLockTarget(t, err, "--break-lock over a symlinked .rdk/apply.lock")
+	if !strings.Contains(errOut, ".rdk/apply.lock") {
+		t.Errorf("stderr does not name the offending path: %q", errOut)
+	}
+	if _, statErr := os.Lstat(filepath.Join(dir, ".rdk", "apply.lock")); statErr != nil {
+		t.Errorf("the symlink itself was disturbed: %v", statErr)
+	}
+
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut2 bytes.Buffer
+	gotExit := execute([]string{"apply", "--break-lock=9f3a1c4e7b2d8a05"}, &out, &errOut2)
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+	if gotExit != 1 {
+		t.Errorf("lock-target exit = %d, want 1 (stderr: %s)", gotExit, errOut2.String())
 	}
 }
 

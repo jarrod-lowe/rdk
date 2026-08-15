@@ -519,3 +519,48 @@ func TestMemReleaseLockLeavesAReplacedLockAlone(t *testing.T) {
 		t.Error("released a lock it did not take")
 	}
 }
+
+// Mirrors TestReadLockFileTrustsThePathOverTheRecordedKind: Mem's override is
+// otherwise untested, and it is the one piece of readLockFile's behaviour Mem
+// can actually exercise (the ErrLockTarget half cannot be — see the doc
+// comment on Mem.readLockFile for why).
+func TestMemReadLockFileTrustsThePathOverTheRecordedKind(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(LockInfo{ID: "aaaa", Kind: lockKindApply, PID: 1, Host: "h", Since: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchLock] = b
+
+	info, err := m.readLockFile(scratchLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != lockKindHeld {
+		t.Errorf("Kind = %q, want %q — the file it came from is authoritative", info.Kind, lockKindHeld)
+	}
+	if info.Path != scratchLock {
+		t.Errorf("Path = %q, want %q", info.Path, scratchLock)
+	}
+}
+
+// The mirror direction, same as store_test.go's pair.
+func TestMemReadLockFileTrustsThePathOverTheRecordedKindTheOtherWay(t *testing.T) {
+	m := NewMem()
+	b, err := json.Marshal(LockInfo{ID: "bbbb", Kind: lockKindHeld, PID: 2, Host: "h", Since: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Files()[scratchApplyLock] = b
+
+	info, err := m.readLockFile(scratchApplyLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != lockKindApply {
+		t.Errorf("Kind = %q, want %q — the file it came from is authoritative", info.Kind, lockKindApply)
+	}
+	if info.Path != scratchApplyLock {
+		t.Errorf("Path = %q, want %q", info.Path, scratchApplyLock)
+	}
+}

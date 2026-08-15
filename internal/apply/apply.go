@@ -87,6 +87,9 @@ func Run(store repofs.Store, version string) (Result, error) {
 				Hint: "the generated tree is correct; clear " + repofs.ScratchDir + "/old, then re-run",
 			})
 		}
+		if d, ok := LockTargetDiagnostic(err); ok {
+			return Result{}, diag.Wrap(err, d)
+		}
 		if errors.Is(err, repofs.ErrLocked) {
 			// No Cause here (diag.New, not diag.Wrap): the wrapped error's own
 			// text is the same holder details in a different shape, and setting
@@ -174,6 +177,37 @@ func LockedDiagnostic(err error) (diag.Diagnostic, bool) {
 			diag.Int("pid", info.PID),
 			diag.Str("since", info.Since),
 		},
+	}, true
+}
+
+// LockTargetDiagnostic builds the lock-target diagnostic from an error
+// wrapping repofs.ErrLockTarget — a lock path occupied by something other
+// than a regular file. Three call sites (rdk apply's own Materialize, rdk
+// lock, rdk unlock) already special-cased it correctly, each carrying its own
+// copy of the same three-line Diagnostic; two more (rdk apply --with-lock and
+// --break-lock, via UseLock and BreakLock) had no case for it at all and fell
+// through to lock-mismatch, sending the reader hunting for an id to fix when
+// the actual fix is a path to remove and there is no lock to name. One shared
+// constructor for all five, reused the way LockedDiagnostic already is by rdk
+// lock, so the fix is one definition rather than three copies that happened
+// to agree and two call sites that silently didn't.
+//
+// False if err doesn't wrap ErrLockTarget, so a caller can chain it before
+// its own fallback handling the same way it already chains a LockedDiagnostic
+// check. Unlike LockedDiagnostic, this never bakes the holder's details into
+// the summary — lockTargetError carries only a formatted message, no
+// structured LockInfo, since nothing is actually holding the repository for
+// there to be a holder to describe (see ErrLockTarget's doc comment) — so the
+// caller is expected to wrap err as Cause (diag.Wrap, not diag.New) so the
+// path lockTargetError names still reaches the reader.
+func LockTargetDiagnostic(err error) (diag.Diagnostic, bool) {
+	if !errors.Is(err, repofs.ErrLockTarget) {
+		return diag.Diagnostic{}, false
+	}
+	return diag.Diagnostic{
+		Code:    diag.CodeLockTarget,
+		Summary: "cannot use rdk's lock files",
+		Hint:    "remove the path named above, then re-run",
 	}, true
 }
 

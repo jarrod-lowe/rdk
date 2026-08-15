@@ -60,7 +60,7 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 			return err
 		}
 	}
-	if _, err := m.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := m.acquireLock(scratchApplyLock, ""); err != nil {
 		return err
 	}
 	defer m.ReleaseLock()
@@ -94,8 +94,10 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 // acquireLock mirrors osStore.acquireLock's exclusive-create semantics using
 // the same map that models the rest of the tree, keyed under file (scratchLock
 // for a held lock, scratchApplyLock for a transaction lock) so a planted lock
-// and a materialized file can never collide.
-func (m *Mem) acquireLock(file, kind, message string) (LockInfo, error) {
+// and a materialized file can never collide. No separate kind argument, for
+// the same reason as osStore.acquireLock: lockKindFor(file) is the one
+// authority on what a lock found at file is.
+func (m *Mem) acquireLock(file, message string) (LockInfo, error) {
 	// No usingLock guard here — see osStore.acquireLock: every Materialize
 	// now acquires the transaction lock regardless of whether it also
 	// adopted the held lock via UseLock, so this running with usingLock true
@@ -110,7 +112,7 @@ func (m *Mem) acquireLock(file, kind, message string) (LockInfo, error) {
 	}
 	info := LockInfo{
 		ID:      hex.EncodeToString(idBytes),
-		Kind:    kind,
+		Kind:    lockKindFor(file),
 		Host:    hostname(),
 		PID:     os.Getpid(),
 		Since:   time.Now().UTC().Format(time.RFC3339),
@@ -129,6 +131,18 @@ func (m *Mem) acquireLock(file, kind, message string) (LockInfo, error) {
 // readLockFile mirrors osStore.readLockFile: a lock file that exists but
 // fails to parse still reports Held, since the malformed file is itself what
 // has to keep blocking (rule 6).
+//
+// Kind and Path come from the file, not the record, exactly as osStore does —
+// otherwise a component test could plant a record whose kind disagrees with
+// its file and see Mem describe it differently from production.
+//
+// Where the mirror stops: osStore.readLockFile also Lstats file and refuses
+// anything that is not a regular file (ErrLockTarget). Mem has no
+// filesystem — m.files is a map from path to bytes, so every entry it holds
+// is already exactly one "regular file's" worth of content — so there is no
+// symlink or directory state for it to model, and no component test can
+// exercise ErrLockTarget against Mem. That path is verified against the real
+// Store only.
 func (m *Mem) readLockFile(file string) (LockInfo, error) {
 	b, ok := m.files[file]
 	if !ok {
@@ -137,6 +151,8 @@ func (m *Mem) readLockFile(file string) (LockInfo, error) {
 	var info LockInfo
 	_ = json.Unmarshal(b, &info) // best effort; see doc comment
 	info.Held = true
+	info.Path = file
+	info.Kind = lockKindFor(file)
 	return info, nil
 }
 
@@ -259,7 +275,7 @@ func (m *Mem) HoldLock(message string) (LockInfo, error) {
 	} else if err != fs.ErrNotExist {
 		return LockInfo{}, err
 	}
-	return m.acquireLock(scratchLock, lockKindHeld, message)
+	return m.acquireLock(scratchLock, message)
 }
 
 // Unlock mirrors osStore.Unlock: it only ever writes to scratchLock, and

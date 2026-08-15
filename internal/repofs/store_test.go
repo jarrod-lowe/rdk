@@ -1464,7 +1464,7 @@ func TestReleaseLockConcurrentCallsAlwaysRemoveTheLock(t *testing.T) {
 	if err := st.ensureScratchDir(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1662,5 +1662,127 @@ func TestMaterializeUnderAdoptedLockNeverLetsTwoApplyRunsBothProceed(t *testing.
 	}
 	if err := holder.Unlock(held.ID); err != nil {
 		t.Fatalf("unlock: %v", err)
+	}
+}
+
+// A dangling symlink at the held lock's path used to read as "no lock is
+// held", so the exclusion silently stopped excluding — the exact failure
+// flock was rejected for, reached through a different door.
+func TestMaterializeRefusesADanglingSymlinkAtTheHeldLock(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nowhere", filepath.Join(root, scratchLock)); err != nil {
+		t.Fatal(err)
+	}
+	set := NewFileSet()
+	add(t, set, Managed("a.txt"), []byte("a"))
+	err := s.Materialize("managed", set)
+	if !errors.Is(err, ErrLockTarget) {
+		t.Fatalf("Materialize err = %v, want ErrLockTarget", err)
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("err = %q, want it to name what is in the way", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, "managed")); !os.IsNotExist(statErr) {
+		t.Error("published a tree while the held lock path was unusable")
+	}
+}
+
+// The transaction lock's path has the mirror problem: the exclusive create
+// sees the symlink (so applies block forever) but every reader says it is
+// absent, so no id is ever printed and nothing can name it to break it.
+func TestMaterializeRefusesADanglingSymlinkAtTheApplyLock(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nowhere", filepath.Join(root, scratchApplyLock)); err != nil {
+		t.Fatal(err)
+	}
+	set := NewFileSet()
+	add(t, set, Managed("a.txt"), []byte("a"))
+	if err := s.Materialize("managed", set); !errors.Is(err, ErrLockTarget) {
+		t.Fatalf("Materialize err = %v, want ErrLockTarget", err)
+	}
+}
+
+// A directory at a lock path is user-fixable state, so it must not surface as
+// "an rdk bug. Report it".
+func TestHoldLockRefusesADirectoryAtTheLockPath(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, scratchLock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.HoldLock("work")
+	if !errors.Is(err, ErrLockTarget) {
+		t.Fatalf("HoldLock err = %v, want ErrLockTarget", err)
+	}
+	if !strings.Contains(err.Error(), "directory") {
+		t.Errorf("err = %q, want it to name what is in the way", err)
+	}
+}
+
+// Every entry point that reads a lock has to refuse the same way, or one of
+// them becomes the door the others are guarding.
+func TestEveryLockEntryPointRefusesAnUnusableLockPath(t *testing.T) {
+	for _, file := range []string{scratchLock, scratchApplyLock} {
+		t.Run(file, func(t *testing.T) {
+			s, root := newTestStore(t)
+			if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("nowhere", filepath.Join(root, file)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.BreakLock("deadbeef"); !errors.Is(err, ErrLockTarget) {
+				t.Errorf("BreakLock err = %v, want ErrLockTarget", err)
+			}
+			if err := s.Unlock("deadbeef"); !errors.Is(err, ErrLockTarget) {
+				t.Errorf("Unlock err = %v, want ErrLockTarget", err)
+			}
+			if _, err := s.UseLock("deadbeef"); !errors.Is(err, ErrLockTarget) {
+				t.Errorf("UseLock err = %v, want ErrLockTarget", err)
+			}
+		})
+	}
+}
+
+// The file a lock was read from is what decides how it is described — not the
+// kind field inside it, which a pre-split binary (or a hand-edited file) can
+// contradict.
+func TestReadLockFileTrustsThePathOverTheRecordedKind(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	writeLock(t, root, LockInfo{ID: "aaaa", Kind: lockKindApply, PID: 1, Host: "h", Since: "s"})
+	info, err := st.readLockFile(scratchLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != lockKindHeld {
+		t.Errorf("Kind = %q, want %q — the file it came from is authoritative", info.Kind, lockKindHeld)
+	}
+	if info.Path != scratchLock {
+		t.Errorf("Path = %q, want %q", info.Path, scratchLock)
+	}
+}
+
+// The mirror of the test above: the override runs the same way regardless of
+// which direction the JSON disagrees with the file, since lockKindFor(file)
+// never consults the record at all.
+func TestReadLockFileTrustsThePathOverTheRecordedKindTheOtherWay(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	writeApplyLock(t, root, LockInfo{ID: "bbbb", Kind: lockKindHeld, PID: 2, Host: "h", Since: "s"})
+	info, err := st.readLockFile(scratchApplyLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Kind != lockKindApply {
+		t.Errorf("Kind = %q, want %q — the file it came from is authoritative", info.Kind, lockKindApply)
+	}
+	if info.Path != scratchApplyLock {
+		t.Errorf("Path = %q, want %q", info.Path, scratchApplyLock)
 	}
 }
