@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
+	"github.com/jarrod-lowe/rdk/internal/repofs"
 )
 
 // assertLockMismatch checks that err is a diagnostic coded lock-mismatch: the
@@ -606,6 +607,105 @@ func TestLockRefusesWhenAlreadyLocked(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "first") {
 		t.Errorf("second lock's error does not name the first holder: %q", errOut.String())
+	}
+}
+
+// fakeLockNotReleased and fakeLockTarget reproduce the shape repofs actually
+// produces when HoldLock's own release fails because .rdk/apply.lock itself
+// has become unusable: an error that Is(ErrLockNotReleased) and unwraps to
+// one that separately Is(ErrLockTarget) (internal/repofs/store.go's
+// ReleaseLock wraps whatever readLockFile's Lstat guard returns). Copied
+// locally rather than shared with internal/apply/apply_test.go's identical
+// pair: both are three-line stand-ins for a repofs state that cannot be
+// reached from outside internal/repofs at all — HoldLock's release runs
+// inside a single synchronous call with no seam this package can reach (see
+// lockHoldError's doc comment in lock.go) — so there is no production entry
+// point either copy is standing in for that the other package could expose
+// instead.
+type fakeLockNotReleased struct{ cause error }
+
+func (e fakeLockNotReleased) Error() string        { return e.cause.Error() }
+func (e fakeLockNotReleased) Unwrap() error        { return e.cause }
+func (e fakeLockNotReleased) Is(target error) bool { return target == repofs.ErrLockNotReleased }
+
+type fakeLockTarget struct{}
+
+func (fakeLockTarget) Error() string {
+	return ".rdk/apply.lock is a directory, not a lock file; remove it"
+}
+func (fakeLockTarget) Is(target error) bool { return target == repofs.ErrLockTarget }
+
+// TestLockHoldErrorReportsLockNotReleasedWithTheHeldLockID exercises
+// lockHoldError directly rather than through rdk lock end to end: reaching
+// this branch for real needs .rdk to go unwritable in the exact window
+// between HoldLock creating .rdk/lock and its own deferred ReleaseLock
+// running, and nothing outside internal/repofs can land there (see
+// lockHoldError's doc comment) — repofs's own suite only reaches the
+// equivalent failure in Materialize via its unexported afterPublish seam.
+// This test only asserts what a unit test of the mapping can honestly
+// assert: given the sentinel HoldLock is documented to return alongside a
+// LockInfo it already created, the diagnostic built from it carries the
+// right code, exit status, and — the whole reason this task exists — the
+// held lock's own id, without which the lock it just created would block
+// every apply until someone found it by other means.
+func TestLockHoldErrorReportsLockNotReleasedWithTheHeldLockID(t *testing.T) {
+	info := repofs.LockInfo{ID: "deadbeefcafefeed", Message: "agent working"}
+	err := lockHoldError(fakeLockNotReleased{cause: errors.New("remove .rdk/apply.lock: permission denied")}, info)
+
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeLockNotReleased {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeLockNotReleased)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1 — this is user-fixable state, not an rdk bug", got)
+	}
+	if !strings.Contains(d.Summary, info.ID) {
+		t.Errorf("summary %q does not carry the held lock's id", d.Summary)
+	}
+	if !strings.Contains(d.Summary, info.Message) {
+		t.Errorf("summary %q does not carry the lock's message", d.Summary)
+	}
+	for _, want := range []string{"rdk apply --with-lock=" + info.ID, "rdk unlock " + info.ID} {
+		if !strings.Contains(d.Hint, want) {
+			t.Errorf("hint %q does not mention %q — the id is only useful if it's handed over", d.Hint, want)
+		}
+	}
+	found := false
+	for _, a := range d.Attrs {
+		if a.Key == "lock_id" && a.Value() == info.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("attrs %+v do not carry lock_id = %q", d.Attrs, info.ID)
+	}
+	if !errors.Is(err, repofs.ErrLockNotReleased) {
+		t.Errorf("err does not unwrap to ErrLockNotReleased: %v", err)
+	}
+}
+
+// A release failure whose cause is also an unusable lock path must still
+// report lock-not-released, not lock-target: the held lock was already
+// created by the time this fires, and reporting "cannot use rdk's lock
+// files" would never say so. Mirrors
+// internal/apply/apply_test.go's TestRunReportsLockNotReleasedEvenWhenTheCauseIsALockTargetFailure,
+// which guards the identical ordering in apply.Run.
+func TestLockHoldErrorPrefersLockNotReleasedOverLockTarget(t *testing.T) {
+	info := repofs.LockInfo{ID: "deadbeefcafefeed", Message: "agent working"}
+	err := lockHoldError(fakeLockNotReleased{cause: fakeLockTarget{}}, info)
+
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeLockNotReleased {
+		t.Errorf("code = %q, want %q — the held lock was created and must say so, not report lock-target", d.Code, diag.CodeLockNotReleased)
+	}
+	if !strings.Contains(d.Summary, "held "+info.ID) {
+		t.Errorf("summary %q does not lead with the held lock having been created", d.Summary)
 	}
 }
 

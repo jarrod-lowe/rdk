@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -68,17 +69,7 @@ func (a *app) lockCmd() *cobra.Command {
 			a.setStore(store)
 			info, err := store.HoldLock(message)
 			if err != nil {
-				if d, ok := apply.LockTargetDiagnostic(err); ok {
-					return diag.Wrap(err, d)
-				}
-				// Something already holds the repository — a held lock or a
-				// running apply, it makes no difference. That is the exact
-				// condition a blocked apply reports, so this reuses its
-				// diagnostic rather than a second, differently-worded one.
-				if d, ok := apply.LockedDiagnostic(err); ok {
-					return diag.New(d)
-				}
-				return err
+				return lockHoldError(err, info)
 			}
 			// The id has to reach stdout as part of the result: the caller is
 			// very often a script or an agent that needs to capture it to
@@ -102,6 +93,66 @@ func (a *app) lockCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&message, "message", "m", "", "why the repository is being locked (required)")
 	return cmd
+}
+
+// lockHoldError maps a HoldLock failure to the diagnostic rdk lock reports.
+// Pulled out of lockCmd's RunE so the ErrLockNotReleased branch can be
+// exercised directly from cli_test.go with a crafted error: making HoldLock's
+// own release genuinely fail needs .rdk to go unwritable in the narrow window
+// between HoldLock creating .rdk/lock and its deferred ReleaseLock running,
+// and nothing reaches that window from outside internal/repofs — the
+// equivalent failure in Materialize is only reachable in repofs's own test
+// suite via its unexported afterPublish seam (internal/repofs/store_test.go),
+// and HoldLock has no analogous seam at all.
+func lockHoldError(err error, info repofs.LockInfo) error {
+	if errors.Is(err, repofs.ErrLockNotReleased) {
+		// Checked before LockTargetDiagnostic, deliberately, mirroring
+		// apply.Run's identical ordering (internal/apply/apply.go): a release
+		// that fails because .rdk/apply.lock itself has become unusable — a
+		// directory where the lock file was, say — wraps both
+		// ErrLockNotReleased and ErrLockTarget, and checking
+		// LockTargetDiagnostic first would report "cannot use rdk's lock
+		// files" and never say the held lock was already created, which is
+		// the one obligation this diagnostic exists to meet.
+		//
+		// info is trustworthy here specifically because of how HoldLock's
+		// named return works: its last statement is
+		// `return s.acquireLock(scratchLock, message)`, which assigns both
+		// named returns before the deferred ReleaseLock runs — and that
+		// defer only ever overwrites err, never info (see HoldLock's own doc
+		// comment). So err wrapping ErrLockNotReleased here can only mean
+		// HoldLock's own final acquireLock succeeded first: the held lock
+		// info describes is genuinely sitting in .rdk/lock right now, and
+		// its id is real — it is not invented, and it must reach the user,
+		// because a held lock whose id nobody saw still blocks every apply
+		// until someone finds it.
+		return diag.Wrap(err, diag.Diagnostic{
+			Code: diag.CodeLockNotReleased,
+			Summary: fmt.Sprintf("rdk lock: held %s — %s, but could not release .rdk/apply.lock",
+				info.ID, info.Message),
+			// The held lock is already in effect, so the usual --with-lock /
+			// unlock guidance still belongs here — but neither works yet:
+			// Materialize acquires .rdk/apply.lock on every apply, including
+			// one run with --with-lock, so both stay blocked until whatever
+			// the cause above names is cleared. rdk lock itself must not be
+			// re-run to "fix" this: .rdk/lock already exists, so a second
+			// call would only report this repository as locked.
+			Hint: fmt.Sprintf("the lock above is real and already in effect; read the cause above for what's blocking %s and clear it — until then every apply blocks on it, including one run with --with-lock. Once it's clear: apply while you hold this lock: rdk apply --with-lock=%s\nrelease when you are done: rdk unlock %s",
+				repofs.ScratchDir+"/apply.lock", info.ID, info.ID),
+			Attrs: []diag.Attr{diag.Str("lock_id", info.ID)},
+		})
+	}
+	if d, ok := apply.LockTargetDiagnostic(err); ok {
+		return diag.Wrap(err, d)
+	}
+	// Something already holds the repository — a held lock or a running
+	// apply, it makes no difference. That is the exact condition a blocked
+	// apply reports, so this reuses its diagnostic rather than a second,
+	// differently-worded one.
+	if d, ok := apply.LockedDiagnostic(err); ok {
+		return diag.New(d)
+	}
+	return err
 }
 
 // unlockCmd releases a held lock. Unlike lockCmd, it must not call a.setStore
