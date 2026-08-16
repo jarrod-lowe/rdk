@@ -943,13 +943,13 @@ func TestMaterializeStillSucceedsWhenItsLockIsUntouched(t *testing.T) {
 
 Run: `go test ./internal/repofs/ -run 'AbortsWhenItsLock|StillSucceedsWhenItsLock' -v`
 
-Expected: FAIL — `undefined: ErrLockLost`, `undefined: afterStaging` is already defined by Task 2 so the failure is the sentinel and, once stubbed, a mixed tree.
+Expected: FAIL to compile — `undefined: ErrLockLost` and `undefined: afterStaging`. Add the seam (Step 3) and the sentinel (Step 4) and the failure becomes the real one: a published, mixed tree.
 
 - [ ] **Step 3: Add this task's seam**
 
 Add `afterStaging` to `internal/repofs/seams.go`, with the doc comment shown in Task 2's listing. It is added now rather than in Task 2 because only now does the behaviour it describes exist.
 
-- [ ] **Step 3: Add the sentinel**
+- [ ] **Step 4: Add the sentinel**
 
 In `internal/repofs/store.go`, after the `ErrLockTarget` block:
 
@@ -975,7 +975,7 @@ func (e *lockLostError) Unwrap() error        { return e.err }
 func (e *lockLostError) Is(target error) bool { return target == ErrLockLost }
 ```
 
-- [ ] **Step 4: Add the revalidation helper**
+- [ ] **Step 5: Add the revalidation helper**
 
 In `internal/repofs/store.go`, after `ReleaseLock`:
 
@@ -1017,7 +1017,7 @@ func (s *osStore) checkStillLocked() error {
 }
 ```
 
-- [ ] **Step 5: Call it before every irreversible step**
+- [ ] **Step 6: Call it before every irreversible step**
 
 In `internal/repofs/store.go`'s `Materialize`, after the staging loop and before the `checkPathComponents` call, add the seam and the first check:
 
@@ -1054,7 +1054,7 @@ and before the sweep, replacing the existing comment block above `RemoveAll(scra
 	}
 ```
 
-- [ ] **Step 6: Mirror in `Mem`**
+- [ ] **Step 7: Mirror in `Mem`**
 
 `Mem` has no partial-write or interleaving model, but it must reject the same states so a component test cannot pass against the fake while production aborts. In `internal/repofs/mem.go`, add after `ReleaseLock`:
 
@@ -1090,7 +1090,7 @@ and call it in `Mem.Materialize` immediately before the loop that deletes the ma
 	}
 ```
 
-- [ ] **Step 7: Add the diagnostic code and map it**
+- [ ] **Step 8: Add the diagnostic code and map it**
 
 In `internal/diag/codes.go`, add `CodeLockLost = "lock-lost"` next to `CodeLockTarget` and to the `All` slice.
 
@@ -1112,7 +1112,7 @@ In `internal/apply/apply.go`, before the `ErrLocked` branch:
 		}
 ```
 
-- [ ] **Step 8: Document the code**
+- [ ] **Step 9: Document the code**
 
 In `docs/errors.md`, in the exit-1 table, after the `lock-target` row:
 
@@ -1120,13 +1120,13 @@ In `docs/errors.md`, in the exit-1 table, after the `lock-target` row:
 | `lock-lost` | This apply held `.rdk/apply.lock` and something removed or replaced it before the apply finished — almost always `--break-lock` used on a lock that was live rather than stranded. rdk refuses to guess whether a lock is stale, so that judgement is the user's, and this is what it looks like when it goes the wrong way. | Nothing was written; the managed tree is exactly as it was. Re-run. If this recurs, the cause is a `--break-lock` habit rather than a stranded lock: wait for the running apply instead. |
 ```
 
-- [ ] **Step 9: Run the tests**
+- [ ] **Step 10: Run the tests**
 
 Run: `go test ./... && gofmt -l . && go vet ./...`
 
 Expected: PASS, no gofmt output.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add internal/repofs/store.go internal/repofs/mem.go internal/repofs/store_test.go internal/apply/apply.go internal/diag/codes.go docs/errors.md
