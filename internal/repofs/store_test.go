@@ -2293,6 +2293,17 @@ func TestHoldLockStillReportsARunningApply(t *testing.T) {
 // This models that stray call and checks it is harmless, and that the held
 // lock's id is still discoverable by someone else even though the user who
 // created it never saw it printed.
+//
+// What this does and does not prove: by this point lockHeld is already
+// false, so ReleaseLock returns early without touching the filesystem at
+// all — the "held lock survives" assertion below would pass even if
+// ReleaseLock were hardcoded to remove scratchLock instead of
+// scratchApplyLock. This test's real coverage is idempotence (a stray call
+// after the real release is harmless) and discoverability (the id survives
+// to be found later). The no-route-to-the-held-lock property itself —
+// that ReleaseLock cannot reach scratchLock even while it has something live
+// to release — is TestReleaseLockDuringHoldLockWindowReleasesOnlyTheTransactionLock's
+// job, where lockHeld is still true when ReleaseLock runs.
 func TestHeldLockSurvivesAReleaseLockCallAfterHoldLockReturns(t *testing.T) {
 	s, root := newTestStore(t)
 	info, err := s.HoldLock("work")
@@ -2372,5 +2383,24 @@ func TestReleaseLockDuringHoldLockWindowReleasesOnlyTheTransactionLock(t *testin
 	}
 	if info.ID == "" {
 		t.Error("HoldLock returned no id")
+	}
+}
+
+// The held-lock-takes-precedence branch must not swallow ErrLockTarget: a
+// symlink at .rdk/lock while a genuine apply holds the transaction lock has
+// to surface as something the user can fix (Task 1), not be hidden behind
+// "another rdk apply is running" just because that collision happened too.
+func TestHoldLockRefusesAnUnusableHeldLockPathEvenWhenAnApplyIsRunning(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+	if err := os.Symlink("nowhere", filepath.Join(root, scratchLock)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.HoldLock("work")
+	if !errors.Is(err, ErrLockTarget) {
+		t.Fatalf("HoldLock err = %v, want ErrLockTarget", err)
 	}
 }

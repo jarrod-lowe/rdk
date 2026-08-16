@@ -931,11 +931,14 @@ func lockKindFor(file string) string {
 // alone. Now it is: this function is hardcoded to scratchApplyLock, a name a
 // held lock is never written under, so there is no held lock this code could
 // reach even if lockHeld/lockID were wrong — the exclusion is structural, not
-// a check that has to remember to exclude it. (If a SIGTERM arrived while
-// `rdk lock` was still running, the lock command's own Store was never
-// registered with the signal handler in the first place — see cmd/lock.go —
-// so this function is not even reachable from that path; the file-name
-// argument above is the belt to that braces.)
+// a check that has to remember to exclude it. (`rdk lock`'s own Store is
+// registered with the signal handler — see cmd/lock.go — because HoldLock
+// transiently acquires the transaction lock while it creates the held one,
+// and a SIGTERM landing in that span needs this function reachable to avoid
+// stranding it. Registering is what the hardcoded file name above makes
+// safe: the handler can call this freely because it structurally has no
+// route from here to the held lock, not because it never reaches this
+// function at all.)
 //
 // lockHeld/lockID record what acquireLock actually created, but that alone
 // isn't enough: between this process taking the lock and this call running,
@@ -1236,6 +1239,25 @@ func (s *osStore) publishScratchGitignore() error {
 // there, and following it really would remove it — but it describes rdk's own
 // momentary plumbing, not the held lock the winner is about to create.
 //
+// The substitution itself has a stated limit, separate from the window
+// above: when a held lock genuinely exists (readErr == nil), it is reported
+// instead of the transaction-lock collision even though both can be real
+// blockers at once — an apply can be running alongside a held lock via
+// --with-lock, which contends for the transaction lock like any other apply
+// (see Materialize) but only verifies the held lock it adopted once, before
+// staging, and never again. The caller here hears only about the held lock,
+// whose hint says to --break-lock it if stranded; following that while the
+// --with-lock apply is genuinely running removes the held lock out from
+// under it without that apply ever noticing. Verified directly: it is not
+// corruption — the transaction lock the --with-lock apply holds is untouched
+// by breaking a different file, so nothing can run concurrently with it —
+// but it is not an abort either. Task 3's re-verification (checkStillLocked)
+// watches only the transaction lock, not the held lock, so the running apply
+// completes and publishes normally, and "the repository is held" quietly
+// stops being true while it still is running. A misleading recovery
+// instruction that costs a false promise, not a tree, and a real gap this
+// task does not close.
+//
 // The held lock is deliberately not recorded as this store's (see
 // acquireLock): if it were, the second acquisition below would overwrite the
 // transaction lock's id and the deferred release would then fail its own id
@@ -1269,8 +1291,18 @@ func (s *osStore) HoldLock(message string) (LockInfo, error) {
 		// no held lock, the collision was a genuine apply and the original
 		// error is already right.
 		if errors.Is(err, ErrLocked) {
-			if held, readErr := s.readLockFile(scratchLock); readErr == nil {
+			switch held, readErr := s.readLockFile(scratchLock); {
+			case readErr == nil:
 				return LockInfo{}, lockedErrorFor(held)
+			case !os.IsNotExist(readErr):
+				// Not swallowed into the transaction-lock's message: a
+				// symlink at .rdk/lock is exactly the state Task 1's
+				// ErrLockTarget exists to name, and it is no less reachable
+				// here than in the ordinary held-lock case above — falling
+				// through to "another rdk apply is running" would hide a
+				// user-fixable path behind a message about a lock that, for
+				// all this call knows, may not even be real.
+				return LockInfo{}, readErr
 			}
 		}
 		return LockInfo{}, err

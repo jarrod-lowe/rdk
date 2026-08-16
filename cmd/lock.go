@@ -107,11 +107,12 @@ func (a *app) lockCmd() *cobra.Command {
 // unlockCmd releases a held lock. Unlike lockCmd, it must not call a.setStore
 // — not because registering would be unsafe (see lockCmd's doc comment on
 // why it never was), but because there is nothing here to register for:
-// Unlock only ever reads and removes scratchLock directly, and never calls
-// acquireLock, so it never touches lockHeld/lockID and never acquires the
-// transaction lock ReleaseLock is hardcoded to release. A Ctrl-C during this
-// command strands nothing for the same reason it always would have had
-// nothing to strand.
+// Unlock reads both scratchLock and scratchApplyLock (the second only to
+// diagnose an id that belongs to a running apply) but removes only
+// scratchLock, and never calls acquireLock — so it never touches
+// lockHeld/lockID and never acquires the transaction lock ReleaseLock is
+// hardcoded to release. A Ctrl-C during this command strands nothing for the
+// same reason it always would have had nothing to strand.
 func (a *app) unlockCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "unlock <id>",
