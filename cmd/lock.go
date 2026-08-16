@@ -11,14 +11,30 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// lockCmd takes a held lock and exits leaving it, deliberately. It must not
-// call a.setStore: that would give the SIGINT/SIGTERM handler a route to
-// release the very lock this command exists to leave behind. repofs already
-// makes that structural — ReleaseLock only ever touches the transaction
-// lock's file, and a held lock is never written under that name — but not
-// registering this Store at all is the belt to that braces: the handler has
-// no route to any Store here, so there is nothing for a future repofs change
-// to have to remember not to reach.
+// lockCmd takes a held lock and exits leaving it, deliberately — and it does
+// register its Store with the signal handler, which an earlier version of
+// this comment argued against.
+//
+// HoldLock transiently acquires .rdk/apply.lock, the transaction lock, for
+// the span in which it creates .rdk/lock, the held lock (see HoldLock's own
+// doc comment). SIGINT/SIGTERM don't run deferred functions (see
+// handleSignals), so a Ctrl-C landing in that span would leave HoldLock's own
+// `defer s.ReleaseLock()` never called — and without registration, nothing
+// else calls it either, stranding the transaction lock. That is exactly the
+// goal-5 violation ("nothing is stranded by an ordinary exit, including
+// Ctrl-C") the rest of this series exists to close, reopened by the one
+// command that used to hold no transaction lock at all. Registering gives the
+// handler a route to release it, which is exactly the span that needs
+// releasing on a Ctrl-C.
+//
+// Registering is safe now for a reason that did not hold when this comment
+// argued the opposite: the handler can only ever reach .rdk/apply.lock.
+// ReleaseLock is hardcoded to that one file, and acquireLock records
+// ownership (lockHeld/lockID) only when it is the file being written — never
+// for the held lock (see acquireLock's own doc comment) — so lockHeld/lockID
+// can never name .rdk/lock. There is no route from this registration to the
+// held lock this command exists to leave behind, by construction, not by a
+// check that has to remember to exclude it.
 func (a *app) lockCmd() *cobra.Command {
 	var message string
 	cmd := &cobra.Command{
@@ -44,6 +60,12 @@ func (a *app) lockCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Registered before HoldLock runs, not after: HoldLock is what
+			// acquires the transaction lock this exists to let the handler
+			// release, so registering any later would leave exactly the span
+			// that needs covering unregistered. See this function's own doc
+			// comment for why registering is safe.
+			a.setStore(store)
 			info, err := store.HoldLock(message)
 			if err != nil {
 				if d, ok := apply.LockTargetDiagnostic(err); ok {
@@ -82,9 +104,14 @@ func (a *app) lockCmd() *cobra.Command {
 	return cmd
 }
 
-// unlockCmd releases a held lock. Like lockCmd, it must not call a.setStore:
-// unlock's own store never acquires anything the signal handler would need to
-// release.
+// unlockCmd releases a held lock. Unlike lockCmd, it must not call a.setStore
+// — not because registering would be unsafe (see lockCmd's doc comment on
+// why it never was), but because there is nothing here to register for:
+// Unlock only ever reads and removes scratchLock directly, and never calls
+// acquireLock, so it never touches lockHeld/lockID and never acquires the
+// transaction lock ReleaseLock is hardcoded to release. A Ctrl-C during this
+// command strands nothing for the same reason it always would have had
+// nothing to strand.
 func (a *app) unlockCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "unlock <id>",

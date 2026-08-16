@@ -2284,3 +2284,93 @@ func TestHoldLockStillReportsARunningApply(t *testing.T) {
 		t.Errorf("Kind = %q, want %q", info.Kind, lockKindApply)
 	}
 }
+
+// Verifies recoverability for a signal landing after HoldLock has already
+// returned: cmd/lock.go registers its Store with the signal handler before
+// calling HoldLock, so a Ctrl-C after the held lock is created but before
+// rdk lock prints its id calls ReleaseLock on a store that, by then, has
+// already released its own transaction lock via HoldLock's internal defer.
+// This models that stray call and checks it is harmless, and that the held
+// lock's id is still discoverable by someone else even though the user who
+// created it never saw it printed.
+func TestHeldLockSurvivesAReleaseLockCallAfterHoldLockReturns(t *testing.T) {
+	s, root := newTestStore(t)
+	info, err := s.HoldLock("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Models the signal handler's call landing after HoldLock has already
+	// returned (and so has already released its own transaction lock via its
+	// own defer): idempotent, must not disturb the held lock.
+	if err := s.ReleaseLock(); err != nil {
+		t.Fatalf("ReleaseLock after HoldLock returned = %v, want nil (idempotent)", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Fatalf("held lock did not survive a stray ReleaseLock call: %v", err)
+	}
+
+	// Recoverable: a second party can still discover the id, even though the
+	// user who created it never saw it printed — a subsequent blocked apply
+	// (or a second rdk lock) is how it would actually be found in practice.
+	other, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = other.HoldLock("someone else")
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("second HoldLock err = %v, want ErrLocked", err)
+	}
+	found, ok := LockInfoFromError(err)
+	if !ok || found.ID != info.ID {
+		t.Errorf("second HoldLock reported id %q, want the original held lock's %q", found.ID, info.ID)
+	}
+}
+
+// Verifies the property cmd/lock.go's registration now depends on: if the
+// signal handler's ReleaseLock call lands during the span in which HoldLock
+// holds the transaction lock — the span afterApplyLockHeldByHoldLock marks —
+// it releases the transaction lock immediately and touches nothing else.
+//
+// What this does not prove: production's actual failure mode is a real
+// SIGINT/SIGTERM landing while HoldLock's own goroutine is genuinely
+// concurrent with the handler's, followed by os.Exit — which can end the
+// process before HoldLock ever reaches the Link call that creates the held
+// lock, or after it. Reproducing that interleaving would need control over
+// the Go scheduler and an actual process exit this test cannot take without
+// killing itself — the same limitation already documented above
+// TestReleaseLockConcurrentCallsAlwaysRemoveTheLock. What this test proves
+// instead: wherever in that window the release lands, it is safe — the
+// transaction lock is gone immediately, ReleaseLock never reaches scratchLock
+// (it is hardcoded to scratchApplyLock), and HoldLock's own eventual creation
+// of the held lock — which in production may or may not still get to run
+// before os.Exit — succeeds normally when it does.
+func TestReleaseLockDuringHoldLockWindowReleasesOnlyTheTransactionLock(t *testing.T) {
+	s, root := newTestStore(t)
+
+	afterApplyLockHeldByHoldLock = func() {
+		// Models the signal handler's own call, on the same Store — exactly
+		// what a.getStore() would return once cmd/lock.go registers it.
+		if err := s.ReleaseLock(); err != nil {
+			t.Errorf("ReleaseLock during HoldLock's window = %v, want nil", err)
+		}
+		if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+			t.Error("transaction lock survived a ReleaseLock call made during HoldLock's own window")
+		}
+		if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(err) {
+			t.Error("held lock exists before HoldLock has created it — test precondition is wrong")
+		}
+	}
+	t.Cleanup(func() { afterApplyLockHeldByHoldLock = nil })
+
+	info, err := s.HoldLock("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Fatalf("held lock was not created after the mid-window release: %v", err)
+	}
+	if info.ID == "" {
+		t.Error("HoldLock returned no id")
+	}
+}
