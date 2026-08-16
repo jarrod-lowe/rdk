@@ -2196,3 +2196,91 @@ func TestCheckStillLockedBeforePublishLeavesAnUnexpectedReadFailureUnclassified(
 		t.Errorf("checkStillLocked(false) err = %v, want a bare unclassified error, not ErrSweep or ErrLockLost", err)
 	}
 }
+
+// The property, stated deterministically: for the whole span in which the
+// held lock is being created, an apply is genuinely excluded. Without it,
+// both creates check the other's file first and interleave.
+func TestHoldLockExcludesAnApplyWhileItCreatesTheHeldLock(t *testing.T) {
+	s, root := newTestStore(t)
+	other, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var applyErr error
+	afterApplyLockHeldByHoldLock = func() {
+		set := NewFileSet()
+		add(t, set, Managed("a.txt"), []byte("a"))
+		applyErr = other.Materialize("managed", set)
+	}
+	t.Cleanup(func() { afterApplyLockHeldByHoldLock = nil })
+
+	if _, err := s.HoldLock("work"); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(applyErr, ErrLocked) {
+		t.Fatalf("concurrent apply err = %v, want ErrLocked — rdk lock did not exclude it", applyErr)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "managed")); !os.IsNotExist(err) {
+		t.Error("an apply published a tree while rdk lock was taking the repository")
+	}
+}
+
+// The transaction lock HoldLock takes is transient: it must be gone by the
+// time rdk lock returns, or every subsequent apply blocks on a lock nobody
+// holds.
+func TestHoldLockReleasesTheTransactionLock(t *testing.T) {
+	s, root := newTestStore(t)
+	if _, err := s.HoldLock("work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Fatal("rdk lock left its transaction lock behind")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Fatalf("the held lock was not created: %v", err)
+	}
+}
+
+// Two rdk locks must still read as "this repository is locked", not as
+// "another apply is running": the transaction lock is now an implementation
+// detail of rdk lock, and describing it to the user would be describing
+// rdk's own plumbing back at them.
+func TestHoldLockTwiceReportsTheHeldLock(t *testing.T) {
+	s, _ := newTestStore(t)
+	first, err := s.HoldLock("first holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.HoldLock("second")
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("second HoldLock err = %v, want ErrLocked", err)
+	}
+	info, ok := LockInfoFromError(err)
+	if !ok {
+		t.Fatal("no LockInfo on the error")
+	}
+	if info.Kind != lockKindHeld || info.ID != first.ID {
+		t.Errorf("blocked by %s/%s, want the held lock %s", info.Kind, info.ID, first.ID)
+	}
+	if info.Message != "first holder" {
+		t.Errorf("message = %q, want the first holder's", info.Message)
+	}
+}
+
+// A genuinely running apply still reports as one.
+func TestHoldLockStillReportsARunningApply(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+	_, err := s.HoldLock("work")
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("HoldLock err = %v, want ErrLocked", err)
+	}
+	info, _ := LockInfoFromError(err)
+	if info.Kind != lockKindApply {
+		t.Errorf("Kind = %q, want %q", info.Kind, lockKindApply)
+	}
+}

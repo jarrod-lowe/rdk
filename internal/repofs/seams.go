@@ -40,3 +40,24 @@ var afterLockOwnershipRecorded func()
 // replace) this run's lock at the exact point where doing so used to produce
 // a mixed tree in silence.
 var afterStaging func()
+
+// afterApplyLockHeldByHoldLock is a test seam. Nil in production, so it costs
+// one nil check on a path that already does filesystem work.
+//
+// It exists because the property it lets a test assert — that for the whole
+// span in which HoldLock is creating the held lock, a concurrent Materialize
+// is genuinely excluded — lives between two syscalls (acquiring the
+// transaction lock and creating the held lock under it): a test that tried to
+// hit that window by racing goroutines would be timing-dependent, and a
+// timing-dependent test for a timing bug is one that passes on the machine
+// where the bug is worst. This makes the window itself reachable on demand
+// instead. It is a package-level var rather than a field on osStore for the
+// same reason as the other seams in this file: nothing outside this package
+// can set it, and nothing inside sets it except a test.
+//
+// Fires inside HoldLock once it holds the transaction lock and before it
+// creates the held lock. A test uses it to run a concurrent Materialize from
+// inside the callback and assert that it blocks on ErrLocked — the property
+// that stops rdk lock from ever returning success while an apply is
+// genuinely running underneath it.
+var afterApplyLockHeldByHoldLock func()

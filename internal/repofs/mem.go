@@ -327,15 +327,28 @@ func (m *Mem) ReadDir(dir string) ([]Entry, error) {
 	return out, nil
 }
 
-// HoldLock mirrors osStore.HoldLock: refuses while the transaction lock
-// exists, so rdk lock never claims the repository is held while an apply is
-// genuinely running.
+// HoldLock mirrors osStore.HoldLock: it creates the held lock while holding
+// the transaction lock, so rdk lock and an apply can never both succeed on
+// the ordinary interleaving that used to let both of their mutually-checking
+// creates through. Mem is single-goroutine and cannot race, but the two
+// implementations must agree on the sequence and not merely on the end
+// state — otherwise a component test could describe an ordering production
+// does not have.
 func (m *Mem) HoldLock(message string) (LockInfo, error) {
-	if applying, err := m.readLockFile(scratchApplyLock); err == nil {
-		return LockInfo{}, lockedErrorFor(applying)
-	} else if err != fs.ErrNotExist {
+	if _, err := m.acquireLock(scratchApplyLock, ""); err != nil {
+		// A held lock takes precedence in the message when there is one —
+		// mirrors osStore.HoldLock's reasoning: describing rdk's own
+		// transaction-lock plumbing back at a user whose actual situation is
+		// that someone else holds the repository would be the wrong thing to
+		// say.
+		if errors.Is(err, ErrLocked) {
+			if held, readErr := m.readLockFile(scratchLock); readErr == nil {
+				return LockInfo{}, lockedErrorFor(held)
+			}
+		}
 		return LockInfo{}, err
 	}
+	defer m.ReleaseLock()
 	return m.acquireLock(scratchLock, message)
 }
 

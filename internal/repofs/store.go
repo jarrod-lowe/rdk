@@ -1209,24 +1209,75 @@ func (s *osStore) publishScratchGitignore() error {
 }
 
 // HoldLock takes a lock that outlives this process, so a person or agent can
-// work on the tree without an apply running underneath them. Refuses while a
-// transaction lock exists: without this, rdk lock could return success while
-// a Materialize is genuinely halfway through, claiming the repository is
-// held when what's actually true is that an apply is running — the exact lie
-// this feature exists to prevent. This check and the O_EXCL create below are
-// two separate reads of two separate files, not one atomic operation; see
-// BreakLock's doc comment on the equivalent, already-accepted TOCTOU window
-// elsewhere in this file. The window here is no wider, and closing it would
-// need the same nonexistent atomic compare-and-create.
+// work on the tree without an apply running underneath them.
+//
+// It runs under the transaction lock. The old shape — read .rdk/apply.lock,
+// find it absent, create .rdk/lock — was one half of a symmetric race:
+// Materialize reads .rdk/lock, finds it absent, and creates .rdk/apply.lock,
+// so each checked the other's file before creating its own and interleaved
+// runs both succeeded. Reproduced at 3 in 3000 trials: rdk lock returned
+// success, the apply published, and .rdk/lock stood — the repository
+// reported as held while an apply was running underneath it, which is the
+// exact lie this feature exists to prevent, told to the one person who asked
+// for exclusivity.
+//
+// Acquiring the transaction lock first turns two mutually-checking creates
+// into one create inside a lock, using the mechanism already here rather than
+// a second one (rule 7). The transaction lock is transient — held only for
+// the span of the create, released before returning — and the message-
+// selection branch below hides it from a second, losing rdk lock call
+// whenever the held lock already exists by the time the loser checks. It is
+// not hidden unconditionally: if the loser's read of scratchLock lands before
+// the winner has created it — a real, verified window, not a hypothetical one
+// — the loser sees the winner's transaction lock instead, worded exactly like
+// a running apply ("another rdk apply is running ... --break-lock=<id>"), and
+// the id that message hands over is the transaction lock's, not the held
+// lock's. That message is not false — the winner's transaction lock really is
+// there, and following it really would remove it — but it describes rdk's own
+// momentary plumbing, not the held lock the winner is about to create.
+//
+// The held lock is deliberately not recorded as this store's (see
+// acquireLock): if it were, the second acquisition below would overwrite the
+// transaction lock's id and the deferred release would then fail its own id
+// compare and strand the transaction lock.
+//
+// This makes "HoldLock cannot create a held lock while an apply genuinely
+// holds the transaction lock" true against ordinary interleaving — the case
+// the 3-in-3000 measurement above came from, where nothing disturbs either
+// side's lock. It is not true unconditionally: --break-lock can remove the
+// transaction lock this call is holding (it is an ordinary transaction lock,
+// discoverable and breakable exactly like any Materialize's, once someone
+// has observed its id — goal 3), and this call does not re-verify it between
+// acquiring and creating the held lock the way Materialize re-verifies
+// before its own destructive renames (see checkStillLocked). A break
+// landing in that window lets a fresh apply's Materialize run genuinely
+// concurrently with this call's acquireLock(scratchLock, ...) — the same
+// shape of race Task 3 closes for Materialize's own irreversible steps, left
+// open here because this task does not add the equivalent revalidation to
+// HoldLock. What this task closes is the symmetric race described above,
+// not every way to interrupt this call's hold on the transaction lock.
 func (s *osStore) HoldLock(message string) (LockInfo, error) {
 	if err := s.ensureScratchDir(); err != nil {
 		return LockInfo{}, err
 	}
-	switch applying, err := s.readLockFile(scratchApplyLock); {
-	case err == nil:
-		return LockInfo{}, lockedErrorFor(applying)
-	case !os.IsNotExist(err):
+	if _, err := s.acquireLock(scratchApplyLock, ""); err != nil {
+		// A held lock takes precedence in the message when there is one: two
+		// rdk locks racing means the loser briefly collides with the winner's
+		// transaction lock, and reporting "another rdk apply is running"
+		// would be describing rdk's own plumbing back at a user whose actual
+		// situation is that someone else holds the repository. When there is
+		// no held lock, the collision was a genuine apply and the original
+		// error is already right.
+		if errors.Is(err, ErrLocked) {
+			if held, readErr := s.readLockFile(scratchLock); readErr == nil {
+				return LockInfo{}, lockedErrorFor(held)
+			}
+		}
 		return LockInfo{}, err
+	}
+	defer s.ReleaseLock()
+	if afterApplyLockHeldByHoldLock != nil {
+		afterApplyLockHeldByHoldLock()
 	}
 	return s.acquireLock(scratchLock, message)
 }
