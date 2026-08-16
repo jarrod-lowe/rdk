@@ -1786,3 +1786,203 @@ func TestReadLockFileTrustsThePathOverTheRecordedKindTheOtherWay(t *testing.T) {
 		t.Errorf("Path = %q, want %q", info.Path, scratchApplyLock)
 	}
 }
+
+// The lock file must never be observable in a half-written state: a
+// zero-length lock blocks every apply while carrying no id, so --break-lock
+// has nothing to name and the printed recovery cannot be typed.
+func TestLockFileIsCompleteTheInstantItIsVisible(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	bad := make(chan string, 1)
+	go func() {
+		defer close(finished)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			b, err := os.ReadFile(filepath.Join(root, ScratchDir, "apply.lock"))
+			if err != nil {
+				continue // absent is fine; partial is not
+			}
+			var info LockInfo
+			if err := json.Unmarshal(b, &info); err != nil || info.ID == "" {
+				select {
+				case bad <- string(b):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.ReleaseLock(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(done)
+	// Joined before checking bad: without this, the poller can still be
+	// between detecting a partial file and sending on bad when the
+	// non-blocking read below runs, which would only ever under-report a
+	// real failure, never manufacture one — but under-reporting is still
+	// worth closing.
+	<-finished
+	select {
+	case b := <-bad:
+		t.Fatalf("observed a lock file that was not a complete record: %q", b)
+	default:
+	}
+}
+
+// Ownership has to be recorded before the lock becomes visible, or a signal
+// arriving in between leaves a complete lock the handler declines to remove
+// because it does not know it is its own.
+func TestAcquireLockRecordsOwnershipBeforeTheLockIsVisible(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan bool, 1)
+	afterLockOwnershipRecorded = func() {
+		_, err := os.Lstat(filepath.Join(root, ScratchDir, "apply.lock"))
+		seen <- os.IsNotExist(err)
+	}
+	t.Cleanup(func() { afterLockOwnershipRecorded = nil })
+
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !<-seen {
+		t.Error("the lock file was already visible when ownership was recorded")
+	}
+	st.lockMu.Lock()
+	held, id := st.lockHeld, st.lockID
+	st.lockMu.Unlock()
+	if !held || id == "" {
+		t.Errorf("lockHeld/lockID = %v/%q, want ownership recorded", held, id)
+	}
+}
+
+// The property TestAcquireLockRecordsOwnershipBeforeTheLockIsVisible cannot
+// show on its own: that lockMu stays held all the way to the Link, so a
+// ReleaseLock racing the exact instant ownership is recorded is excluded
+// until the lock actually exists to be released. The seam fires with lockMu
+// held, so a ReleaseLock launched from inside it can only start running once
+// this call has released — which, if the window were still open (lockMu
+// dropped right after the two field assignments, as an earlier version of
+// this fix still did), would not be true: that release would run immediately,
+// find nothing on disk yet, conclude there was nothing of this call's to
+// remove, and return — leaving the lock this call is about to create
+// permanently unreleased once the Link does land.
+func TestAcquireLockCannotBeStrandedByAConcurrentRelease(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	releaseDone := make(chan error, 1)
+	afterLockOwnershipRecorded = func() {
+		go func() { releaseDone <- st.ReleaseLock() }()
+	}
+	t.Cleanup(func() { afterLockOwnershipRecorded = nil })
+
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-releaseDone; err != nil {
+		t.Fatal(err)
+	}
+	// The concurrent release could only have run after the Link — lockMu
+	// excluded it until then — so it saw the real, complete file and
+	// actually removed it. If the window were open, it would have run
+	// early, removed nothing, and this file would still be here with
+	// nothing left tracking it as this store's to release.
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(err) {
+		t.Error("lock file survived the concurrent ReleaseLock: it ran before the lock was fully recorded and is now stranded")
+	}
+}
+
+// Losing the exclusive-create race must leave no ownership behind: the lock
+// on disk is someone else's, and a release that believed otherwise would
+// remove a live lock.
+func TestAcquireLockClearsOwnershipWhenItLosesTheRace(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	writeApplyLock(t, root, sampleLock(lockKindApply))
+	if _, err := st.acquireLock(scratchApplyLock, ""); !errors.Is(err, ErrLocked) {
+		t.Fatalf("acquireLock err = %v, want ErrLocked", err)
+	}
+	st.lockMu.Lock()
+	held := st.lockHeld
+	st.lockMu.Unlock()
+	if held {
+		t.Error("ownership survived a lost race; a release would remove someone else's live lock")
+	}
+	if err := s.ReleaseLock(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+		t.Error("ReleaseLock removed a lock this store never acquired")
+	}
+}
+
+// Only the transaction lock is ever this store's to release. Recording a held
+// lock's id in the same fields would make the deferred release in Task 4's
+// HoldLock compare the wrong id and strand the transaction lock.
+func TestAcquireLockDoesNotClaimOwnershipOfAHeldLock(t *testing.T) {
+	s, _ := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchLock, "work"); err != nil {
+		t.Fatal(err)
+	}
+	st.lockMu.Lock()
+	held := st.lockHeld
+	st.lockMu.Unlock()
+	if held {
+		t.Error("a held lock was recorded as this store's transaction lock")
+	}
+}
+
+// The scratch dir must not accumulate the temporary records lock creation
+// writes through.
+func TestAcquireLockLeavesNoTemporaryFiles(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReleaseLock(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ScratchDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != ".gitignore" {
+			t.Errorf("scratch dir holds %q, want only .gitignore", e.Name())
+		}
+	}
+}

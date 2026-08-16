@@ -564,3 +564,18 @@ func TestMemReadLockFileTrustsThePathOverTheRecordedKindTheOtherWay(t *testing.T
 		t.Errorf("Path = %q, want %q", info.Path, scratchApplyLock)
 	}
 }
+
+// Mirrors TestAcquireLockDoesNotClaimOwnershipOfAHeldLock — the one half of
+// Task 2's fix Mem can express (see the "where the mirror stops" paragraph
+// on Mem.acquireLock for the half it cannot). A held lock's id landing in
+// lockID would make HoldLock's deferred release, once Task 4 has it acquire
+// the transaction lock too, compare the wrong id and strand it.
+func TestMemAcquireLockDoesNotClaimOwnershipOfAHeldLock(t *testing.T) {
+	m := NewMem()
+	if _, err := m.acquireLock(scratchLock, "work"); err != nil {
+		t.Fatal(err)
+	}
+	if m.lockHeld {
+		t.Error("a held lock was recorded as this store's transaction lock")
+	}
+}

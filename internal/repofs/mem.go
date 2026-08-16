@@ -97,6 +97,20 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 // and a materialized file can never collide. No separate kind argument, for
 // the same reason as osStore.acquireLock: lockKindFor(file) is the one
 // authority on what a lock found at file is.
+//
+// Where the mirror stops: osStore's fix for this task is two things —
+// atomicity (write the complete record to a scratch name and only then Link
+// it into place, so nothing ever observes a half-written lock, with lockMu
+// held across that Link so a racing ReleaseLock cannot withdraw the claim
+// before the file exists to back it) and ownership scoping (record only for
+// scratchApplyLock). Mem models only the second, below. m.files[file] = b is
+// a single map write with nothing else able to observe it mid-assignment, so
+// there is no half-written state for a temp-then-link step to guard against,
+// and Mem has no mutex or second goroutine to race in the first place (see
+// the struct's own doc comment) — the atomicity half of this fix is not
+// something Mem could misrepresent even if it tried. What it can
+// misrepresent is the scoping, which is why that half is mirrored and tested
+// here.
 func (m *Mem) acquireLock(file, message string) (LockInfo, error) {
 	// No usingLock guard here — see osStore.acquireLock: every Materialize
 	// now acquires the transaction lock regardless of whether it also
@@ -123,8 +137,13 @@ func (m *Mem) acquireLock(file, message string) (LockInfo, error) {
 		return LockInfo{}, err
 	}
 	m.files[file] = b
-	m.lockHeld = true
-	m.lockID = info.ID
+	// Only the transaction lock is this Mem's to release — mirrors
+	// osStore.acquireLock, where recording a held lock's id would make
+	// HoldLock's deferred release compare the wrong id.
+	if file == scratchApplyLock {
+		m.lockHeld = true
+		m.lockID = info.ID
+	}
 	return info, nil
 }
 
@@ -289,9 +308,10 @@ func (m *Mem) Unlock(id string) error {
 	}
 	if heldErr == nil && held.ID == id {
 		delete(m.files, scratchLock)
-		if m.lockID == id {
-			m.lockHeld = false
-		}
+		// No ownership to clear: lockHeld/lockID track only the
+		// transaction lock (see acquireLock), and a held lock's id can
+		// never appear there, so there is nothing here this call could be
+		// the owner of.
 		return nil
 	}
 	if applying, err := m.readLockFile(scratchApplyLock); err == nil && applying.ID == id {
@@ -318,8 +338,11 @@ func (m *Mem) UseLock(id string) (LockInfo, error) {
 	if info.ID != id {
 		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
 	}
-	if m.lockHeld && m.lockID != id {
-		return LockInfo{}, errors.New("this store already holds a different lock and cannot also run under one")
+	// lockHeld alone — mirrors osStore.UseLock: lockID, when set, is always a
+	// transaction lock's id, never a held lock's, so comparing it against id
+	// (always a held lock's id here) could never be what makes this refuse.
+	if m.lockHeld {
+		return LockInfo{}, errors.New("this store already holds a lock and cannot also run under one")
 	}
 	m.usingLock = true
 	m.usingLockID = id

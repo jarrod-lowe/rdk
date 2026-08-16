@@ -345,14 +345,18 @@ type osStore struct {
 	// of this comment used to describe alone.
 	//
 	// lockHeld and lockID record whether *this* Store value itself acquired
-	// the transaction lock and, if so, its id. ReleaseLock consults them
-	// rather than unconditionally removing scratchApplyLock: a lock left by
-	// another process must survive a release it did not grant. HoldLock also
-	// uses acquireLock and sets these the same way, but nothing reads them
-	// for a held lock's sake: ReleaseLock only ever targets scratchApplyLock,
-	// so lockID recording a held lock's id just means the id compare there
-	// fails (or the file it would compare against is absent) — safe either
-	// way, never a removal.
+	// the transaction lock and, if so, its id. ReleaseLock consults both:
+	// lockHeld to know whether there is anything of this call's to release,
+	// and lockID to avoid removing a lock left by another process — one it
+	// did not grant — rather than unconditionally removing scratchApplyLock.
+	// UseLock consults lockHeld alone, to refuse adopting a held lock while
+	// this store already holds a transaction lock of its own; it has no
+	// reason to compare lockID, which never holds a held lock's id (see
+	// acquireLock). acquireLock only ever sets them for scratchApplyLock: a
+	// held lock is never this store's to release, so recording one here
+	// would be at best meaningless and at worst (once HoldLock acquires
+	// both) the thing that strands a transaction lock by making its release
+	// compare the wrong id.
 	lockMu   sync.Mutex
 	lockHeld bool
 	lockID   string
@@ -594,21 +598,115 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	return nil
 }
 
-// acquireLock takes a lock by creating file exclusively — scratchLock for a
-// held lock, scratchApplyLock for a transaction lock. Kind is recorded in the
-// JSON as which one this was (see the Kind field's doc comment) purely for
-// display; there is no separate kind argument to pass it in as, because
-// lockKindFor(file) is the single authority on what a lock found at file is
-// (readLockFile overrides the JSON with it on every read, so a caller-chosen
-// value here would only ever disagree with itself once read back) — file is
-// what actually governs, and a second parameter carrying the same fact would
-// just be a second source for it. O_CREAT|O_EXCL is atomic on NFSv3 and later
-// and depends on no mount option or lock daemon, unlike flock: flock over NFS
-// is emulated as a whole-file POSIX lock that degrades to purely local
-// (excluding nothing) under the local_lock=flock/all mount options, with no
-// error to say so. A lock that silently does not lock is worse than no lock,
-// because it manufactures confidence — see
+// writeScratchTemp writes b to a randomly-named temporary file in ScratchDir
+// — prefix + "." + 16 hex digits + ".tmp" — and returns its path once the
+// write (and, if sync, an fsync) and the close have all succeeded. It is the
+// one piece acquireLock, seedNew and publishScratchGitignore share (rule 7):
+// each still does its own commit — Link for acquireLock and seedNew, which
+// must never overwrite; Rename for publishScratchGitignore, which may — and
+// its own handling of a failed commit, because those differ enough (whether
+// losing the race is an error at all, what the caller does with what was
+// already there) that folding them in here would just move the special-casing
+// rather than remove it. On any failure the temp file is removed and the
+// error returned, so no caller has to clean one up itself.
+//
+// Random, not sequential or fixed: concurrent writers of the same kind must
+// not choose the same name and stomp each other's in-flight write.
+//
+// sync is true only for a lock. Flushing before the commit is what makes
+// "visible implies complete" survive a power loss and not just a signal:
+// without it, the directory entry a Link or Rename creates can outlive the
+// bytes it points at, which is the zero-length-lock failure again by a
+// slower route. Seed and the scratch .gitignore don't carry that guarantee
+// today — a partial seed or a rewritten-from-nothing gitignore surviving a
+// crash is not the failure this task addresses — so they pass false and skip
+// the fsync's cost.
+func (s *osStore) writeScratchTemp(prefix string, b []byte, sync bool) (string, error) {
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", err
+	}
+	tmp := ScratchDir + "/" + prefix + "." + hex.EncodeToString(suffix) + ".tmp"
+	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		_ = s.root.Remove(tmp)
+		return "", err
+	}
+	if sync {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			_ = s.root.Remove(tmp)
+			return "", err
+		}
+	}
+	if err := f.Close(); err != nil {
+		_ = s.root.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
+}
+
+// acquireLock takes a lock by making it appear atomically and complete —
+// scratchLock for a held lock, scratchApplyLock for a transaction lock. The
+// file is the only input: the kind recorded in the JSON is derived from it
+// (see the Kind field's doc comment), so there is no way for a caller to
+// write a record that disagrees with where it lives.
+//
+// The record is written to a scratch name, flushed, closed, and only then
+// linked into place (writeScratchTemp, then Link). link() fails with EEXIST
+// if anything is already at the destination, so it is exactly as exclusive as
+// O_CREAT|O_EXCL — and over NFS it is the more dependable of the two, which
+// is the same reason both were chosen over flock: flock over NFS is emulated
+// as a whole-file POSIX lock that degrades to purely local (excluding
+// nothing) under the local_lock=flock/all mount options, with no error to say
+// so. A lock that silently does not lock is worse than no lock, because it
+// manufactures confidence — see
 // docs/superpowers/specs/2026-08-02-apply-lock-design.md.
+//
+// Creating the visible name first and writing into it second — what this used
+// to do — left the lock observable while empty. That is not a cosmetic
+// window: a zero-length lock still blocks every apply, but carries no id, so
+// --break-lock has nothing to name and the recovery the blocked-apply error
+// prints cannot be typed. A signal, a full disk, or a power loss all landed
+// there. Now the visible name only ever comes into existence already
+// complete.
+//
+// Ownership is recorded before the link, not after — and lockMu stays held
+// from that recording through the Link call itself, not just across the two
+// assignments that record it. Releasing in between (what an earlier version
+// of this fix still did) reopened a narrower version of the same window: a
+// concurrent ReleaseLock could see lockHeld true, read scratchApplyLock, find
+// nothing there yet because the Link had not run, and conclude there was
+// nothing of this call's left to remove — withdrawing ownership of a lock
+// that was about to exist. This call would then complete the Link and
+// return, and a signal handler whose ReleaseLock lands in exactly that gap
+// (its read-then-no-op before the Link, its os.Exit after) is the SIGTERM
+// scenario this task exists for. Holding lockMu across the Link closes it:
+// ReleaseLock cannot run at all until this call has released, and by then
+// the file is either linked (present, matching the id ReleaseLock will read)
+// or the attempt failed (present as someone else's, or absent only because
+// this call never recorded anything for it to find).
+//
+// What is not closed, stated plainly rather than implied away (rule 12): a
+// signal whose handler's ReleaseLock call runs and returns — correctly
+// finding nothing yet to release — before this call ever takes lockMu, can
+// still be followed by this call completing and the process exiting with no
+// second release ever running. Synchronising signal delivery itself against
+// an in-flight acquisition would close it, and is out of scope here. What
+// this fix buys instead is narrower but real: a strand left this way is now
+// always a complete record --break-lock can name, never the zero-length file
+// that could not be.
+//
+// Only the transaction lock is recorded as this store's. ReleaseLock only
+// ever targets scratchApplyLock, so a held lock's id in those fields was
+// always meaningless; it becomes actively wrong once HoldLock acquires both
+// (see HoldLock), because the second acquisition would overwrite the first's
+// id and the deferred release would then fail its own id compare and strand
+// the transaction lock.
 func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 	// No usingLock guard here any more: before the split, adopting the held
 	// lock (UseLock) meant Materialize skipped acquiring anything at all, so
@@ -641,9 +739,46 @@ func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 	if err != nil {
 		return LockInfo{}, err
 	}
-	f, err := s.root.OpenFile(file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	tmp, err := s.writeScratchTemp("lock", b, true)
 	if err != nil {
-		if os.IsExist(err) {
+		return LockInfo{}, err
+	}
+
+	owned := file == scratchApplyLock
+	if owned {
+		s.lockMu.Lock()
+		s.lockHeld = true
+		s.lockID = info.ID
+		if afterLockOwnershipRecorded != nil {
+			// Fires with lockMu still held — see the seam's own doc comment
+			// for why a future callback here has to keep that in mind.
+			afterLockOwnershipRecorded()
+		}
+	}
+	linkErr := s.root.Link(tmp, file)
+	if owned {
+		s.lockMu.Unlock()
+	}
+	if linkErr != nil {
+		if owned {
+			s.lockMu.Lock()
+			// Only this call's own claim is withdrawn, and only if it is
+			// still there to withdraw. ReleaseLock clears lockHeld alone and
+			// never touches lockID, so it cannot be what makes this compare
+			// fail — lockMu was released just above, though, so a *different*
+			// acquireLock call on this same store can have started and
+			// already recorded its own claim in that gap. Clearing
+			// unconditionally would strand that claim: its own ReleaseLock
+			// would then find lockHeld false and believe there was nothing
+			// to release.
+			if s.lockID == info.ID {
+				s.lockHeld = false
+				s.lockID = ""
+			}
+			s.lockMu.Unlock()
+		}
+		_ = s.root.Remove(tmp)
+		if os.IsExist(linkErr) {
 			// Read whatever is there for the message; a malformed or
 			// unreadable lock must still block (rule 6) rather than let a
 			// corrupt file silently disable the exclusion, so parse failures
@@ -652,19 +787,13 @@ func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 			existing, _ := s.readLockFile(file)
 			return LockInfo{}, lockedErrorFor(existing)
 		}
-		return LockInfo{}, err
+		return LockInfo{}, linkErr
 	}
-	defer f.Close()
-	if _, err := f.Write(b); err != nil {
-		return LockInfo{}, err
-	}
-	if err := f.Close(); err != nil {
-		return LockInfo{}, err
-	}
-	s.lockMu.Lock()
-	s.lockHeld = true
-	s.lockID = info.ID
-	s.lockMu.Unlock()
+	// Best-effort: file is already complete by the time Link returns — Link
+	// only adds a second directory entry for the same bytes — so a temp left
+	// here by a failed Remove is clutter in the gitignored scratch dir, not a
+	// reason to fail an acquisition that succeeded.
+	_ = s.root.Remove(tmp)
 	return info, nil
 }
 
@@ -926,25 +1055,13 @@ func (s *osStore) ensureScratchDir() error {
 // plants a symlink at the .gitignore path pointing at a file the user owns
 // and asserts that file is untouched after this runs.
 func (s *osStore) publishScratchGitignore() error {
-	// Random, not sequential or fixed: two concurrent runs must not choose
-	// the same temp name and stomp each other's in-flight write, the very
-	// failure mode this replaces.
-	suffix := make([]byte, 8)
-	if _, err := rand.Read(suffix); err != nil {
-		return err
-	}
-	tmp := ScratchDir + "/.gitignore." + hex.EncodeToString(suffix) + ".tmp"
-	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	// writeScratchTemp gets the temp name (random, so two concurrent runs
+	// never collide on it — the very failure mode this replaces), the write,
+	// and the close; sync is false because a gitignore that reverts to
+	// nothing across a crash just gets rewritten by the next call (rule 13),
+	// which is cheaper than the fsync on every apply.
+	tmp, err := s.writeScratchTemp(".gitignore", []byte("*\n"), false)
 	if err != nil {
-		return err
-	}
-	if _, err := f.Write([]byte("*\n")); err != nil {
-		f.Close()
-		_ = s.root.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = s.root.Remove(tmp)
 		return err
 	}
 	if err := s.root.Rename(tmp, ScratchDir+"/.gitignore"); err != nil {
@@ -1001,11 +1118,10 @@ func (s *osStore) Unlock(id string) error {
 		if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		s.lockMu.Lock()
-		if s.lockID == id {
-			s.lockHeld = false
-		}
-		s.lockMu.Unlock()
+		// No ownership to clear: lockHeld/lockID track only the
+		// transaction lock (see acquireLock), and a held lock's id can
+		// never appear there, so there is nothing here this call could be
+		// the owner of.
 		return nil
 	}
 	switch applying, err := s.readLockFile(scratchApplyLock); {
@@ -1076,8 +1192,14 @@ func (s *osStore) UseLock(id string) (LockInfo, error) {
 	}
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()
-	if s.lockHeld && s.lockID != id {
-		return LockInfo{}, errors.New("this store already holds a different lock and cannot also run under one")
+	// lockHeld alone, not also compared against id: lockID, when set, is
+	// always a transaction lock's id (see acquireLock), never a held lock's,
+	// so it and id — always a held lock's id here — can never legitimately
+	// be equal. The comparison this used to make could only ever be true,
+	// which made it a check on the wrong question; the real one is simply
+	// whether this store already holds a transaction lock of its own.
+	if s.lockHeld {
+		return LockInfo{}, errors.New("this store already holds a lock and cannot also run under one")
 	}
 	s.usingLock = true
 	s.usingLockID = id
@@ -1172,25 +1294,13 @@ func (s *osStore) seedNew(name string, data []byte) error {
 	if err := s.ensureScratchDir(); err != nil {
 		return err
 	}
-	// Random, not sequential or fixed, for the same reason as
-	// publishScratchGitignore's suffix: two concurrent Seed calls must not
-	// choose the same scratch name and stomp each other's in-flight write.
-	suffix := make([]byte, 8)
-	if _, err := rand.Read(suffix); err != nil {
-		return err
-	}
-	tmp := ScratchDir + "/seed." + hex.EncodeToString(suffix) + ".tmp"
-	f, err := s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	// writeScratchTemp gets the temp name, the write, and the close; sync is
+	// false, same as publishScratchGitignore's: the guarantee this function
+	// needs is "never publish a partial write" (see the doc comment above),
+	// which write-then-link already gives without an fsync — durability
+	// across a power loss is not a promise Seed makes.
+	tmp, err := s.writeScratchTemp("seed", data, false)
 	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		_ = s.root.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = s.root.Remove(tmp)
 		return err
 	}
 	if err := s.root.Link(tmp, name); err != nil {
