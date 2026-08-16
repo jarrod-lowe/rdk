@@ -185,15 +185,15 @@ type LockInfo struct {
 	// Path is the lock file this record was read from, repo-relative. Not
 	// serialised: it is a property of where the record was found, not of the
 	// record, and writing it would let a copied file lie about its own
-	// location. Set by every readLockFile call as of this commit; nothing
-	// reads it yet — that lands in a later commit in this series (a lock
-	// file whose id cannot be read still needs a recovery instruction that
-	// can be typed, and "remove the path" is the one that always works). It
-	// is carried on the record now, rather than left for that future call
-	// site to recompute from the file argument it happens to have in scope,
-	// because readLockFile is the one place that already knows which file it
-	// read; a second computation elsewhere would be rule 12's kind of
-	// unbudgeted complexity for a fact this call already has.
+	// location. Set by every readLockFile call. It is what
+	// apply.LockedDiagnostic names when a lock's id cannot be read: a lock
+	// with no id has no --break-lock recovery, and "remove the path" is the
+	// one instruction that still works. Carried on the record here, rather
+	// than left for that call site to recompute from the file argument it
+	// happens to have in scope, because readLockFile is the one place that
+	// already knows which file it read; a second computation elsewhere would
+	// be rule 12's kind of unbudgeted complexity for a fact this call
+	// already has.
 	Path string `json:"-"`
 }
 
@@ -217,6 +217,14 @@ func describeLock(info LockInfo) string {
 func lockedErrorFor(info LockInfo) error {
 	return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(info)), info: info}
 }
+
+// LockedErrorFor builds the same blocked-by-a-lock error every path inside
+// this package produces, from a LockInfo the caller already has. It exists
+// for tests in other packages — apply's diagnostic rendering, principally,
+// which has to be able to render a lock whose id is unreadable without
+// arranging one on a real filesystem. lockedError stays unexported so that
+// the only production source of ErrLocked remains inside this package.
+func LockedErrorFor(info LockInfo) error { return lockedErrorFor(info) }
 
 // ErrLockTarget reports that a lock path exists as something other than a
 // regular file. It is separate from ErrLocked because nothing is actually
@@ -1099,6 +1107,14 @@ func (s *osStore) checkStillLockedAfterPublish() error  { return s.checkStillLoc
 // there are two files to look in, rather than regressing to "only clears a
 // held lock" the moment the split landed.
 func (s *osStore) BreakLock(id string) (LockInfo, error) {
+	// An empty id is not a compare-and-swap, it is "remove whatever is
+	// there" — the one thing this function exists not to be. It would also
+	// match a truncated lock file, whose id unmarshals to "", turning the
+	// safety property inside out precisely in the case where the caller can
+	// see least.
+	if id == "" {
+		return LockInfo{}, errors.New("a lock id is required: --break-lock names the one lock it may remove")
+	}
 	var found []LockInfo
 	for _, file := range []string{scratchLock, scratchApplyLock} {
 		info, err := s.readLockFile(file)
@@ -1330,6 +1346,9 @@ func (s *osStore) HoldLock(message string) (LockInfo, error) {
 // apply gets the redirecting message, rather than degrading to "no lock is
 // held" just because Unlock looked in the wrong file for it.
 func (s *osStore) Unlock(id string) error {
+	if id == "" {
+		return errors.New("a lock id is required: rdk unlock names the one lock it may release")
+	}
 	held, heldErr := s.readLockFile(scratchLock)
 	if heldErr != nil && !os.IsNotExist(heldErr) {
 		return heldErr
@@ -1388,6 +1407,9 @@ func (s *osStore) Unlock(id string) error {
 // aside applies, and is equally accepted: a pre-split file's stale id is
 // adoptable, but nothing is actually running under it).
 func (s *osStore) UseLock(id string) (LockInfo, error) {
+	if id == "" {
+		return LockInfo{}, errors.New("a lock id is required: --with-lock names the one lock it may run under")
+	}
 	// Checked even though UseLock's own logic never reads scratchApplyLock's
 	// contents: without this, adopting the held lock would succeed over an
 	// unusable transaction-lock path, and the caller would only discover it

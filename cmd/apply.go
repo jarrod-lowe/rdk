@@ -30,15 +30,36 @@ func (a *app) applyCmd() *cobra.Command {
 		Short: "Regenerate all rdk-managed files from the definitions in rdk/",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Changed, not != "": --break-lock= is a flag that was given with
+			// no id, and treating that as "absent" ran a plain apply — while
+			// the error it was answering printed "use --break-lock=<id>". A
+			// lock whose id could not be read therefore had a recovery that
+			// could not be typed. Empty is now its own, named mistake.
+			gaveBreak := cmd.Flags().Changed("break-lock")
+			gaveWith := cmd.Flags().Changed("with-lock")
 			// --with-lock says "this lock is mine, run under it"; --break-lock
 			// says "this lock is stale, destroy it". Together they contradict
 			// each other, so this has to fail before either flag does anything
 			// rather than let one silently win.
-			if breakLock != "" && withLock != "" {
+			if gaveBreak && gaveWith {
 				return diag.New(diag.Diagnostic{
 					Code:    diag.CodeInvalidFlag,
 					Summary: "rdk apply: --with-lock and --break-lock are mutually exclusive",
 					Hint:    "pick one: --with-lock to run under a lock you hold, or --break-lock to remove one that's stranded",
+				})
+			}
+			if gaveBreak && breakLock == "" {
+				return diag.New(diag.Diagnostic{
+					Code:    diag.CodeInvalidFlag,
+					Summary: "rdk apply: --break-lock needs the id of the lock to remove",
+					Hint:    "the blocked-apply error prints the id; if it prints none, the lock file is unreadable — remove " + repofs.ScratchDir + "/apply.lock",
+				})
+			}
+			if gaveWith && withLock == "" {
+				return diag.New(diag.Diagnostic{
+					Code:    diag.CodeInvalidFlag,
+					Summary: "rdk apply: --with-lock needs the id of the lock to run under",
+					Hint:    `rdk lock -m "..." prints the id it takes`,
 				})
 			}
 			wd, err := os.Getwd()
@@ -56,7 +77,7 @@ func (a *app) applyCmd() *cobra.Command {
 			// acquired an apply lock, which UseLock below deliberately never
 			// does.
 			a.setStore(store)
-			if withLock != "" {
+			if gaveWith {
 				info, err := store.UseLock(withLock)
 				if err != nil {
 					if d, ok := apply.LockTargetDiagnostic(err); ok {
@@ -90,7 +111,7 @@ func (a *app) applyCmd() *cobra.Command {
 				lockInfo = info
 				underLock = true
 			}
-			if breakLock != "" {
+			if gaveBreak {
 				info, err := store.BreakLock(breakLock)
 				if err != nil {
 					if d, ok := apply.LockTargetDiagnostic(err); ok {

@@ -248,6 +248,11 @@ func (m *Mem) checkStillLocked() error {
 // BreakLock mirrors osStore.BreakLock: the id is required, checked against
 // both the held lock and the transaction lock, and only a match is removed.
 func (m *Mem) BreakLock(id string) (LockInfo, error) {
+	// Mirrors osStore.BreakLock: an empty id must never match, or this fake
+	// could accept what production refuses.
+	if id == "" {
+		return LockInfo{}, errors.New("a lock id is required: --break-lock names the one lock it may remove")
+	}
 	var found []LockInfo
 	for _, file := range []string{scratchLock, scratchApplyLock} {
 		info, err := m.readLockFile(file)
@@ -357,6 +362,10 @@ func (m *Mem) HoldLock(message string) (LockInfo, error) {
 // apply, redirecting to --break-lock instead of degrading to "no lock is
 // held".
 func (m *Mem) Unlock(id string) error {
+	// Mirrors osStore.Unlock: an empty id must never match.
+	if id == "" {
+		return errors.New("a lock id is required: rdk unlock names the one lock it may release")
+	}
 	held, heldErr := m.readLockFile(scratchLock)
 	if heldErr != nil && heldErr != fs.ErrNotExist {
 		return heldErr
@@ -383,6 +392,10 @@ func (m *Mem) Unlock(id string) error {
 // osStore.UseLock for why that makes the old Kind check structural now
 // rather than something this still has to test for.
 func (m *Mem) UseLock(id string) (LockInfo, error) {
+	// Mirrors osStore.UseLock: an empty id must never match.
+	if id == "" {
+		return LockInfo{}, errors.New("a lock id is required: --with-lock names the one lock it may run under")
+	}
 	info, err := m.readLockFile(scratchLock)
 	if err != nil {
 		if err == fs.ErrNotExist {

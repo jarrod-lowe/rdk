@@ -313,3 +313,31 @@ func TestResultDiagnosticCarriesCounts(t *testing.T) {
 		t.Errorf("dir attr = %v, want %q", attrs["dir"], ManagedDir)
 	}
 }
+
+// A lock whose id cannot be read has no --break-lock recovery, so the
+// diagnostic has to name the path instead of printing a command that cannot
+// be typed. Reachable from a lock file truncated by a power loss, or written
+// by a binary older than repofs' complete-or-absent lock creation.
+func TestLockedDiagnosticNamesThePathWhenTheIDIsUnreadable(t *testing.T) {
+	err := repofs.LockedErrorFor(repofs.LockInfo{Held: true, Kind: "apply", Path: ".rdk/apply.lock"})
+	d, ok := LockedDiagnostic(err)
+	if !ok {
+		t.Fatal("LockedDiagnostic returned false")
+	}
+	if !strings.Contains(d.Hint, ".rdk/apply.lock") {
+		t.Errorf("hint = %q, want it to name the path to remove", d.Hint)
+	}
+	if strings.Contains(d.Hint, "--break-lock=") {
+		t.Errorf("hint = %q, still offers a --break-lock that cannot name anything", d.Hint)
+	}
+}
+
+// The ordinary case must keep printing the id, since that is the only
+// argument --break-lock accepts.
+func TestLockedDiagnosticStillPrintsTheIDWhenItIsReadable(t *testing.T) {
+	err := repofs.LockedErrorFor(repofs.LockInfo{Held: true, ID: "9f3a1c4e", Kind: "apply", Path: ".rdk/apply.lock"})
+	d, _ := LockedDiagnostic(err)
+	if !strings.Contains(d.Hint, "--break-lock=9f3a1c4e") {
+		t.Errorf("hint = %q, want it to hand over the id", d.Hint)
+	}
+}

@@ -2404,3 +2404,41 @@ func TestHoldLockRefusesAnUnusableHeldLockPathEvenWhenAnApplyIsRunning(t *testin
 		t.Fatalf("HoldLock err = %v, want ErrLockTarget", err)
 	}
 }
+
+// An empty id is not a compare-and-swap. Accepting it would make BreakLock
+// "remove whatever is there", which is the one thing goal 3 forbids — and it
+// would match a truncated lock file's empty id by accident.
+func TestBreakLockRejectsAnEmptyID(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, scratchApplyLock), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BreakLock(""); err == nil {
+		t.Fatal("BreakLock(\"\") succeeded; an empty id must never match")
+	}
+	if _, err := os.Stat(filepath.Join(root, scratchApplyLock)); err != nil {
+		t.Error("BreakLock(\"\") removed a lock it could not name")
+	}
+}
+
+func TestUnlockAndUseLockRejectAnEmptyID(t *testing.T) {
+	s, root := newTestStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, scratchLock), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Unlock(""); err == nil {
+		t.Error("Unlock(\"\") succeeded")
+	}
+	if _, err := s.UseLock(""); err == nil {
+		t.Error("UseLock(\"\") succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(root, scratchLock)); err != nil {
+		t.Error("a lock with no readable id was removed by an unnamed call")
+	}
+}

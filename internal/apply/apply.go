@@ -166,13 +166,27 @@ func LockedDiagnostic(err error) (diag.Diagnostic, bool) {
 	// it's appended rather than baked into a fixed format — leaving a
 	// dangling colon for kind "apply" (no message) would be its own small
 	// lie.
+	//
+	// info.Kind is now the file the lock was read from rather than the field
+	// inside it (repofs.readLockFile), so this can no longer describe a held
+	// lock as an apply because someone hand-edited a JSON field.
 	var summary, hint string
-	if info.Kind == "held" {
+	switch {
+	case info.ID == "":
+		// No id means no --break-lock: naming the lock is the whole
+		// mechanism, and printing "use --break-lock=" would be printing a
+		// command that cannot work — which is exactly what it used to do. The
+		// path is the only handle left, so the recovery names that instead.
+		// Reachable from a lock file truncated by a power loss or written by
+		// a binary older than the complete-or-absent creation in repofs.
+		summary = fmt.Sprintf("this repository is locked by %s, and the lock file carries no readable id", info.Path)
+		hint = fmt.Sprintf("nothing can name that lock, so --break-lock cannot remove it: if no rdk is running, delete %s", info.Path)
+	case info.Kind == "held":
 		summary = fmt.Sprintf("this repository is locked (lock %s, pid %d on %s since %s)",
 			info.ID, info.PID, info.Host, info.Since)
 		hint = fmt.Sprintf("wait for it to be unlocked; if it is stranded use --break-lock=%s — do not use --with-lock unless this lock is yours",
 			info.ID)
-	} else {
+	default:
 		summary = fmt.Sprintf("another rdk apply is running (lock %s, pid %d on %s since %s)",
 			info.ID, info.PID, info.Host, info.Since)
 		hint = fmt.Sprintf("wait for it; if it is stranded use --break-lock=%s", info.ID)
@@ -191,6 +205,7 @@ func LockedDiagnostic(err error) (diag.Diagnostic, bool) {
 			diag.Str("host", info.Host),
 			diag.Int("pid", info.PID),
 			diag.Str("since", info.Since),
+			diag.Str("lock_path", info.Path),
 		},
 	}, true
 }

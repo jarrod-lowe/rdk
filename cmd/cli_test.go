@@ -1069,3 +1069,47 @@ func TestApplyRejectsWithLockAndBreakLockTogether(t *testing.T) {
 		t.Errorf("--with-lock + --break-lock exit = %d, want 1 (stderr: %s)", gotExit, errOut.String())
 	}
 }
+
+// The blocked-apply error prints "--break-lock=<id>"; --break-lock= with no
+// id used to run a plain apply instead, so a lock with no readable id had a
+// recovery that could not be typed.
+func TestApplyRejectsAnEmptyBreakLock(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run(t, dir, "init"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, dir, "apply", "--break-lock=")
+	if err == nil {
+		t.Fatalf("apply --break-lock= succeeded, want a flag error; output:\n%s", out)
+	}
+	if !strings.Contains(out, "--break-lock") {
+		t.Errorf("output = %q, want it to name the flag", out)
+	}
+}
+
+func TestApplyRejectsAnEmptyWithLock(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run(t, dir, "init"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run(t, dir, "apply", "--with-lock="); err == nil {
+		t.Fatalf("apply --with-lock= succeeded, want a flag error; output:\n%s", out)
+	}
+}
+
+// Giving both flags is an error however they are spelled, including when one
+// of them is empty — otherwise "empty means absent" comes back through the
+// mutual-exclusion check.
+func TestApplyRejectsBothLockFlagsEvenWhenOneIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run(t, dir, "init"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, dir, "apply", "--break-lock=", "--with-lock=abc")
+	if err == nil {
+		t.Fatalf("both flags accepted; output:\n%s", out)
+	}
+	if !strings.Contains(out, "mutually exclusive") {
+		t.Errorf("output = %q, want the mutual-exclusion error", out)
+	}
+}
