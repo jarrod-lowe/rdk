@@ -1,9 +1,11 @@
 # One apply at a time, per repository
 
-**Status:** implemented. Landed in four steps — see "Sequencing" — the third
+**Status:** implemented. Landed in five steps — see "Sequencing" — the third
 of which split one lock file into two (see "Two kinds, two files" and
-"Migration"), and the fourth of which closed a P1 in the split's own
-`--with-lock` path: adding step 5 to "Where the lock sits in the sequence".
+"Migration"), the fourth of which closed a P1 in the split's own
+`--with-lock` path (step 5 of "Where the lock sits in the sequence"), and the
+fifth of which hardened the mechanism against a full audit of it against its
+own goals — see "Stated limits" for what that closed and what it left open.
 
 ## Problem
 
@@ -187,12 +189,14 @@ The match is checked twice, not once: `UseLock` checks it up front (that's
 where the messages above are worded from the CLI's point of view), and
 `Materialize` checks it again after acquiring `.rdk/apply.lock` — see "Where
 the lock sits in the sequence" below. `UseLock` runs before any transaction
-lock exists, so its check alone leaves a window the same width as the one
-between `HoldLock`'s absence check and its own create (see "Stated limits"):
-wide enough for the held lock to be released, or replaced by a different one,
-before this run ever contends for `.rdk/apply.lock`. The second check is what
-makes "id matches" a fact this run can act on rather than a fact it merely
-observed once.
+lock exists, so its check alone leaves a window between that read and step
+4's acquisition of `.rdk/apply.lock` — narrow (a read followed by an
+exclusive create), not zero, the same shape as every other read-then-act gap
+this design accepts rather than closes (see "Stated limits"): wide enough for
+the held lock to be released, or replaced by a different one, before this run
+ever contends for `.rdk/apply.lock`. The second check is what makes "id
+matches" a fact this run can act on rather than a fact it merely observed
+once.
 
 Everyone without the id stays blocked, which is what the holder wanted — and
 two runs both holding the id are no longer everyone: they contend for the
@@ -272,16 +276,39 @@ the per-file manifest hash check for outside files — when that lands.
 6. Stat the managed dir (drives two later decisions)
 7. clear new (and old, when the managed dir exists)
 8. stage into .rdk/new
-9. check the managed dir's parent components
-10. displace by rename, publish by rename
-11. sweep .rdk/old
-12. RELEASE .rdk/apply.lock
+9. re-check this run still holds .rdk/apply.lock   ← last point before anything visible
+10. check the managed dir's parent components
+11. displace by rename, publish by rename
+12. re-check this run still holds .rdk/apply.lock
+13. sweep .rdk/old
+14. RELEASE .rdk/apply.lock, and report a release that fails
 ```
 
-Step 2 sits outside the lock and is safe there: `MkdirAll` is idempotent and the
-symlink check is a read. Writing `.gitignore` is deliberately *inside* it,
-though — it's remove-then-create, so two concurrent runs would otherwise race
-and one would fail `O_EXCL` spuriously.
+Steps 9 and 12 exist because `--break-lock` does not ask whether the lock it
+removes is live, and the blocked-apply error tells the reader to use it when
+they judge the lock stranded — a judgement rdk declines to make for them, and
+which they make with less information than rdk has. Nothing here makes
+breaking a live lock safe. What these two re-reads do is stop the victim from
+completing a tree that would otherwise be interleaved with the breaker's:
+everything before step 9 lives in `.rdk` and is discarded by the next run
+regardless, so a run that has lost its claim by step 9 aborts with nothing
+published (`ErrLockLost`). Step 12 guards the sweep for the mirror reason:
+`.rdk/old` may be the only remaining copy of a tree if another run has since
+failed to publish — and by step 12 this run's own tree is already published,
+so the abort there says so instead of claiming nothing was written. Neither
+check closes the window *between* them: a break landing after step 9 and
+before step 12 still lets the displacing and publishing renames run
+unguarded — see "Stated limits" for that window stated rather than hidden.
+
+Step 2 sits outside the lock and is safe there: `MkdirAll` is idempotent and
+the symlink check is a read. Writing `.gitignore` is part of step 2 and also
+sits outside the lock. It was briefly moved inside, on the reasoning that its
+remove-then-create shape would otherwise let two concurrent runs collide on
+`O_EXCL`; that shape is gone — it writes a temp name and renames it into
+place, so concurrent runs cannot collide and the loser cannot observe a
+half-written file. The write has to happen wherever the scratch directory is
+created, which includes `rdk lock` in a repository that has never been
+applied, so it belongs to `ensureScratchDir` rather than to the locked span.
 
 Step 5 exists because step 3 alone is not enough on the `--with-lock` path.
 `UseLock` (step 3's check, when it runs at all) executes in `cmd`, before
@@ -292,12 +319,32 @@ skipped straight to staging on the strength of `UseLock`'s answer could
 publish while a *different* held lock's owner believed applies were
 excluded — the same shape of corruption the rest of this design exists to
 prevent, just reached through `--with-lock` instead of two ordinary applies.
-Step 5 closes it: once `.rdk/apply.lock` is held, `HoldLock` structurally
-cannot create a new `.rdk/lock` (see "Two kinds, two files"), so a re-read
-taken right here is a fact that stays true for the rest of the run — the
-same reasoning as step 6 below, just one lock earlier. Checking any earlier
-(e.g. folding it into step 3) would leave the same window open, only
-narrower. If the id no longer matches — the lock was replaced — the error is
+
+Step 5 narrows it, and since `HoldLock` began acquiring `.rdk/apply.lock`
+before creating `.rdk/lock` it also closes the gap this paragraph used to
+claim the file layout alone had already closed: two mutually-checking
+creates — `HoldLock` checking `.rdk/apply.lock` is absent, `Materialize`
+checking `.rdk/lock` is absent — can no longer interleave, because `HoldLock`
+now performs its own create under the very lock `Materialize` checks for.
+A re-read taken right here, once that guarantee exists, is a fact that stays
+true for the rest of the run — the same reasoning as step 6 below, just one
+lock earlier. Checking any earlier (e.g. folding it into step 3) would leave
+the same window open, only narrower.
+
+That property is worth stating carefully, because the first version of this
+paragraph asserted it while it was false: `HoldLock` used to read
+`.rdk/apply.lock`, find it absent, and create `.rdk/lock` as two separate
+operations, so the re-read at step 5 was a narrowing and nothing more, and
+the argument for its sufficiency rested on a guarantee that did not exist.
+It holds now because `HoldLock` was changed to make it hold, not because the
+file layout implied it — and even now it is scoped to *this* run's lock, not
+unconditional: `HoldLock`'s own hold on `.rdk/apply.lock` is an ordinary
+transaction lock, breakable exactly like any other once its id has been
+observed, and `HoldLock` does not re-verify it between acquiring and
+creating the held lock the way `Materialize` re-verifies before its own
+destructive steps below. See "Stated limits" for what that leaves open.
+
+If the id no longer matches — the lock was replaced — the error is
 `ErrLocked` naming the new holder, identical in shape to any other run
 colliding with a held lock. If the lock is simply gone, it's a distinct
 plain error: nothing currently holds the repository, so `ErrLocked`'s claim
@@ -347,13 +394,76 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
   a second lock guarding the first — turtles down. The window is two syscalls
   wide, against a `--break-lock` window that spans a human reading an error and
   typing a command, so the id check remains worth having even though it is not
-  airtight. Accepted, not overlooked. `HoldLock`'s check that `.rdk/apply.lock`
-  is absent (see "Two kinds, two files") has the same shape: it is a read of
-  one file followed by an exclusive create of another, not one atomic
-  operation, so an apply could start in the gap between them. Closing it would
-  need the same nonexistent atomic compare-and-create, so it is accepted for
-  the same reason — the window is narrow, and the check exists to catch the
-  ordinary case, not to be airtight against an adversary.
+  airtight. Accepted, not overlooked. `HoldLock` no longer has a window of
+  this shape: it acquires `.rdk/apply.lock` and creates `.rdk/lock` under it,
+  so the two creates that used to check each other's file cannot interleave.
+  It used to, and did — 3 of 3000 trials had `rdk lock` and an apply both
+  return success, the tree published and `.rdk/lock` left standing.
+- **Breaking a live transaction lock still corrupts, in a window one
+  displace-and-publish rename pair wide.** `--break-lock` cannot tell live
+  from stranded, because rdk refuses to guess and the design has no third
+  source of truth. The re-reads at steps 9 and 12 of "Where the lock sits in
+  the sequence" shrink the exposure from "the whole apply" to "between a
+  re-read and the rename pair that follows it" and turn every wider case into
+  a loud abort (`ErrLockLost`) instead of a silent mixture. Closing it
+  entirely would need an atomic compare-and-rename, which does not exist, or
+  the staleness heuristic this design already rules out. Accepted, and the
+  reason `--break-lock`'s own output is louder than `--with-lock`'s: it is
+  the more dangerous of the two.
+- **A lock file with no readable id cannot be broken by `--break-lock`**, and
+  is not meant to be: naming the lock is the whole mechanism, and a command
+  built from an id nobody could read would be a command that cannot work. A
+  lock file is now written to a scratch name, flushed, closed, and only then
+  linked into its visible name, so it is complete the instant it exists; an
+  id-less lock file can now only be reached by one left over from before that
+  guarantee existed, or one truncated by something outside rdk's control (a
+  full disk, a power loss, a hand edit). The diagnostic names the path to
+  delete instead of a command that could not work.
+- **A `rdk lock` that loses the race to another `rdk lock`'s transient window
+  reports "another rdk apply is running", naming the *transaction* lock's id
+  rather than the held lock about to exist.** `HoldLock` holds
+  `.rdk/apply.lock` only for the span of its own create; a second `HoldLock`
+  whose read of `.rdk/lock` lands inside that span sees the winner's
+  transaction lock instead and describes it exactly as it would a genuinely
+  running apply. Misleading — it is rdk's own plumbing, not an apply — but not
+  unsafe: by the time anyone reads the message and acts on that id, the
+  transaction lock is already gone (`HoldLock` has released it), so
+  `--break-lock` against it finds nothing to remove in either file and
+  reports a clean "no lock is held" rather than destroying something live.
+- **Breaking a held lock under a running `--with-lock` apply is not noticed
+  by that apply.** The adopted held lock is verified twice — once by
+  `UseLock`, before any transaction lock exists, and once by `Materialize`
+  itself right after acquiring the transaction lock (step 5) — and never
+  again. The revalidation at steps 9 and 12 only re-reads the transaction
+  lock, not the held one. This is not corruption and not a loss of exclusion:
+  the running apply holds the transaction lock for its whole span, and since
+  `HoldLock` now runs under that same lock, no new held lock and no second
+  apply can start while it does. What is lost is notification — "the
+  repository is held" quietly stops being true partway through the run, and
+  the apply completes and publishes with nobody told. Not corruption; not
+  harmless either — a false promise outlives the run that broke it.
+- **A run that fails at the sweep (`ErrSweep`) and then also fails to release
+  its lock reports only the sweep.** `Materialize`'s deferred release only
+  overrides a *nil* result (see "Where the lock sits in the sequence", step
+  14); an error already being returned keeps priority, on the reasoning that
+  the first failure is the cause and a second one is at most its consequence.
+  A stranded lock in that specific combination is not silent forever — the
+  tree is already correct and a human reads `ErrSweep`'s own message — but
+  the next apply is the first thing to notice the lock itself, far from where
+  the release actually failed.
+- **`HoldLock`'s own hold on `.rdk/apply.lock` has the same unguarded window
+  `Materialize` closes for itself, and does not close it the same way.**
+  Between acquiring the transaction lock and creating the held lock,
+  `HoldLock` does not re-verify it — there is no `checkStillLocked`
+  equivalent here. A `--break-lock` against the id `HoldLock` is holding, if
+  it lands in that narrow span, frees `.rdk/apply.lock` for a fresh
+  `Materialize` to acquire and run genuinely concurrently with `HoldLock`'s
+  own create of `.rdk/lock` — the same shape of race the revalidation above
+  closes for `Materialize`'s own destructive steps, left open here because
+  nothing plays that role for `HoldLock`. What is at risk is narrower than a
+  mixed managed tree, though: the two locks are independent files, so the
+  worst case is the held lock and a fresh apply both existing at once, not a
+  corrupted `rdk-managed/`.
 
 ## Migration
 
@@ -369,12 +479,20 @@ mid-apply when the binary changed underneath it. No migration code; the next
 apply or `rdk lock`/`rdk unlock`/`--break-lock` in that repository simply
 sees a held lock.
 
+That the file's location wins over its own `kind` field is not incidental to
+this one migration case — it is what `readLockFile` guarantees structurally
+for every read, not a rule this call site has to remember: `Kind` and `Path`
+are set from which file was opened, after unmarshalling, overriding whatever
+the JSON claims (see "Two kinds, two files" above).
+
 ## Sequencing
 
-Four steps. The first two share one file format designed for both, so the
+Five steps. The first two share one file format designed for both, so the
 second was a command and a warning rather than a format migration; the third
 splits that one file into two without changing the format or the
-user-visible surface at all; the fourth closes a gap the split itself opened:
+user-visible surface at all; the fourth closes a gap the split itself opened;
+the fifth is a full audit of the mechanism against its own goals, closing
+what it found a fix for and stating what it could not:
 
 1. **The apply lock** — the JSON file, acquire/release in `Materialize`,
    `--break-lock=<id>`, and the signal handler. This was the original P1.
@@ -395,6 +513,21 @@ user-visible surface at all; the fourth closes a gap the split itself opened:
    `.rdk/lock` immediately after acquiring `.rdk/apply.lock` (step 5) and
    refuses unless it still carries the id `UseLock` verified — see that
    step's explanation above.
+5. **Audit hardening** — six defects found by reviewing the mechanism against
+   its own goals: lock paths a symlink could neutralise (`ErrLockTarget`), a
+   lock file observable while empty (write-then-link), an apply able to
+   publish a mixed tree after its lock was broken out from under it
+   (`ErrLockLost`), `rdk lock` succeeding underneath a genuinely running
+   apply (`HoldLock` now runs under the transaction lock), `--break-lock=`
+   with no id silently running a plain apply, and a failed release reported
+   as a success (`ErrLockNotReleased`). Goals 2 and 5 failed outright before
+   this landed. Goal 1 could also be violated — through `--break-lock` on a
+   live lock, which is exactly what the third defect above made possible —
+   so it is not accurate to say goal 1 held throughout; what is accurate is
+   narrower: the revalidation this step added turns that violation from a
+   silent mixed tree into a loud abort in most cases, not into an
+   impossibility. See "Stated limits" for exactly what of that gap is closed
+   and what remains.
 
 ## Consequences
 
