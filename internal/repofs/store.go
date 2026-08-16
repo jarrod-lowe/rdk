@@ -1397,12 +1397,16 @@ func (s *osStore) HoldLock(message string) (info LockInfo, err error) {
 	// shape of bug — a release that failed after the held lock was already
 	// created left rdk lock reporting success with .rdk/apply.lock still on
 	// disk, and every apply or rdk lock after it would then block on a
-	// transaction lock nobody holds. Unlike Materialize, nothing downstream
-	// of this call special-cases ErrLockNotReleased yet — cmd/lock.go only
-	// checks for ErrLockTarget and ErrLocked — so today this surfaces as an
-	// unclassified error (exit 2) rather than a proper diagnostic. That is a
-	// real gap, stated rather than left implicit; closing it is cmd/lock.go's
-	// to do, not this function's.
+	// transaction lock nobody holds. cmd/lock.go's lockHoldError special-cases
+	// that outcome — checking ErrLockNotReleased before its ErrLockTarget
+	// branch, deliberately, since a release that fails because .rdk/apply.lock
+	// itself is unusable wraps both sentinels, and reporting the target
+	// problem first would bury the fact that the held lock already exists —
+	// so this surfaces as a lock-not-released diagnostic at exit 1, not an
+	// unclassified error. That ordering depends on info surviving this
+	// function's own failure path: the named return is assigned by the final
+	// acquireLock above, and this defer only ever overwrites err, never info,
+	// so a caller seeing ErrLockNotReleased still has the real id to report.
 	defer func() {
 		if relErr := s.ReleaseLock(); relErr != nil && err == nil {
 			err = relErr
