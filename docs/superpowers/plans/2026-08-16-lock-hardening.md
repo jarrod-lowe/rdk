@@ -1773,9 +1773,11 @@ Run: `go test ./internal/repofs/ -run 'CouldNotRelease|ReadFailureAsSuccess' -v`
 
 Expected: FAIL — `undefined: ErrLockNotReleased`, and `ReleaseLock` returns nil on a read failure.
 
-- [ ] **Step 2b: Add this task's seam**
+- [ ] **Step 2b: Add this task's seam, and pay Task 3's debt with it**
 
 Add `afterPublish` to `internal/repofs/seams.go`, with the doc comment shown in Task 2's listing.
+
+Task 3 left a debt this seam is what settles. Its second revalidation — the one guarding the sweep of `.rdk/old` — can be deleted today with the whole suite still green, because nothing can reach it through `Materialize`: Task 3's tests exercise it by calling `checkStillLockedAfterPublish` directly, which asserts the message rather than the guard. `afterPublish` fires at exactly the point that makes it reachable. Add a test that breaks this run's lock from inside the seam and asserts `Materialize` returns `ErrLockLost` **and** that `.rdk/old` still exists — the whole point of that guard is that a run whose claim is gone must not sweep away what may now be another run's only copy. Verify it fails with that revalidation removed, not merely that it passes with it present.
 
 - [ ] **Step 3: Add the sentinel**
 
