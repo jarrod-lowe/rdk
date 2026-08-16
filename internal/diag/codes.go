@@ -43,6 +43,7 @@ const (
 	CodeApplyLocked        = "apply-locked"
 	CodeLockMismatch       = "lock-mismatch"
 	CodeLockTarget         = "lock-target"
+	CodeLockLost           = "lock-lost"
 	CodeLockHeld           = "lock-held"
 	CodeUnlocked           = "unlocked"
 	CodeOutputFailed       = "output-failed"
@@ -62,6 +63,6 @@ var all = []string{
 	CodeScratchNotRemoved, CodeScratchTarget, CodeUnsafePath, CodeSeedNotAFile, CodeSeedFailed,
 	CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal, CodeInvalidFlag,
-	CodeApplyLocked, CodeLockMismatch, CodeLockTarget, CodeLockHeld, CodeUnlocked,
+	CodeApplyLocked, CodeLockMismatch, CodeLockTarget, CodeLockLost, CodeLockHeld, CodeUnlocked,
 	CodeOutputFailed,
 }

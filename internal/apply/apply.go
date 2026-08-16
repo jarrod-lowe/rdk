@@ -90,6 +90,21 @@ func Run(store repofs.Store, version string) (Result, error) {
 		if d, ok := LockTargetDiagnostic(err); ok {
 			return Result{}, diag.Wrap(err, d)
 		}
+		if errors.Is(err, repofs.ErrLockLost) {
+			// Not apply-locked: this run was not refused a lock, it held one
+			// and had it taken away mid-flight. Saying "another apply is
+			// running" would send the reader looking for a queue to wait in,
+			// when what actually happened is that something destroyed this
+			// run's claim. The hint does not say "nothing was written": the
+			// revalidation this wraps fires at two different points, and at
+			// the later one the tree has already been published — the cause
+			// below says which, so the hint only needs to point there.
+			return Result{}, diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeLockLost,
+				Summary: "this apply's lock was broken while it was running",
+				Hint:    "read the cause above for what, if anything, was published, then re-run — and check who is using --break-lock on a live lock",
+			})
+		}
 		if errors.Is(err, repofs.ErrLocked) {
 			// No Cause here (diag.New, not diag.Wrap): the wrapped error's own
 			// text is the same holder details in a different shape, and setting

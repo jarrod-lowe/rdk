@@ -238,6 +238,30 @@ func (e *lockTargetError) Error() string        { return e.err.Error() }
 func (e *lockTargetError) Unwrap() error        { return e.err }
 func (e *lockTargetError) Is(target error) bool { return target == ErrLockTarget }
 
+// ErrLockLost reports that this run's transaction lock was removed or
+// replaced while the run was still going. It is not ErrLocked: this is not a
+// run that failed to start, it is a run that had already started under a
+// claim someone then destroyed — most often --break-lock used on a live lock,
+// which the blocked-apply error itself invites, since rdk refuses to guess
+// whether a lock is stranded and the reader has less information than rdk
+// does. The only thing rdk can do about that from here is refuse to be the
+// second half of the corruption: abort loudly rather than complete a tree
+// that will be interleaved with another run's. Almost always that means
+// nothing was published — but checkStillLocked's second call runs after this
+// run's own publish has already succeeded, so on that path the tree itself is
+// fine and what the abort actually skips is the sweep that would otherwise
+// clear .rdk/old; see checkStillLocked's doc comment for which is which.
+var ErrLockLost = errors.New("this apply's lock was broken while it was running")
+
+// lockLostError names the lock that holds the repository now, when there is
+// one: that is the id the reader has to act on, not the dead id this run was
+// carrying.
+type lockLostError struct{ err error }
+
+func (e *lockLostError) Error() string        { return e.err.Error() }
+func (e *lockLostError) Unwrap() error        { return e.err }
+func (e *lockLostError) Is(target error) bool { return target == ErrLockLost }
+
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
 type Store interface {
@@ -562,6 +586,27 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		}
 	}
 
+	if afterStaging != nil {
+		afterStaging()
+	}
+
+	// Revalidated here, at the last moment before anything irreversible: the
+	// staging above writes only into .rdk/new, which every run discards and
+	// rewrites unconditionally, so up to this point losing the lock costs the
+	// user's visible tree nothing — that claim is scoped to managedDir on
+	// purpose, not to this run's own bookkeeping: a run that has genuinely
+	// taken over the lock can still race this run's .rdk/new with its own
+	// pre-staging clear, in which case the renames below fail loudly as
+	// ErrPublish rather than silently corrupting managedDir. From the
+	// displacing rename onward every step is visible in the user's tree, so a
+	// run whose claim is gone has to stop rather than interleave its output
+	// with whoever holds the repository now. This narrows the corruption
+	// window --break-lock opens on a live lock to the displace-and-publish
+	// rename pair; it does not close it — see checkStillLocked's doc comment.
+	if err := s.checkStillLockedBeforePublish(); err != nil {
+		return err
+	}
+
 	// Both renames below walk managedDir's parent chain the same way MkdirAll
 	// does, so an intermediate symlink would land the tree in whatever
 	// directory it points to, not managedDir. Every caller today passes a
@@ -590,8 +635,15 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		return &publishError{err: err}
 	}
 
-	// Past this point the tree on disk is correct, so the caller must say so
-	// even while reporting this failure.
+	// Checked again before the sweep, which is irreversible in a different
+	// direction: .rdk/old is the previous tree, and if this run's lock was
+	// broken after publishing, that copy may now be the only thing standing
+	// between another run's failed publish and a lost tree. Past this point
+	// the tree on disk is correct, so the caller must say so even while
+	// reporting a failure.
+	if err := s.checkStillLockedAfterPublish(); err != nil {
+		return err
+	}
 	if err := s.root.RemoveAll(scratchOld); err != nil {
 		return &sweepError{err: err}
 	}
@@ -942,6 +994,91 @@ func (s *osStore) ReleaseLock() error {
 	s.lockHeld = false
 	return nil
 }
+
+// checkStillLocked verifies this run still holds the transaction lock it
+// acquired. Called immediately before each irreversible step, because between
+// acquiring and here someone may have run --break-lock on a live lock —
+// which the blocked-apply error tells them to do when they judge it stranded,
+// a judgement rdk deliberately declines to make for them.
+//
+// This narrows the corruption window to the displace-and-publish rename
+// pair; it does not close it. Closing it would need an atomic
+// compare-and-rename, which does not exist, or a staleness heuristic, which
+// the design rules out (rule 12: the limit ships with the flexibility). What
+// it does buy is that the common case — a person breaking a lock they
+// believed dead, seconds or minutes before the victim's renames — stops
+// being silent, and a mixed tree becomes a loud error instead.
+//
+// published tells the message which of the two call sites this is, because
+// "nothing was published" stops being true at the second one: it runs after
+// the publishing rename has already succeeded. Even then the message must not
+// name .rdk/old as if a previous tree were sitting there: the displacing
+// rename that would have put one there only runs when managedDir already
+// existed (see managedExists in Materialize), so on a first apply into a
+// fresh repository .rdk/old was never populated by this run at all. What is
+// true in every published case, regardless of managedExists, is only that the
+// sweep which would otherwise clear .rdk/old did not run — so that is the
+// only claim the message makes.
+func (s *osStore) checkStillLocked(published bool) error {
+	s.lockMu.Lock()
+	held, id := s.lockHeld, s.lockID
+	s.lockMu.Unlock()
+	if !held {
+		// Defensive, not a dead branch: ordinarily Materialize acquires the
+		// transaction lock before staging, so this run's own goroutine cannot
+		// reach checkStillLocked without holding one. But ReleaseLock also
+		// runs from the SIGINT/SIGTERM handler's own goroutine (handleSignals
+		// in cmd/root.go), which clears lockHeld before it calls os.Exit —
+		// not atomically with the exit itself — so a signal landing at the
+		// right instant can flip held to false while this goroutine is still
+		// executing Materialize. Narrow, and harmless here since the process
+		// is already on its way out, but a real way to arrive, not a
+		// cannot-happen one; answering "fine" over it would be the dangerous
+		// way to be wrong.
+		return &lockLostError{err: errors.New("this apply is not holding a lock")}
+	}
+	switch info, err := s.readLockFile(scratchApplyLock); {
+	case err == nil && info.ID == id:
+		return nil
+	case err == nil && published:
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running, and %s holds the repository now: this apply's tree was already published and is correct, but the sweep of %s was skipped — re-run to clean up anything left there", id, info.ID, scratchOld)}
+	case err == nil:
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running, and %s holds the repository now: nothing was published, re-run when it is free", id, info.ID)}
+	case os.IsNotExist(err) && published:
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running, after its tree was already published (which is correct): the sweep of %s was skipped — re-run to clean up anything left there", id, scratchOld)}
+	case os.IsNotExist(err):
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running: nothing was published, re-run", id)}
+	case published:
+		// Unexpected and not classified as ErrLockTarget (readLockFile
+		// already refuses a non-regular file that way, above this switch's
+		// reach) or as one of the two cases handled above, so this is a
+		// filesystem failure this code did not anticipate. Reported as
+		// ErrSweep — not left bare — because the consequence and the fix are
+		// identical to a sweep that genuinely failed: the publish already
+		// succeeded, .rdk/old is left exactly where a failed RemoveAll would
+		// leave it, and "the tree is correct; clear .rdk/old, then re-run" is
+		// the right instruction regardless of which of the two stopped the
+		// clearing from happening. Leaving it bare would fall through to
+		// apply.Run's generic write-managed-dir fallback, which claims the
+		// write itself failed — false once the publish has already
+		// succeeded.
+		return &sweepError{err: err}
+	default:
+		// Same unexpected failure, but before publishing: nothing has been
+		// written to the user's tree yet, so the generic write-managed-dir
+		// fallback this bare error reaches in apply.Run is not making a false
+		// claim the way the published case above would be.
+		return err
+	}
+}
+
+// checkStillLockedBeforePublish and checkStillLockedAfterPublish name
+// checkStillLocked's two call sites so a reader at either one sees which
+// question is being asked without following the bool to its doc comment.
+// Both share the one implementation (rule 7) rather than duplicating its
+// branching under two names.
+func (s *osStore) checkStillLockedBeforePublish() error { return s.checkStillLocked(false) }
+func (s *osStore) checkStillLockedAfterPublish() error  { return s.checkStillLocked(true) }
 
 // BreakLock removes a lock only if its id matches, and returns what it
 // found. The id is required so this can never be "remove whatever is

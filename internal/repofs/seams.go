@@ -21,3 +21,22 @@ package repofs
 // else, which is safe; a future callback needs to keep that constraint in
 // mind rather than assume the mutex is free.
 var afterLockOwnershipRecorded func()
+
+// afterStaging is a test seam. Nil in production, so it costs one nil check
+// on a path that already does filesystem work.
+//
+// It exists because the window it lets a test hit — this run's transaction
+// lock broken or replaced after staging but before the destructive renames —
+// is, by construction, between two syscalls: a test that tried to race it
+// with goroutines would be timing-dependent, and a timing-dependent test for
+// a timing bug is one that passes on the machine where the bug is worst. This
+// makes the window itself reachable on demand instead. It is a package-level
+// var rather than a field on osStore for the same reason as
+// afterLockOwnershipRecorded: nothing outside this package can set it, and
+// nothing inside sets it except a test.
+//
+// Fires inside Materialize once the new tree is fully staged in .rdk/new and
+// before checkStillLocked's first call. A test uses it to break (or break and
+// replace) this run's lock at the exact point where doing so used to produce
+// a mixed tree in silence.
+var afterStaging func()

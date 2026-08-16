@@ -79,6 +79,11 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 			return err
 		}
 	}
+	// Mirrors osStore.Materialize: the last point before anything the caller
+	// can observe changes.
+	if err := m.checkStillLocked(); err != nil {
+		return err
+	}
 	prefix := managedDir + "/"
 	for p := range m.files {
 		if strings.HasPrefix(p, prefix) {
@@ -201,6 +206,43 @@ func (m *Mem) ReleaseLock() error {
 	delete(m.files, scratchApplyLock)
 	m.lockHeld = false
 	return nil
+}
+
+// checkStillLocked mirrors osStore's pre-publish check only.
+//
+// Where the mirror stops: osStore calls this twice — once before the renames
+// and again before the sweep — with a published bool that changes what the
+// message can honestly say once the tree has already been written. Mem has
+// no publish/sweep split to mirror: Materialize replaces m.files with a
+// single unconditional set of map writes (see Materialize's own doc
+// comment), so there is only ever one point in Mem's Materialize where this
+// applies, and it is always the pre-publish one — the published axis simply
+// does not exist here, not just isn't modelled.
+//
+// It also cannot return non-nil through Mem.Materialize today: everything
+// between acquiring the lock and calling this is a read
+// (checkNoOutsideEntries, the two readLockFile calls above), and Mem has no
+// seam and no second goroutine to change m.lockHeld or the map underneath a
+// single-threaded call (see the struct's own doc comment), so this always
+// finds exactly what Materialize just acquired. Kept anyway, mirroring
+// osStore's shape rather than osStore's reachability, and callable directly
+// by a test that plants a broken or replaced lock in the map first — the
+// same way the direct tests against osStore's checkStillLocked do, without
+// going through Materialize.
+func (m *Mem) checkStillLocked() error {
+	if !m.lockHeld {
+		return &lockLostError{err: errors.New("this apply is not holding a lock")}
+	}
+	switch info, err := m.readLockFile(scratchApplyLock); {
+	case err == nil && info.ID == m.lockID:
+		return nil
+	case err == nil:
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running, and %s holds the repository now: nothing was published, re-run when it is free", m.lockID, info.ID)}
+	case err == fs.ErrNotExist:
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running: nothing was published, re-run", m.lockID)}
+	default:
+		return err
+	}
 }
 
 // BreakLock mirrors osStore.BreakLock: the id is required, checked against

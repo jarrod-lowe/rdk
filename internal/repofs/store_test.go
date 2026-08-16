@@ -1986,3 +1986,213 @@ func TestAcquireLockLeavesNoTemporaryFiles(t *testing.T) {
 		}
 	}
 }
+
+// The corruption this exists to stop: --break-lock on a live transaction
+// lock, which the blocked-apply error actively instructs the user to do.
+// Nothing may be published after this run's claim is gone.
+func TestMaterializeAbortsWhenItsLockIsBrokenBeforePublishing(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	add(t, first, Managed("keep.txt"), []byte("original"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+
+	afterStaging = func() {
+		if err := os.Remove(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { afterStaging = nil })
+
+	second := NewFileSet()
+	add(t, second, Managed("new.txt"), []byte("replacement"))
+	err := s.Materialize("managed", second)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Materialize err = %v, want ErrLockLost", err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, "managed", "keep.txt"))
+	if readErr != nil {
+		t.Fatalf("the published tree was disturbed after the lock was lost: %v", readErr)
+	}
+	if string(got) != "original" {
+		t.Errorf("keep.txt = %q, want the tree left exactly as it was", got)
+	}
+}
+
+// A lock that was broken and replaced is the same abort, and the message has
+// to name the lock that holds the repository now — that is the id the reader
+// needs, not the dead one this run was carrying.
+func TestMaterializeAbortsWhenItsLockWasBrokenAndReplaced(t *testing.T) {
+	s, root := newTestStore(t)
+	afterStaging = func() {
+		if err := os.Remove(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+			t.Error(err)
+		}
+		writeApplyLock(t, root, LockInfo{ID: "beefbeefbeefbeef", Kind: lockKindApply, PID: 99, Host: "other", Since: "2026-08-16T00:00:00Z"})
+	}
+	t.Cleanup(func() { afterStaging = nil })
+
+	set := NewFileSet()
+	add(t, set, Managed("a.txt"), []byte("a"))
+	err := s.Materialize("managed", set)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Materialize err = %v, want ErrLockLost", err)
+	}
+	if !strings.Contains(err.Error(), "beefbeefbeefbeef") {
+		t.Errorf("err = %q, want it to name the lock that holds the repository now", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, "managed")); !os.IsNotExist(statErr) {
+		t.Error("published a tree after this run's lock was replaced")
+	}
+}
+
+// The revalidation must not fire on the ordinary path, where nothing has
+// touched the lock.
+func TestMaterializeStillSucceedsWhenItsLockIsUntouched(t *testing.T) {
+	s, root := newTestStore(t)
+	set := NewFileSet()
+	add(t, set, Managed("a.txt"), []byte("a"))
+	if err := s.Materialize("managed", set); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "managed", "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkStillLocked's message must not claim "nothing was published" once
+// this run's own publishing rename has already succeeded — that claim would
+// be false at the call site right before the sweep, which only ever runs
+// after the publish. Exercised directly against checkStillLocked rather than
+// through Materialize: reaching that call site with a broken lock needs a
+// seam between publish and the sweep, and that seam (afterPublish) belongs to
+// a later task in this series, not this one.
+func TestCheckStillLockedDoesNotClaimNothingWasPublishedAfterItWas(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh-repo shape, deliberately: no prior Materialize ever ran here, so
+	// .rdk/old was never populated — the displacing rename that would put a
+	// previous tree there only runs when managedDir already existed. A
+	// message that claimed a previous tree was "left in place" would be false
+	// in exactly this shape, which is why the assertions below check for that
+	// specifically rather than just checking for *some* mention of .rdk/old.
+	if _, statErr := os.Stat(filepath.Join(root, ScratchDir, "old")); !os.IsNotExist(statErr) {
+		t.Fatalf(".rdk/old already exists; this test needs it absent to prove the message doesn't assume it exists")
+	}
+
+	err := st.checkStillLocked(true)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("checkStillLocked(true) err = %v, want ErrLockLost", err)
+	}
+	if strings.Contains(err.Error(), "nothing was published") {
+		t.Errorf("err = %q, claims nothing was published after the publish already succeeded", err)
+	}
+	if !strings.Contains(err.Error(), "already published") {
+		t.Errorf("err = %q, want it to say this run's own tree was already published", err)
+	}
+	if strings.Contains(err.Error(), "previous tree") || strings.Contains(err.Error(), "was left in place") {
+		t.Errorf("err = %q, asserts a previous tree exists at .rdk/old when this run never created one", err)
+	}
+	if !strings.Contains(err.Error(), "skipped") {
+		t.Errorf("err = %q, want it to say the sweep was skipped rather than claim what state .rdk/old is in", err)
+	}
+}
+
+// The same call, before publishing, must still say nothing was published —
+// confirming the two messages actually differ rather than one silently
+// subsuming the other.
+func TestCheckStillLockedClaimsNothingWasPublishedBeforeItWas(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := st.checkStillLocked(false)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("checkStillLocked(false) err = %v, want ErrLockLost", err)
+	}
+	if !strings.Contains(err.Error(), "nothing was published") {
+		t.Errorf("err = %q, want it to say nothing was published", err)
+	}
+}
+
+// After publishing, an unexpected failure while re-checking the lock (not
+// "gone", not "replaced" — something readLockFile could not even classify)
+// must not fall through to apply.Run's generic write-managed-dir fallback:
+// the write already succeeded, so "cannot write" would be false. Reported as
+// ErrSweep instead, because the consequence and the fix are identical to a
+// sweep that genuinely failed to clear .rdk/old.
+func TestCheckStillLockedAfterPublishReportsAnUnexpectedReadFailureAsASweepFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(root, ScratchDir, "apply.lock")
+	if err := os.Chmod(lockPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(lockPath, 0o644) })
+
+	err := st.checkStillLocked(true)
+	if !errors.Is(err, ErrSweep) {
+		t.Fatalf("checkStillLocked(true) err = %v, want ErrSweep", err)
+	}
+	if errors.Is(err, ErrLockLost) {
+		t.Errorf("err = %v, an unexplained read failure is not a confirmed lock loss and must not claim to be one", err)
+	}
+}
+
+// The same failure before publishing is left bare and unclassified: the
+// generic write-managed-dir fallback it reaches in apply.Run is not making a
+// false claim there, since nothing has been written to the user's tree yet.
+func TestCheckStillLockedBeforePublishLeavesAnUnexpectedReadFailureUnclassified(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(root, ScratchDir, "apply.lock")
+	if err := os.Chmod(lockPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(lockPath, 0o644) })
+
+	err := st.checkStillLocked(false)
+	if err == nil {
+		t.Fatal("want an error when the lock file cannot be read")
+	}
+	if errors.Is(err, ErrSweep) || errors.Is(err, ErrLockLost) {
+		t.Errorf("checkStillLocked(false) err = %v, want a bare unclassified error, not ErrSweep or ErrLockLost", err)
+	}
+}
