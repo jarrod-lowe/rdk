@@ -389,6 +389,8 @@ describe it as the other thing."
 
 The fix uses the pattern `seedNew` already uses (rule 7): write the whole record to a scratch name, `Sync`, `Close`, then `Link` it into place. `link()` fails with `EEXIST` if anything is there, so it is exactly as exclusive as `O_CREAT|O_EXCL` — and on NFS it is the more reliable of the two, which strengthens goal 4 rather than trading it away. Ownership is recorded *before* the link and cleared if the link fails, so there is no ordering in which the handler can see a lock it does not know is its own.
 
+**What Task 1 already changed under this task's feet:** `acquireLock`'s signature is now `acquireLock(file, message string)` — the `kind` argument was dropped once `lockKindFor(file)` became the single authority for a lock's kind — and its pre-create guard is `lockPathUsable(file)`, not a `readLockFile` call. The listings below are written against that. Read the current `internal/repofs/store.go` rather than assuming; where this plan and the code disagree, the code is right and the disagreement is worth reporting.
+
 **Files:**
 - Modify: `internal/repofs/store.go`
 - Test: `internal/repofs/store_test.go`
@@ -433,7 +435,7 @@ func TestLockFileIsCompleteTheInstantItIsVisible(t *testing.T) {
 	}()
 
 	for i := 0; i < 200; i++ {
-		if _, err := st.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+		if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.ReleaseLock(); err != nil {
@@ -464,7 +466,7 @@ func TestAcquireLockRecordsOwnershipBeforeTheLockIsVisible(t *testing.T) {
 	}
 	t.Cleanup(func() { afterLockOwnershipRecorded = nil })
 
-	if _, err := st.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
 		t.Fatal(err)
 	}
 	if !<-seen {
@@ -488,7 +490,7 @@ func TestAcquireLockClearsOwnershipWhenItLosesTheRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeApplyLock(t, root, sampleLock(lockKindApply))
-	if _, err := st.acquireLock(scratchApplyLock, lockKindApply, ""); !errors.Is(err, ErrLocked) {
+	if _, err := st.acquireLock(scratchApplyLock, ""); !errors.Is(err, ErrLocked) {
 		t.Fatalf("acquireLock err = %v, want ErrLocked", err)
 	}
 	st.lockMu.Lock()
@@ -514,7 +516,7 @@ func TestAcquireLockDoesNotClaimOwnershipOfAHeldLock(t *testing.T) {
 	if err := st.ensureScratchDir(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.acquireLock(scratchLock, lockKindHeld, "work"); err != nil {
+	if _, err := st.acquireLock(scratchLock, "work"); err != nil {
 		t.Fatal(err)
 	}
 	st.lockMu.Lock()
@@ -533,7 +535,7 @@ func TestAcquireLockLeavesNoTemporaryFiles(t *testing.T) {
 	if err := st.ensureScratchDir(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.ReleaseLock(); err != nil {
@@ -611,9 +613,10 @@ Replace the body of `acquireLock` in `internal/repofs/store.go` (keep the existi
 
 ```go
 // acquireLock takes a lock by making it appear atomically and complete —
-// scratchLock for a held lock, scratchApplyLock for a transaction lock; kind
-// is recorded in the JSON as which one this was (see the Kind field's doc
-// comment), but file is what actually governs.
+// scratchLock for a held lock, scratchApplyLock for a transaction lock. The
+// file is the only input: the kind recorded in the JSON is derived from it
+// (see the Kind field's doc comment), so there is no way for a caller to
+// write a record that disagrees with where it lives.
 //
 // The record is written to a scratch name, flushed, closed, and only then
 // linked into place. link() fails with EEXIST if anything is already at the
@@ -647,12 +650,9 @@ Replace the body of `acquireLock` in `internal/repofs/store.go` (keep the existi
 // (see HoldLock), because the second acquisition would overwrite the first's
 // id and the deferred release would then fail its own id compare and strand
 // the transaction lock.
-func (s *osStore) acquireLock(file, kind, message string) (LockInfo, error) {
-	// Checked before creating, not just when reading: the exclusive create
-	// refuses a symlink with EEXIST, which is indistinguishable from a real
-	// lock being present — so without this the caller would report "another
-	// apply is running" about a lock that does not exist and cannot be named.
-	if _, err := s.readLockFile(file); err != nil && !os.IsNotExist(err) {
+func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
+	// Keep Task 1's guard exactly as it stands — it is already correct here.
+	if err := s.lockPathUsable(file); err != nil {
 		return LockInfo{}, err
 	}
 	idBytes := make([]byte, 8)
@@ -661,7 +661,7 @@ func (s *osStore) acquireLock(file, kind, message string) (LockInfo, error) {
 	}
 	info := LockInfo{
 		ID:      hex.EncodeToString(idBytes),
-		Kind:    kind,
+		Kind:    lockKindFor(file),
 		Host:    hostname(),
 		PID:     os.Getpid(),
 		Since:   time.Now().UTC().Format(time.RFC3339),
@@ -1294,7 +1294,7 @@ func (s *osStore) HoldLock(message string) (LockInfo, error) {
 	if err := s.ensureScratchDir(); err != nil {
 		return LockInfo{}, err
 	}
-	if _, err := s.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := s.acquireLock(scratchApplyLock, ""); err != nil {
 		// A held lock takes precedence in the message when there is one: two
 		// rdk locks racing means the loser briefly collides with the winner's
 		// transaction lock, and reporting "another rdk apply is running"
@@ -1313,7 +1313,7 @@ func (s *osStore) HoldLock(message string) (LockInfo, error) {
 	if afterApplyLockHeldByHoldLock != nil {
 		afterApplyLockHeldByHoldLock()
 	}
-	return s.acquireLock(scratchLock, lockKindHeld, message)
+	return s.acquireLock(scratchLock, message)
 }
 ```
 
@@ -1328,7 +1328,7 @@ Replace `Mem.HoldLock` in `internal/repofs/mem.go`:
 // on the sequence and not merely on the end state — otherwise a component
 // test could describe an ordering production does not have.
 func (m *Mem) HoldLock(message string) (LockInfo, error) {
-	if _, err := m.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := m.acquireLock(scratchApplyLock, ""); err != nil {
 		if errors.Is(err, ErrLocked) {
 			if held, readErr := m.readLockFile(scratchLock); readErr == nil {
 				return LockInfo{}, lockedErrorFor(held)
@@ -1337,7 +1337,7 @@ func (m *Mem) HoldLock(message string) (LockInfo, error) {
 		return LockInfo{}, err
 	}
 	defer m.ReleaseLock()
-	return m.acquireLock(scratchLock, lockKindHeld, message)
+	return m.acquireLock(scratchLock, message)
 }
 ```
 
@@ -1734,7 +1734,7 @@ func TestReleaseLockDoesNotTreatAReadFailureAsSuccess(t *testing.T) {
 	if err := st.ensureScratchDir(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.acquireLock(scratchApplyLock, lockKindApply, ""); err != nil {
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
 		t.Fatal(err)
 	}
 	// A directory where the lock file was: readLockFile refuses it (Task 1),
