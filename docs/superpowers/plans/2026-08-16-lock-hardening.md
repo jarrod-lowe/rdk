@@ -42,7 +42,7 @@ Tasks 1–5 restore goals 1, 2 and 5. Nothing in this plan may weaken goals 3, 4
 | File | Change |
 |---|---|
 | `internal/repofs/store.go` | All five fixes. Gains `ErrLockTarget`, `ErrLockLost`, `ErrLockNotReleased` and their error types; `readLockFile` gains an Lstat guard and becomes authoritative for `Kind`/`Path`; `acquireLock` becomes write-then-link; `Materialize` revalidates ownership before the destructive renames; `HoldLock` runs under the transaction lock. |
-| `internal/repofs/seams.go` | **New.** Two package-level test seams, nil in production, that let the destructive-window tests be deterministic instead of timing-dependent. |
+| `internal/repofs/seams.go` | **New in Task 2, then grown one seam at a time.** Package-level test seams, nil in production, that let the destructive-window tests be deterministic instead of timing-dependent. Each task adds only the seam it uses: a seam whose comment describes behaviour not yet in the tree is a comment that is fiction, which this repo's standard forbids. Task 2 adds `afterLockOwnershipRecorded`, Task 3 `afterStaging`, Task 4 `afterApplyLockHeldByHoldLock`, Task 6 `afterPublish`. |
 | `internal/repofs/mem.go` | Mirrors every semantic change so a component test cannot pass against the fake while misrepresenting production. |
 | `internal/repofs/store_test.go` | Tests for Tasks 1–6. |
 | `internal/repofs/mem_test.go` | Mirror tests where `Mem` can express the behaviour. |
@@ -392,8 +392,10 @@ The fix uses the pattern `seedNew` already uses (rule 7): write the whole record
 **What Task 1 already changed under this task's feet:** `acquireLock`'s signature is now `acquireLock(file, message string)` — the `kind` argument was dropped once `lockKindFor(file)` became the single authority for a lock's kind — and its pre-create guard is `lockPathUsable(file)`, not a `readLockFile` call. The listings below are written against that. Read the current `internal/repofs/store.go` rather than assuming; where this plan and the code disagree, the code is right and the disagreement is worth reporting.
 
 **Files:**
+- Create: `internal/repofs/seams.go`
 - Modify: `internal/repofs/store.go`
-- Test: `internal/repofs/store_test.go`
+- Modify: `internal/repofs/mem.go` (Step 5 — the ownership scoping Task 4 depends on)
+- Test: `internal/repofs/store_test.go`, `internal/repofs/mem_test.go`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -563,12 +565,12 @@ Expected: FAIL — `undefined: afterLockOwnershipRecorded`, and `TestAcquireLock
 
 - [ ] **Step 3: Create the test seams file**
 
-Create `internal/repofs/seams.go`:
+Create `internal/repofs/seams.go` with **only `afterLockOwnershipRecorded`**. Tasks 3, 4 and 6 each add their own seam when the behaviour it describes actually exists — a seam declared ahead of its use is a doc comment asserting something the tree does not do, which is the defect this repo's comment standard exists to prevent. The other three are shown here greyed into the same file so their final shape is on record, not so they are written now.
 
 ```go
 package repofs
 
-// Test seams. Both are nil in production and are called only if set, so they
+// Test seams. All are nil in production and are called only if set, so they
 // cost one nil check on paths that already do filesystem work.
 //
 // They exist because the windows this package's hardest bugs live in are, by
@@ -943,6 +945,10 @@ Run: `go test ./internal/repofs/ -run 'AbortsWhenItsLock|StillSucceedsWhenItsLoc
 
 Expected: FAIL — `undefined: ErrLockLost`, `undefined: afterStaging` is already defined by Task 2 so the failure is the sentinel and, once stubbed, a mixed tree.
 
+- [ ] **Step 3: Add this task's seam**
+
+Add `afterStaging` to `internal/repofs/seams.go`, with the doc comment shown in Task 2's listing. It is added now rather than in Task 2 because only now does the behaviour it describes exist.
+
 - [ ] **Step 3: Add the sentinel**
 
 In `internal/repofs/store.go`, after the `ErrLockTarget` block:
@@ -1260,6 +1266,10 @@ func TestHoldLockStillReportsARunningApply(t *testing.T) {
 Run: `go test ./internal/repofs/ -run 'HoldLock' -v`
 
 Expected: FAIL — `TestHoldLockExcludesAnApplyWhileItCreatesTheHeldLock` fails because the seam is never called and the apply succeeds; `TestHoldLockTwiceReportsTheHeldLock` passes already (keep it as a regression guard for the new failure wording).
+
+- [ ] **Step 3: Add this task's seam**
+
+Add `afterApplyLockHeldByHoldLock` to `internal/repofs/seams.go`, with the doc comment shown in Task 2's listing.
 
 - [ ] **Step 3: Rewrite `HoldLock`**
 
@@ -1762,6 +1772,10 @@ func TestReleaseLockDoesNotTreatAReadFailureAsSuccess(t *testing.T) {
 Run: `go test ./internal/repofs/ -run 'CouldNotRelease|ReadFailureAsSuccess' -v`
 
 Expected: FAIL — `undefined: ErrLockNotReleased`, and `ReleaseLock` returns nil on a read failure.
+
+- [ ] **Step 2b: Add this task's seam**
+
+Add `afterPublish` to `internal/repofs/seams.go`, with the doc comment shown in Task 2's listing.
 
 - [ ] **Step 3: Add the sentinel**
 
