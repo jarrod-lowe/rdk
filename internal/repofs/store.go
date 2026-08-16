@@ -218,14 +218,6 @@ func lockedErrorFor(info LockInfo) error {
 	return &lockedError{err: fmt.Errorf("%w (%s)", ErrLocked, describeLock(info)), info: info}
 }
 
-// LockedErrorFor builds the same blocked-by-a-lock error every path inside
-// this package produces, from a LockInfo the caller already has. It exists
-// for tests in other packages — apply's diagnostic rendering, principally,
-// which has to be able to render a lock whose id is unreadable without
-// arranging one on a real filesystem. lockedError stays unexported so that
-// the only production source of ErrLocked remains inside this package.
-func LockedErrorFor(info LockInfo) error { return lockedErrorFor(info) }
-
 // ErrLockTarget reports that a lock path exists as something other than a
 // regular file. It is separate from ErrLocked because nothing is actually
 // holding the repository: a dangling symlink at .rdk/lock reads as absent to
@@ -358,7 +350,12 @@ type Store interface {
 	// automatic releases it — see ReleaseLock. Refuses while the transaction
 	// lock is held: an apply is then genuinely in flight, and rdk lock
 	// returning success while that is true would be exactly the lie the
-	// feature exists to prevent.
+	// feature exists to prevent. It also briefly takes the transaction lock
+	// itself while it creates the held one, and releases it before
+	// returning; if that release fails, the returned LockInfo is still the
+	// held lock this call genuinely created — the error wraps
+	// ErrLockNotReleased, the same sentinel Materialize uses, so the caller
+	// is not told the whole call failed when only the cleanup did.
 	HoldLock(message string) (LockInfo, error)
 	// Unlock ends a held lock, and only ever writes to the held lock file.
 	// It names the lock because between reading an id and typing it the lock
@@ -523,6 +520,20 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) (err error) {
 	// cause, and a failed release is at most its consequence — but a
 	// release that fails on an otherwise-successful run is now the run's
 	// result, via the named return.
+	//
+	// The accepted limit (rule 12): when err is already set — ErrSweep, say
+	// — a release failure alongside it is not reported here at all; err ==
+	// nil guards the assignment, so the sweep failure wins and the release
+	// failure is silently dropped for this run. That is still the right
+	// precedence — the reader needs to act on the sweep first, and both
+	// messages would not change what to do about either — but the stranded
+	// lock it leaves behind is not silent forever, only later than a
+	// dedicated message would be: the next acquireLock on this path finds
+	// the file still there, still complete, and reports ErrLocked exactly as
+	// "another rdk apply is running" even though none is. The existing
+	// blocked-apply hint ("if it is stranded use --break-lock=<id>") is what
+	// actually resolves it from there, one apply after this one rather than
+	// on this one.
 	defer func() {
 		if relErr := s.ReleaseLock(); relErr != nil && err == nil {
 			err = relErr
@@ -1042,7 +1053,15 @@ func (s *osStore) ReleaseLock() error {
 		// remove it either.
 		return &lockNotReleasedError{err: err}
 	case info.ID != s.lockID:
-		// Replaced by a live lock this call must not touch.
+		// Not this call's lock any more: most often replaced by a live one
+		// after a --break-lock, but the same mismatch also covers a record
+		// that failed to parse (readLockFile's unmarshal is best-effort, so
+		// a garbled file — this call's own, corrupted by something other
+		// than acquireLock's write-then-link — reads back with ID ""). This
+		// call cannot tell those apart from here, and removing either would
+		// risk deleting a lock that is not its own, so both are treated the
+		// same way: nothing of this call's is safely removable, and
+		// ownership is surrendered.
 		s.lockHeld = false
 		return nil
 	}
@@ -1344,7 +1363,7 @@ func (s *osStore) publishScratchGitignore() error {
 // open here because this task does not add the equivalent revalidation to
 // HoldLock. What this task closes is the symmetric race described above,
 // not every way to interrupt this call's hold on the transaction lock.
-func (s *osStore) HoldLock(message string) (LockInfo, error) {
+func (s *osStore) HoldLock(message string) (info LockInfo, err error) {
 	if err := s.ensureScratchDir(); err != nil {
 		return LockInfo{}, err
 	}
@@ -1373,7 +1392,22 @@ func (s *osStore) HoldLock(message string) (LockInfo, error) {
 		}
 		return LockInfo{}, err
 	}
-	defer s.ReleaseLock()
+	// Mirrors Materialize's named-return defer (see its doc comment for the
+	// full reasoning): a bare `defer s.ReleaseLock()` here had the identical
+	// shape of bug — a release that failed after the held lock was already
+	// created left rdk lock reporting success with .rdk/apply.lock still on
+	// disk, and every apply or rdk lock after it would then block on a
+	// transaction lock nobody holds. Unlike Materialize, nothing downstream
+	// of this call special-cases ErrLockNotReleased yet — cmd/lock.go only
+	// checks for ErrLockTarget and ErrLocked — so today this surfaces as an
+	// unclassified error (exit 2) rather than a proper diagnostic. That is a
+	// real gap, stated rather than left implicit; closing it is cmd/lock.go's
+	// to do, not this function's.
+	defer func() {
+		if relErr := s.ReleaseLock(); relErr != nil && err == nil {
+			err = relErr
+		}
+	}()
 	if afterApplyLockHeldByHoldLock != nil {
 		afterApplyLockHeldByHoldLock()
 	}

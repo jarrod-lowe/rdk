@@ -87,23 +87,30 @@ func Run(store repofs.Store, version string) (Result, error) {
 				Hint: "the generated tree is correct; clear " + repofs.ScratchDir + "/old, then re-run",
 			})
 		}
-		if d, ok := LockTargetDiagnostic(err); ok {
-			return Result{}, diag.Wrap(err, d)
-		}
 		if errors.Is(err, repofs.ErrLockNotReleased) {
-			// Same shape as ErrSweep, and reaches here for the same reason:
-			// Materialize's own body only ever returns this from its
-			// deferred release, which can only override a nil result (see
-			// Materialize's named return), so the tree really was written —
-			// and swept, if there was a previous one — before this fired.
-			// The summary has to lead with that, or the reader goes looking
-			// for damage that isn't there.
+			// Checked before LockTargetDiagnostic, deliberately: a release
+			// that fails because the lock path itself is now unusable (a
+			// directory where .rdk/apply.lock was, say) wraps both
+			// ErrLockNotReleased and ErrLockTarget — readLockFile's guard is
+			// what ReleaseLock's own read failure runs into. Checking
+			// LockTargetDiagnostic first would report "cannot use rdk's
+			// lock files" and never say the apply itself succeeded, which is
+			// the one obligation this whole diagnostic exists to meet (rule
+			// 11). Same shape as ErrSweep otherwise, and reaches here for
+			// the same reason: Materialize's own body only ever returns this
+			// from its deferred release, which can only override a nil
+			// result (see Materialize's named return), so the tree really
+			// was written — and swept, if there was a previous one — before
+			// this fired.
 			return Result{}, diag.Wrap(err, diag.Diagnostic{
 				Code: diag.CodeLockNotReleased,
 				Summary: fmt.Sprintf("rdk apply: wrote %d files to %s/, but could not release its lock",
 					set.Len(), ManagedDir),
 				Hint: "the generated tree is correct; this apply has already finished — read the cause above for what's blocking " + repofs.ScratchDir + "/apply.lock, clear it, then re-run",
 			})
+		}
+		if d, ok := LockTargetDiagnostic(err); ok {
+			return Result{}, diag.Wrap(err, d)
 		}
 		if errors.Is(err, repofs.ErrLockLost) {
 			// Not apply-locked: this run was not refused a lock, it held one
@@ -210,18 +217,31 @@ func LockedDiagnostic(err error) (diag.Diagnostic, bool) {
 		summary += ": " + info.Message
 	}
 
+	// lock_kind and lock_path are always known: Kind comes from the file the
+	// lock was read from, never from the record's own JSON (see
+	// repofs.readLockFile), and Path is a property of where the read
+	// happened — neither depends on the record parsing at all. The rest
+	// (lock_id, host, pid, since) come from the record itself, so they are
+	// only included when info.ID != "": in the no-id branch above nothing
+	// was actually read successfully, and emitting them as zero values
+	// (`"pid":0`, `"host":""`) would have rdk asserting facts it does not
+	// have — worse, an empty lock_id invites exactly the broken
+	// --break-lock= a JSONL consumer might build from it.
+	attrs := []diag.Attr{diag.Str("lock_kind", info.Kind), diag.Str("lock_path", info.Path)}
+	if info.ID != "" {
+		attrs = append(attrs,
+			diag.Str("lock_id", info.ID),
+			diag.Str("host", info.Host),
+			diag.Int("pid", info.PID),
+			diag.Str("since", info.Since),
+		)
+	}
+
 	return diag.Diagnostic{
 		Code:    diag.CodeApplyLocked,
 		Summary: summary,
 		Hint:    hint,
-		Attrs: []diag.Attr{
-			diag.Str("lock_id", info.ID),
-			diag.Str("lock_kind", info.Kind),
-			diag.Str("host", info.Host),
-			diag.Int("pid", info.PID),
-			diag.Str("since", info.Since),
-			diag.Str("lock_path", info.Path),
-		},
+		Attrs:   attrs,
 	}, true
 }
 

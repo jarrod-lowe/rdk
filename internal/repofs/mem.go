@@ -347,7 +347,7 @@ func (m *Mem) ReadDir(dir string) ([]Entry, error) {
 // implementations must agree on the sequence and not merely on the end
 // state — otherwise a component test could describe an ordering production
 // does not have.
-func (m *Mem) HoldLock(message string) (LockInfo, error) {
+func (m *Mem) HoldLock(message string) (info LockInfo, err error) {
 	if _, err := m.acquireLock(scratchApplyLock, ""); err != nil {
 		// A held lock takes precedence in the message when there is one —
 		// mirrors osStore.HoldLock's reasoning: describing rdk's own
@@ -361,7 +361,15 @@ func (m *Mem) HoldLock(message string) (LockInfo, error) {
 		}
 		return LockInfo{}, err
 	}
-	defer m.ReleaseLock()
+	// Mirrors osStore.HoldLock's named-return defer, so the two Store
+	// implementations agree on shape — even though Mem's ReleaseLock, with
+	// no filesystem to fail a read or a Remove against, never actually has a
+	// release error to surface here.
+	defer func() {
+		if relErr := m.ReleaseLock(); relErr != nil && err == nil {
+			err = relErr
+		}
+	}()
 	return m.acquireLock(scratchLock, message)
 }
 

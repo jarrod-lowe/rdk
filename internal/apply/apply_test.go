@@ -318,26 +318,159 @@ func TestResultDiagnosticCarriesCounts(t *testing.T) {
 // diagnostic has to name the path instead of printing a command that cannot
 // be typed. Reachable from a lock file truncated by a power loss, or written
 // by a binary older than repofs' complete-or-absent lock creation.
+//
+// Reproduced through repofs's own exported surface rather than a
+// package-internal constructor: a garbage .rdk/apply.lock planted directly,
+// then a real Materialize call losing the exclusive-create race against it,
+// is exactly the state a truncated write or a pre-split binary would leave —
+// readLockFile's best-effort unmarshal has to tolerate it either way.
 func TestLockedDiagnosticNamesThePathWhenTheIDIsUnreadable(t *testing.T) {
-	err := repofs.LockedErrorFor(repofs.LockInfo{Held: true, Kind: "apply", Path: ".rdk/apply.lock"})
-	d, ok := LockedDiagnostic(err)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, repofs.ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, repofs.ScratchDir, "apply.lock"), []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := repofs.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := repofs.NewFileSet()
+	if err := set.Bytes(repofs.Managed("a.txt"), []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+
+	merr := store.Materialize(ManagedDir, set)
+	d, ok := LockedDiagnostic(merr)
 	if !ok {
 		t.Fatal("LockedDiagnostic returned false")
 	}
-	if !strings.Contains(d.Hint, ".rdk/apply.lock") {
+	lockPath := repofs.ScratchDir + "/apply.lock"
+	if !strings.Contains(d.Hint, lockPath) {
 		t.Errorf("hint = %q, want it to name the path to remove", d.Hint)
 	}
 	if strings.Contains(d.Hint, "--break-lock=") {
 		t.Errorf("hint = %q, still offers a --break-lock that cannot name anything", d.Hint)
 	}
+	// pid/host/since/lock_id were never actually read — the record didn't
+	// parse — so they must be absent, not present as zero values rdk never
+	// observed. lock_kind and lock_path are still known (see readLockFile:
+	// both come from the file, never the record), so those stay.
+	attrs := map[string]any{}
+	for _, a := range d.Attrs {
+		attrs[a.Key] = a.Value()
+	}
+	for _, unknown := range []string{"pid", "host", "since", "lock_id"} {
+		if _, present := attrs[unknown]; present {
+			t.Errorf("attrs carries %q = %v, but nothing was ever read for it", unknown, attrs[unknown])
+		}
+	}
+	if attrs["lock_kind"] != "apply" {
+		t.Errorf("lock_kind attr = %v, want %q — known from the file regardless of parse failure", attrs["lock_kind"], "apply")
+	}
+	if attrs["lock_path"] != lockPath {
+		t.Errorf("lock_path attr = %v, want %q", attrs["lock_path"], lockPath)
+	}
 }
 
 // The ordinary case must keep printing the id, since that is the only
-// argument --break-lock accepts.
+// argument --break-lock accepts. Same reproduction shape as the unreadable-id
+// case above, but with a valid record this time.
 func TestLockedDiagnosticStillPrintsTheIDWhenItIsReadable(t *testing.T) {
-	err := repofs.LockedErrorFor(repofs.LockInfo{Held: true, ID: "9f3a1c4e", Kind: "apply", Path: ".rdk/apply.lock"})
-	d, _ := LockedDiagnostic(err)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, repofs.ScratchDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := `{"id":"9f3a1c4e","kind":"apply","host":"h","pid":1,"since":"2026-08-16T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(root, repofs.ScratchDir, "apply.lock"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := repofs.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := repofs.NewFileSet()
+	if err := set.Bytes(repofs.Managed("a.txt"), []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+
+	merr := store.Materialize(ManagedDir, set)
+	d, _ := LockedDiagnostic(merr)
 	if !strings.Contains(d.Hint, "--break-lock=9f3a1c4e") {
 		t.Errorf("hint = %q, want it to hand over the id", d.Hint)
+	}
+}
+
+// materializeErrStore wraps a real Store and makes Materialize return a
+// canned error, so Run can be driven into a branch that repofs's own state
+// cannot produce on demand (readLockFile's Lstat guard requires a directory
+// to appear at .rdk/apply.lock in the narrow window between the publish
+// rename and the deferred ReleaseLock — reachable in production, but only
+// reachable in a test via repofs's own unexported afterPublish seam, which a
+// different package cannot set). Every other Store method is promoted
+// unchanged, so parse.Dir and generate.Build still run for real against
+// setupRepo's fixture.
+type materializeErrStore struct {
+	repofs.Store
+	err error
+}
+
+func (s *materializeErrStore) Materialize(managedDir string, set *repofs.FileSet) error {
+	return s.err
+}
+
+// fakeLockNotReleased and fakeLockTarget reproduce the shape repofs actually
+// produces when a release fails because the lock path itself has become
+// unusable: an error that Is(ErrLockNotReleased) and unwraps to one that
+// separately Is(ErrLockTarget) — readLockFile's Lstat guard is what
+// ReleaseLock's own read runs into. Built locally rather than via an exported
+// repofs constructor: repofs deliberately keeps ErrLocked's own error type
+// unexported (see the LockedDiagnostic tests below, which reach that state
+// through repofs.New and a planted lock file instead), and this pairing has
+// no equivalent production entry point to test through — Materialize cannot
+// be made to lose its own lock path mid-run without repofs's unexported
+// afterPublish seam (see materializeErrStore's own comment above).
+type fakeLockNotReleased struct{ cause error }
+
+func (e fakeLockNotReleased) Error() string        { return e.cause.Error() }
+func (e fakeLockNotReleased) Unwrap() error        { return e.cause }
+func (e fakeLockNotReleased) Is(target error) bool { return target == repofs.ErrLockNotReleased }
+
+type fakeLockTarget struct{}
+
+func (fakeLockTarget) Error() string {
+	return ".rdk/apply.lock is a directory, not a lock file; remove it"
+}
+func (fakeLockTarget) Is(target error) bool { return target == repofs.ErrLockTarget }
+
+// A release that fails because the lock path is now unusable must still lead
+// with the fact that the apply succeeded: that is Task 6's entire reason to
+// exist, and checking LockTargetDiagnostic before ErrLockNotReleased threw it
+// away, reporting "cannot use rdk's lock files" and never mentioning the tree
+// that had just been published. The repofs-level test for this
+// (TestReleaseLockDoesNotTreatAReadFailureAsSuccess) only ever asserted that
+// ReleaseLock returned an error — it never went through Run, so it could not
+// have caught which diagnostic Run built from it.
+func TestRunReportsLockNotReleasedEvenWhenTheCauseIsALockTargetFailure(t *testing.T) {
+	store, _ := setupRepo(t)
+	wrapped := &materializeErrStore{
+		Store: store,
+		err:   fakeLockNotReleased{cause: fakeLockTarget{}},
+	}
+
+	_, err := Run(wrapped, "v")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeLockNotReleased {
+		t.Errorf("code = %q, want %q — the apply succeeded and must say so, not report lock-target", d.Code, diag.CodeLockNotReleased)
+	}
+	if !strings.Contains(d.Summary, "wrote") {
+		t.Errorf("summary %q does not lead with the apply having succeeded", d.Summary)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1", got)
 	}
 }
