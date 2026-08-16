@@ -90,6 +90,21 @@ func Run(store repofs.Store, version string) (Result, error) {
 		if d, ok := LockTargetDiagnostic(err); ok {
 			return Result{}, diag.Wrap(err, d)
 		}
+		if errors.Is(err, repofs.ErrLockNotReleased) {
+			// Same shape as ErrSweep, and reaches here for the same reason:
+			// Materialize's own body only ever returns this from its
+			// deferred release, which can only override a nil result (see
+			// Materialize's named return), so the tree really was written —
+			// and swept, if there was a previous one — before this fired.
+			// The summary has to lead with that, or the reader goes looking
+			// for damage that isn't there.
+			return Result{}, diag.Wrap(err, diag.Diagnostic{
+				Code: diag.CodeLockNotReleased,
+				Summary: fmt.Sprintf("rdk apply: wrote %d files to %s/, but could not release its lock",
+					set.Len(), ManagedDir),
+				Hint: "the generated tree is correct; this apply has already finished — read the cause above for what's blocking " + repofs.ScratchDir + "/apply.lock, clear it, then re-run",
+			})
+		}
 		if errors.Is(err, repofs.ErrLockLost) {
 			// Not apply-locked: this run was not refused a lock, it held one
 			// and had it taken away mid-flight. Saying "another apply is

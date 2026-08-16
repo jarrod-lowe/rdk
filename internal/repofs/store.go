@@ -270,6 +270,22 @@ func (e *lockLostError) Error() string        { return e.err.Error() }
 func (e *lockLostError) Unwrap() error        { return e.err }
 func (e *lockLostError) Is(target error) bool { return target == ErrLockLost }
 
+// ErrLockNotReleased reports that the apply finished but its transaction lock
+// is still on disk. The tree is correct; the repository is not usable until
+// the lock goes, and saying nothing would move the failure to the next
+// apply — the same reasoning as ErrSweep, and the same obligation on the
+// caller to lead with the fact that the apply itself succeeded.
+var ErrLockNotReleased = errors.New("lock not released")
+
+// lockNotReleasedError marks a failed release without contributing to the
+// message, for the same reason as sweepError: the caller's summary already
+// says what is still there.
+type lockNotReleasedError struct{ err error }
+
+func (e *lockNotReleasedError) Error() string        { return e.err.Error() }
+func (e *lockNotReleasedError) Unwrap() error        { return e.err }
+func (e *lockNotReleasedError) Is(target error) bool { return target == ErrLockNotReleased }
+
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
 type Store interface {
@@ -441,7 +457,7 @@ func (s *osStore) checkPathComponents(p string) error {
 	return nil
 }
 
-func (s *osStore) Materialize(managedDir string, set *FileSet) error {
+func (s *osStore) Materialize(managedDir string, set *FileSet) (err error) {
 	// Checked before any work: the store owns security, so it re-checks what
 	// FileSet already checked on add rather than trusting the caller passed a
 	// set that was never tampered with in between.
@@ -498,7 +514,20 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 	if _, err := s.acquireLock(scratchApplyLock, ""); err != nil {
 		return err
 	}
-	defer s.ReleaseLock()
+	// The release's error is no longer discarded here. It used to be — a
+	// bare `defer s.ReleaseLock()` — which is what let the branch in
+	// ReleaseLock that keeps ownership on an unexpected failure write to
+	// nobody: an apply that failed only to release its lock still exited 0,
+	// and the next apply then blocked on a lock no process held. A failure
+	// the run is already returning takes priority — that error is the
+	// cause, and a failed release is at most its consequence — but a
+	// release that fails on an otherwise-successful run is now the run's
+	// result, via the named return.
+	defer func() {
+		if relErr := s.ReleaseLock(); relErr != nil && err == nil {
+			err = relErr
+		}
+	}()
 
 	// Same kinship as the managedDir Lstat just below, whose comment explains
 	// why that read is deliberately not taken any earlier: UseLock's
@@ -641,6 +670,10 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) error {
 		// tree is safe at scratchOld rather than let the reader assume it is
 		// gone.
 		return &publishError{err: err}
+	}
+
+	if afterPublish != nil {
+		afterPublish()
 	}
 
 	// Checked again before the sweep, which is irreversible in a different
@@ -956,12 +989,19 @@ func lockKindFor(file string) string {
 // --break-lock, just from the release side, and it reopens exactly the
 // two-applies-at-once corruption this feature exists to prevent. So this
 // re-reads the file and removes it only if it still carries the id this call
-// took; if it doesn't (or the read fails, or it's gone already), releasing
-// nothing is the safe outcome — whoever holds the lock now will release
-// their own. There is a TOCTOU window between the read and the remove, but it
-// is only the interval of one Remove syscall, far narrower than the
-// read-a-stale-error-then-type-a-command window --break-lock guards against,
-// and not worth adding machinery for.
+// took. Gone already, or replaced by a live lock, both mean there is nothing
+// of this call's left to remove — releasing nothing is right, and ownership
+// is surrendered. A read that fails for any other reason is different, and
+// used to be conflated with those two: it is not evidence the lock is gone,
+// so ownership is kept and the failure is returned as ErrLockNotReleased —
+// clearing it, which this used to do, left the file standing with nothing
+// tracking it, so no later call would ever remove it. A Remove that fails is
+// the same story from the other side: the file may still be there, and
+// surrendering the only record of who is responsible for it would make it
+// unreleasable by anything short of --break-lock. There is a TOCTOU window
+// between the read and the remove, but it is only the interval of one Remove
+// syscall, far narrower than the read-a-stale-error-then-type-a-command
+// window --break-lock guards against, and not worth adding machinery for.
 //
 // lockMu is held across that read-and-remove rather than only across the
 // flag check: Materialize's defer and the SIGINT/SIGTERM handler both call
@@ -989,18 +1029,28 @@ func (s *osStore) ReleaseLock() error {
 		return nil
 	}
 	info, err := s.readLockFile(scratchApplyLock)
-	if err != nil || !info.Held || info.ID != s.lockID {
-		// Nothing of this call's is left to remove — already gone, or
-		// replaced by a live lock this call must not touch — so there is
-		// nothing left to track either.
+	switch {
+	case err != nil && os.IsNotExist(err):
+		// Already gone — nothing of this call's is left to remove, so there
+		// is nothing left to track either.
+		s.lockHeld = false
+		return nil
+	case err != nil:
+		// A read that failed for any other reason is not evidence the lock is
+		// gone. Clearing ownership here — which this used to do — left the
+		// file standing with nothing tracking it, so no later call would
+		// remove it either.
+		return &lockNotReleasedError{err: err}
+	case info.ID != s.lockID:
+		// Replaced by a live lock this call must not touch.
 		s.lockHeld = false
 		return nil
 	}
 	if err := s.root.Remove(scratchApplyLock); err != nil && !os.IsNotExist(err) {
-		// Ownership is kept: the file may still be there, so a retry (another
-		// signal, or a caller that checks the error) must still see this call
-		// as the one responsible for removing it.
-		return err
+		// Ownership is kept: the file is still there, and surrendering the
+		// only record of who is responsible for it would make it unreleasable
+		// by anything short of --break-lock.
+		return &lockNotReleasedError{err: err}
 	}
 	s.lockHeld = false
 	return nil

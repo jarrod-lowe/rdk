@@ -2442,3 +2442,101 @@ func TestUnlockAndUseLockRejectAnEmptyID(t *testing.T) {
 		t.Error("a lock with no readable id was removed by an unnamed call")
 	}
 }
+
+// A lock that could not be released must not be reported as a clean apply:
+// the tree is correct, but the next apply will block on a lock nobody holds,
+// far from the cause (rule 6).
+func TestMaterializeReportsALockItCouldNotRelease(t *testing.T) {
+	s, root := newTestStore(t)
+	// afterPublish, not afterStaging: everything between staging and
+	// publishing needs .rdk writable — the publish rename moves .rdk/new out
+	// of it — so making the directory unwritable any earlier would fail the
+	// publish instead of the release. There is no prior tree, so .rdk/old
+	// does not exist and the sweep's RemoveAll succeeds without needing write
+	// permission; the release's Remove is the only thing left to fail.
+	afterPublish = func() { chmodUnwritable(t, filepath.Join(root, ScratchDir)) }
+	t.Cleanup(func() { afterPublish = nil })
+
+	set := NewFileSet()
+	add(t, set, Managed("a.txt"), []byte("a"))
+	err := s.Materialize("managed", set)
+	if !errors.Is(err, ErrLockNotReleased) {
+		t.Fatalf("Materialize err = %v, want ErrLockNotReleased", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "managed", "a.txt")); statErr != nil {
+		t.Errorf("the tree should still be published: %v", statErr)
+	}
+}
+
+// A read failure is not a release. Clearing ownership on one leaves the file
+// standing with nothing tracking it.
+func TestReleaseLockDoesNotTreatAReadFailureAsSuccess(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+	// A directory where the lock file was: readLockFile refuses it (Task 1),
+	// which is a read failure that is not "absent".
+	if err := os.Remove(filepath.Join(root, scratchApplyLock)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, scratchApplyLock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReleaseLock(); err == nil {
+		t.Fatal("ReleaseLock reported success over a lock path it could not read")
+	}
+	st.lockMu.Lock()
+	held := st.lockHeld
+	st.lockMu.Unlock()
+	if !held {
+		t.Error("ownership was surrendered without the lock being removed")
+	}
+}
+
+// Task 3's second revalidation — the one guarding the sweep of .rdk/old —
+// was unreachable through Materialize until afterPublish existed: nothing
+// fired between the publish rename and the sweep, so no test could break
+// this run's lock at that exact point without calling checkStillLocked
+// directly (which exercises the guard's message, not whether Materialize
+// actually stops the sweep). This is the test that makes it reachable:
+// breaking this run's lock from inside afterPublish must stop
+// Materialize from clearing .rdk/old, because that copy may now be the
+// only thing standing between another run's failed publish and a lost
+// tree.
+func TestMaterializeDoesNotSweepOldAfterLosingItsLockAtPublish(t *testing.T) {
+	s, root := newTestStore(t)
+	first := NewFileSet()
+	add(t, first, Managed("keep.txt"), []byte("original"))
+	if err := s.Materialize("managed", first); err != nil {
+		t.Fatal(err)
+	}
+
+	afterPublish = func() {
+		if err := os.Remove(filepath.Join(root, ScratchDir, "apply.lock")); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { afterPublish = nil })
+
+	second := NewFileSet()
+	add(t, second, Managed("new.txt"), []byte("replacement"))
+	err := s.Materialize("managed", second)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Materialize err = %v, want ErrLockLost", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, ScratchDir, "old")); statErr != nil {
+		t.Errorf(".rdk/old should still exist — the sweep must not run once this run's lock is gone: %v", statErr)
+	}
+	got, readErr := os.ReadFile(filepath.Join(root, ScratchDir, "old", "keep.txt"))
+	if readErr != nil {
+		t.Fatalf(".rdk/old should still hold the previous tree: %v", readErr)
+	}
+	if string(got) != "original" {
+		t.Errorf(".rdk/old/keep.txt = %q, want %q", got, "original")
+	}
+}

@@ -61,3 +61,27 @@ var afterStaging func()
 // that stops rdk lock from ever returning success while an apply is
 // genuinely running underneath it.
 var afterApplyLockHeldByHoldLock func()
+
+// afterPublish is a test seam. Nil in production, so it costs one nil check
+// on a path that already does filesystem work.
+//
+// It exists because the point it marks — the tree is already published, but
+// the sweep of .rdk/old and the lock release still to come — lives, by
+// construction, between two syscalls: a test that tried to reach it by
+// racing goroutines would be timing-dependent, and a timing-dependent test
+// for a timing bug is one that passes on the machine where the bug is
+// worst. This makes that point reachable on demand instead. It is a
+// package-level var rather than a field on osStore for the same reason as
+// the other seams in this file: nothing outside this package can set it,
+// and nothing inside sets it except a test.
+//
+// Fires inside Materialize once the publishing rename has succeeded and
+// before checkStillLocked's second call (the one guarding the sweep). A test
+// uses it two ways: to break this run's lock from inside the callback, so
+// that second checkStillLocked call — otherwise unreachable through
+// Materialize, since nothing else fires between publish and the sweep —
+// refuses the sweep instead of silently clearing what may be another run's
+// only remaining copy; or to make .rdk unwritable, so the deferred
+// ReleaseLock that runs after Materialize returns fails, reaching the path
+// where the apply itself succeeded but its lock is still on disk.
+var afterPublish func()

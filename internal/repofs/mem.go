@@ -44,7 +44,7 @@ func NewMem() *Mem { return &Mem{files: map[string][]byte{}} }
 // Files exposes the backing map for test assertions.
 func (m *Mem) Files() map[string][]byte { return m.files }
 
-func (m *Mem) Materialize(managedDir string, set *FileSet) error {
+func (m *Mem) Materialize(managedDir string, set *FileSet) (err error) {
 	// Mem must reject exactly what osStore rejects, or a component test could
 	// pass against the fake while misrepresenting what production does.
 	if err := set.checkNoOutsideEntries(); err != nil {
@@ -63,7 +63,15 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) error {
 	if _, err := m.acquireLock(scratchApplyLock, ""); err != nil {
 		return err
 	}
-	defer m.ReleaseLock()
+	// Mirrors osStore.Materialize's named-return defer, so the two Store
+	// implementations agree on shape even though Mem's ReleaseLock — no
+	// filesystem, so no read or Remove that can fail unexpectedly — never
+	// actually has a release error to surface here.
+	defer func() {
+		if relErr := m.ReleaseLock(); relErr != nil && err == nil {
+			err = relErr
+		}
+	}()
 	// Mirrors osStore.Materialize's re-verification: see its comment for why
 	// this has to happen now, under the transaction lock, rather than trust
 	// UseLock's own read to still hold.
