@@ -72,6 +72,27 @@ func (m *Mem) Materialize(managedDir string, set *FileSet) (err error) {
 			err = relErr
 		}
 	}()
+	// Mirrors osStore.Materialize's non-adopted-path re-check: production
+	// closes a race here where a concurrent HoldLock's whole
+	// acquire-create-release cycle completes inside the gap between the
+	// pre-acquire read above and this call's own acquireLock — see
+	// store.go's Materialize for the full argument that this closes rather
+	// than merely narrows that race. Mem is single-goroutine test scaffolding
+	// (see the struct's own doc comment) and has no seam for a second
+	// goroutine to hit that gap, so this can never actually find a lock here
+	// that the pre-acquire read above didn't already catch — but it must
+	// still exist and still refuse, or Mem would accept what production
+	// refuses from a test that plants a lock directly in m.files between the
+	// two reads (the same reasoning checkStillLocked's own doc comment below
+	// gives for keeping its check even though Materialize alone can't reach
+	// it non-nil).
+	if !m.usingLock {
+		if held, err := m.readLockFile(scratchLock); err == nil {
+			return lockedErrorFor(held)
+		} else if err != fs.ErrNotExist {
+			return err
+		}
+	}
 	// Mirrors osStore.Materialize's re-verification: see its comment for why
 	// this has to happen now, under the transaction lock, rather than trust
 	// UseLock's own read to still hold.

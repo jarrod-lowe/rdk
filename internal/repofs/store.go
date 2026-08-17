@@ -350,17 +350,24 @@ type Store interface {
 	// is repo-relative. Materialize checks the held lock is absent before
 	// acquiring the transaction lock, unless this Store adopted it via
 	// UseLock — in which case that pre-acquire read is skipped (UseLock
-	// already made it) but Materialize re-reads the held lock once the
-	// transaction lock is acquired and refuses to proceed unless it still
-	// carries the id UseLock verified: the gap between UseLock running and
-	// the transaction lock existing is otherwise wide enough for the held
-	// lock to be released or replaced without this run ever noticing. The
+	// already made it). Either way, once the transaction lock is acquired
+	// Materialize re-reads the held lock a second time: on the adopted path
+	// it refuses to proceed unless the lock still carries the id UseLock
+	// verified, and on the non-adopted path it refuses if a held lock has
+	// appeared at all. Both close the same shape of gap from opposite sides —
+	// a read taken before this run held the transaction lock can be stale by
+	// the time anything irreversible happens — because a concurrent
+	// HoldLock's entire acquire-create-release cycle fits inside the window
+	// between that first read and this call's own acquireLock: on the
+	// adopted path the lock can be found gone or replaced, on the
+	// non-adopted path one can be found where there was none. The
 	// transaction lock is acquired for Materialize's duration (after the
 	// ScratchDir check, MkdirAll, and .gitignore write) and released before
 	// returning, on every path including failure — a stranded lock is not
-	// the price of an ordinary error. A lock still found in the way (the
-	// pre-acquire check, or a replacement found by the adopted path's
-	// re-check) is reported as an error wrapping ErrLocked; an adopted lock
+	// the price of an ordinary error. A lock found in the way by any of
+	// these reads — the pre-acquire check, the non-adopted path's
+	// post-acquire re-check, or a replacement found by the adopted path's
+	// re-check — is reported as an error wrapping ErrLocked; an adopted lock
 	// found simply gone is reported as a plain error, since nothing is
 	// actually holding the repository for ErrLocked to describe.
 	Materialize(managedDir string, set *FileSet) error
@@ -567,6 +574,13 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) (err error) {
 		case !os.IsNotExist(err):
 			return err
 		}
+		// Test seam only: fires once this read has confirmed .rdk/lock
+		// absent, still before this call's own acquireLock below. See its
+		// doc comment in seams.go — a test uses it to run a concurrent
+		// HoldLock to completion inside this exact gap.
+		if afterHeldLockConfirmedAbsent != nil {
+			afterHeldLockConfirmedAbsent()
+		}
 	}
 	if _, err := s.acquireLock(scratchApplyLock, ""); err != nil {
 		return err
@@ -599,6 +613,64 @@ func (s *osStore) Materialize(managedDir string, set *FileSet) (err error) {
 			err = relErr
 		}
 	}()
+
+	// The mirror of the usingLock block just below, for the run that did not
+	// adopt a held lock at all. HoldLock's own fix — acquire the transaction
+	// lock, create the held lock under it, release — closed the risk of its
+	// create interleaving with a concurrent Materialize's create (the
+	// original 3-in-3000 bug), but the pre-acquire read above still runs
+	// before this run holds the transaction lock. A concurrent HoldLock has
+	// the whole span between that read and this call's own acquireLock a few
+	// lines up to run its entire cycle to completion — acquire the
+	// transaction lock, create .rdk/lock, release, return success — and
+	// this call would then acquire the now-free transaction lock none the
+	// wiser: rdk lock would have told its caller the repository is held, and
+	// this run would go on to stage and publish after that promise. This
+	// read is what catches it.
+	//
+	// This closes that race rather than only narrowing it, for exactly the
+	// interleaving described above — not for every way a lock could change
+	// underneath this run, stated precisely below. HoldLock only ever
+	// creates .rdk/lock while it itself holds .rdk/apply.lock, for the whole
+	// span of that create (see HoldLock's doc comment), and this call's own
+	// acquireLock a few lines up gives at most one caller — of any number of
+	// concurrent Store values, in this process or another, since the
+	// exclusion is Link's, not this Store's lockMu — possession of
+	// .rdk/apply.lock at a time. So by the time this read runs, either
+	// .rdk/lock already exists (caught below) or nothing anywhere can create
+	// it until this run releases .rdk/apply.lock, which does not happen
+	// until Materialize itself returns. A read here that finds .rdk/lock
+	// absent therefore stays true for the rest of this run, the same
+	// reasoning the usingLock block below relies on and step 6's Stat of
+	// managedDir further down relies on for a different fact.
+	//
+	// What this does not cover, because it is a different failure entirely:
+	// --break-lock does not go through HoldLock's acquire-under-the-lock
+	// discipline at all — it deletes a lock file by id outright — so
+	// --break-lock against this run's own transaction lock, followed by a
+	// fresh HoldLock or Materialize racing in behind it, is the
+	// already-documented window checkStillLockedBeforePublish and
+	// checkStillLockedAfterPublish exist to catch (see their doc comment and
+	// the design doc's "Stated limits"), not this one.
+	//
+	// Kept as its own block rather than folded into the switch below, even
+	// though both read scratchLock: they are answering different questions —
+	// this is "did anything appear at all", the block below is "does what's
+	// there still carry the id this run adopted" — with case lists that
+	// don't line up one-for-one (this one has no id to compare; the other
+	// has no bare "something appeared" case, since something being there is
+	// only sometimes wrong for it). A single switch branching on usingLock
+	// inside each case would read as one check doing two things; two small
+	// blocks, each answering one question, is the version a reader does not
+	// have to mentally split apart first.
+	if !usingLock {
+		switch held, err := s.readLockFile(scratchLock); {
+		case err == nil:
+			return lockedErrorFor(held)
+		case !os.IsNotExist(err):
+			return err
+		}
+	}
 
 	// Same kinship as the managedDir Lstat just below, whose comment explains
 	// why that read is deliberately not taken any earlier: UseLock's

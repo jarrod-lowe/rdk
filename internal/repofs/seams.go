@@ -86,6 +86,32 @@ var afterApplyLockHeldByHoldLock func()
 // where the apply itself succeeded but its lock is still on disk.
 var afterPublish func()
 
+// afterHeldLockConfirmedAbsent is a test seam. Nil in production, so it costs
+// one nil check on a path that already does filesystem work.
+//
+// It exists because the window it lets a test hit — Materialize's
+// pre-acquire read of .rdk/lock has found it absent, but this run does not
+// yet hold the transaction lock — lives, by construction, between two
+// syscalls: a test that tried to reach it by racing goroutines would be
+// timing-dependent, and a timing-dependent test for a timing bug is one that
+// passes on the machine where the bug is worst. This makes that window
+// reachable on demand instead. It is a package-level var rather than a field
+// on osStore for the same reason as the other seams in this file: nothing
+// outside this package can set it, and nothing inside sets it except a test.
+//
+// Fires inside Materialize's non-adopted path only (the adopted path has no
+// equivalent pre-acquire read to confirm — see Materialize's doc comment)
+// once that read has found .rdk/lock absent, and before the
+// acquireLock(scratchApplyLock, ...) call that follows. A test uses it to run
+// a concurrent HoldLock to completion from inside the callback — acquire the
+// transaction lock, create .rdk/lock, release, return success — so that
+// Materialize's own acquireLock right after still succeeds (the transaction
+// lock is free again by then) and the post-acquire re-check this seam exists
+// to exercise gets to run against a held lock that appeared in exactly this
+// gap: the mirror, from the other side, of the race
+// afterApplyLockHeldByHoldLock's test proves closed.
+var afterHeldLockConfirmedAbsent func()
+
 // afterHeldLockLinked is a test seam. Nil in production, so it costs one nil
 // check on a path that already does filesystem work.
 //

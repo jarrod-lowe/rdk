@@ -2252,6 +2252,52 @@ func TestHoldLockExcludesAnApplyWhileItCreatesTheHeldLock(t *testing.T) {
 	}
 }
 
+// The mirror of TestHoldLockExcludesAnApplyWhileItCreatesTheHeldLock, from
+// the other side. HoldLock's own fix closes the risk of its create
+// interleaving with a concurrent Materialize's create, but Materialize's
+// pre-acquire read of .rdk/lock still runs before Materialize itself holds
+// the transaction lock — so a concurrent HoldLock can run its whole cycle to
+// completion (acquire the transaction lock, create .rdk/lock, release,
+// return success) inside that gap. Without the post-acquire re-check this
+// test exercises, Materialize would then acquire the now-free transaction
+// lock none the wiser and publish: rdk lock would have told its caller the
+// repository is held, and an apply would have run and published after that
+// promise.
+func TestMaterializeExcludesAHoldLockThatCompletesInTheGapBeforeAcquire(t *testing.T) {
+	s, root := newTestStore(t)
+	other, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var holdInfo LockInfo
+	var holdErr error
+	afterHeldLockConfirmedAbsent = func() {
+		holdInfo, holdErr = other.HoldLock("work")
+	}
+	t.Cleanup(func() { afterHeldLockConfirmedAbsent = nil })
+
+	set := NewFileSet()
+	add(t, set, Managed("a.txt"), []byte("a"))
+	materializeErr := s.Materialize("managed", set)
+
+	if holdErr != nil {
+		t.Fatalf("concurrent HoldLock err = %v, want it to succeed inside the gap", holdErr)
+	}
+	if !errors.Is(materializeErr, ErrLocked) {
+		t.Fatalf("Materialize err = %v, want ErrLocked — the held lock rdk lock just created should have blocked it", materializeErr)
+	}
+	if info, ok := LockInfoFromError(materializeErr); !ok || info.ID != holdInfo.ID {
+		t.Errorf("Materialize blocked by %+v, want the held lock %s", info, holdInfo.ID)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "managed")); !os.IsNotExist(err) {
+		t.Error("an apply published a tree after rdk lock had already taken the repository")
+	}
+	if _, err := os.Stat(filepath.Join(root, ScratchDir, "lock")); err != nil {
+		t.Errorf("held lock did not survive the blocked apply: %v", err)
+	}
+}
+
 // The transaction lock HoldLock takes is transient: it must be gone by the
 // time rdk lock returns, or every subsequent apply blocks on a lock nobody
 // holds.
