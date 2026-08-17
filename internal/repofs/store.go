@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -278,6 +279,54 @@ func (e *lockNotReleasedError) Error() string        { return e.err.Error() }
 func (e *lockNotReleasedError) Unwrap() error        { return e.err }
 func (e *lockNotReleasedError) Is(target error) bool { return target == ErrLockNotReleased }
 
+// ErrLockNotDurable reports that HoldLock created the held lock — .rdk/lock
+// is a complete, valid file the instant this fires, exactly as complete as it
+// would be without this check — but rdk could not confirm its directory
+// entry reached durable storage before returning. Without the fsync this
+// guards, a crash (power loss, a kernel panic — not an ordinary SIGKILL of
+// just the rdk process, since the entry Link already made is visible to any
+// other process on the same live filesystem regardless of durability) landing
+// after Link returns but before the filesystem flushes the entry on its own
+// can leave .rdk/lock entirely absent on the next boot, even though rdk lock
+// already printed success and handed the id to whoever ran it. That is the
+// broken promise this feature exists to prevent: a person or agent believing
+// applies are excluded returns to a repository that reports itself unlocked,
+// and nobody is notified, because from rdk's point of view the lock was never
+// taken. This sentinel is for the one related failure a unit test can
+// actually produce — the sync call itself erroring, on a platform and
+// filesystem where it is expected to succeed — reported rather than
+// swallowed, since the lock genuinely exists on disk right now and its id is
+// the only way to act on it either way (see lockNotDurableErrorFor).
+var ErrLockNotDurable = errors.New("held lock created, but its directory entry could not be confirmed durable")
+
+// lockNotDurableError carries the id alongside the sync failure the same way
+// lockedError and lockNotReleasedError do, but — unlike those — HoldLock's
+// only caller (cmd/lock.go) has no dedicated branch for this sentinel, so it
+// reaches the user through the bare fallback that just prints err.Error().
+// The id therefore has to live in the message text itself, not only in the
+// structured info field, or a caller that doesn't special-case this error
+// loses the one thing that makes it actionable.
+type lockNotDurableError struct {
+	err  error
+	info LockInfo
+}
+
+func (e *lockNotDurableError) Error() string        { return e.err.Error() }
+func (e *lockNotDurableError) Unwrap() error        { return e.err }
+func (e *lockNotDurableError) Is(target error) bool { return target == ErrLockNotDurable }
+
+// lockNotDurableErrorFor wraps a directory-sync failure that followed an
+// otherwise-successful HoldLock. info is the lock acquireLock already
+// created and returned — this never fabricates one — so the id folded into
+// the message is the real id sitting in .rdk/lock right now.
+func lockNotDurableErrorFor(info LockInfo, syncErr error) error {
+	return &lockNotDurableError{
+		err: fmt.Errorf("%w: lock %s is on disk and in effect, but its directory entry may not survive a crash before the filesystem flushes it on its own — run rdk unlock %s when you are done, or check .rdk/lock directly if you need to be sure it is still there: %v",
+			ErrLockNotDurable, info.ID, info.ID, syncErr),
+		info: info,
+	}
+}
+
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
 type Store interface {
@@ -355,7 +404,14 @@ type Store interface {
 	// returning; if that release fails, the returned LockInfo is still the
 	// held lock this call genuinely created — the error wraps
 	// ErrLockNotReleased, the same sentinel Materialize uses, so the caller
-	// is not told the whole call failed when only the cleanup did.
+	// is not told the whole call failed when only the cleanup did. Before
+	// reporting success at all, it fsyncs the directory holding .rdk/lock —
+	// on Unix; see syncHeldLockDir for why not on Windows — so the promise
+	// "the repository is held" cannot outlive its own directory entry across
+	// a crash; a failure there is reported via ErrLockNotDurable, with the
+	// same info-survives-the-error treatment as ErrLockNotReleased, since the
+	// lock is genuinely on disk either way and its id is what makes that
+	// actionable.
 	HoldLock(message string) (LockInfo, error)
 	// Unlock ends a held lock, and only ever writes to the held lock file.
 	// It names the lock because between reading an id and typing it the lock
@@ -1296,6 +1352,29 @@ func (s *osStore) publishScratchGitignore() error {
 	return nil
 }
 
+// afterHeldLockLinked is a test seam, in the same spirit as
+// afterLockOwnershipRecorded, afterStaging, afterApplyLockHeldByHoldLock and
+// afterPublish in seams.go — nil in production, so it costs one nil check on
+// a path that already does filesystem work. It is declared here rather than
+// alongside those because this task's file hygiene rule scopes its diff to
+// store.go, store_test.go, and the design doc.
+//
+// It exists because the window it lets a test hit — HoldLock's held lock is
+// already linked into place, but the directory-entry sync that must run
+// before HoldLock reports success has not — lives, by construction, between
+// two syscalls: a test that tried to reach it by racing goroutines would be
+// timing-dependent, and a timing-dependent test for a timing bug is one that
+// passes on the machine where the bug is worst. This makes that window
+// reachable on demand instead.
+//
+// Fires inside HoldLock immediately after acquireLock(scratchLock, ...) has
+// returned success and before syncHeldLockDir runs. A test uses it the same
+// way store_test.go's afterPublish tests use their own callback: making
+// .rdk unreadable from inside the callback so the syncHeldLockDir call that
+// follows fails for a genuine OS reason — a real fsync-equivalent path that
+// cannot succeed — rather than a stubbed one.
+var afterHeldLockLinked func()
+
 // HoldLock takes a lock that outlives this process, so a person or agent can
 // work on the tree without an apply running underneath them.
 //
@@ -1404,9 +1483,11 @@ func (s *osStore) HoldLock(message string) (info LockInfo, err error) {
 	// problem first would bury the fact that the held lock already exists —
 	// so this surfaces as a lock-not-released diagnostic at exit 1, not an
 	// unclassified error. That ordering depends on info surviving this
-	// function's own failure path: the named return is assigned by the final
-	// acquireLock above, and this defer only ever overwrites err, never info,
-	// so a caller seeing ErrLockNotReleased still has the real id to report.
+	// function's own failure path: info is assigned once, by the final
+	// acquireLock below, and nothing after that point — not the directory
+	// sync, not this defer — ever reassigns it, only err. So a caller seeing
+	// ErrLockNotReleased or ErrLockNotDurable still has the real id to
+	// report.
 	defer func() {
 		if relErr := s.ReleaseLock(); relErr != nil && err == nil {
 			err = relErr
@@ -1415,7 +1496,86 @@ func (s *osStore) HoldLock(message string) (info LockInfo, err error) {
 	if afterApplyLockHeldByHoldLock != nil {
 		afterApplyLockHeldByHoldLock()
 	}
-	return s.acquireLock(scratchLock, message)
+	info, err = s.acquireLock(scratchLock, message)
+	if err != nil {
+		return info, err
+	}
+	if afterHeldLockLinked != nil {
+		afterHeldLockLinked()
+	}
+	// The held lock is complete and Link has already made it visible; what is
+	// not yet true is that its directory entry would survive a crash right
+	// now. Run only here, after Link has succeeded, not before: a crash
+	// between the two is harmless, since nothing has told the caller the lock
+	// exists yet. Scoped to the held lock alone — see syncHeldLockDir's own
+	// doc comment for why the transaction lock this function also uses does
+	// not get the same treatment, and why a failure here is reported rather
+	// than swallowed.
+	if syncErr := s.syncHeldLockDir(); syncErr != nil {
+		err = lockNotDurableErrorFor(info, syncErr)
+	}
+	return info, err
+}
+
+// syncHeldLockDir makes .rdk's directory entry for the held lock durable
+// before HoldLock reports success, closing the gap acquireLock's own fsync
+// does not: that call flushes the lock *file's* bytes before anything points
+// at them (see writeScratchTemp and acquireLock's doc comment), which stops a
+// crash from producing a zero-length lock, but says nothing about whether the
+// *name* Link just added is itself durable. Without this, a power loss or
+// kernel panic after Link returns but before the filesystem flushes the
+// directory entry on its own can leave .rdk/lock completely absent on the
+// next boot — not empty, gone — even though rdk lock already printed success
+// and handed the id to whoever ran it. That is a broken promise this feature
+// exists to prevent (see ErrLockNotDurable), so it is checked before HoldLock
+// reports success, not left to chance.
+//
+// Scoped to the held lock only, never called for the transaction lock: a
+// crash kills the transaction lock's own holder (the applying process) at
+// the same moment, so a transaction lock vanishing with it is the outcome
+// Materialize wants — the alternative is a stranded lock needing
+// --break-lock, which is strictly worse — and Materialize already pays a
+// directory-open-and-fsync's cost on every apply if this were shared, for a
+// guarantee it has no use for. The held lock is different because its holder
+// is a person or agent who has already walked away by the time a crash could
+// happen; nothing else will ever tell them the promise didn't hold.
+//
+// os.Root can express this without leaving the repository's confinement:
+// Root.Open resolves ScratchDir the same way every other call in this file
+// resolves a path — refusing an escaping symlink, confined to repoRoot (see
+// New) — and returns an ordinary *os.File once opened. Calling Sync on that
+// file is exactly the fsync(2) this needs; nothing here reaches around Root
+// to get it.
+//
+// fsync on a directory descriptor is POSIX behaviour, and every target of
+// GOOS other than windows is expected to support it; this package's own
+// tests exercise the call on whichever such platform runs them (see
+// store_test.go), though not every POSIX platform rdk might run on. Where it
+// is supported, this closes the gap described above against a power loss or
+// a kernel panic. It does not, and cannot, close it against a filesystem
+// that lies about fsync having completed (some do, on some storage), nor
+// against a crash that lands inside the fsync call itself on hardware that
+// reorders write-backs beneath the OS. Windows has no
+// equivalent: FlushFileBuffers on a directory handle is not a meaningful
+// operation there, refused rather than silently accepted, so there is
+// nothing this function could call that would tell the truth about whether
+// the entry is durable. Rather than call it anyway and either discard the
+// error (reporting success while confirming nothing) or fail the call over
+// an operation that was never going to succeed on that platform, this simply
+// does not run on Windows: GOOS == "windows" returns nil immediately, and
+// HoldLock's own doc comment says plainly that the crash-durability
+// guarantee this function gives does not extend there (see also the design
+// doc's "Stated limits" section).
+func (s *osStore) syncHeldLockDir() error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	f, err := s.root.Open(ScratchDir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // Unlock ends a held lock, and only ever writes to scratchLock — never

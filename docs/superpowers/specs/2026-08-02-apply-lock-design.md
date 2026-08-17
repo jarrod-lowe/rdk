@@ -419,6 +419,44 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
   guarantee existed, or one truncated by something outside rdk's control (a
   full disk, a power loss, a hand edit). The diagnostic names the path to
   delete instead of a command that could not work.
+- **The held lock's directory entry is now made durable before `rdk lock`
+  reports success; the transaction lock's is not, and that asymmetry is
+  deliberate, not an oversight.** The write-then-link above makes a lock
+  file's *contents* durable before any name points at them — that is what
+  stops a crash from leaving a zero-length lock — but flushing a file's data
+  and flushing the directory entry that names it are two different
+  operations; a crash between them can leave a directory entry that never
+  reached durable storage even though the bytes it would point to did. For
+  the transaction lock this is harmless and stays as it is: whatever crashed
+  also killed the process that took it, so a vanished `.rdk/apply.lock` is
+  the wanted outcome, and the alternative — a stranded lock needing
+  `--break-lock` — is strictly worse; `Materialize` also pays this lock's
+  cost on every single apply, not once. For the held lock it is not
+  harmless: `rdk lock` exits 0 and hands its id to a person or agent who then
+  works on the tree, often long after the process that ran `rdk lock` has
+  exited, believing applies are excluded. If the directory entry never
+  reached durable storage, a crash can make that promise false with nobody
+  told — the repository reports itself unlocked and the id belongs to
+  nothing, the same broken-promise shape `flock` was rejected for above.
+  `HoldLock` now opens `.rdk` — through `os.Root`, the same confinement
+  every other operation here uses, since a directory is an ordinary entry to
+  it and needs no exception — and syncs it after linking `.rdk/lock` into
+  place and before reporting success, closing that gap where it can be
+  closed. This protects against a power loss or a kernel panic; it does not,
+  and cannot, protect against a filesystem that lies about a completed sync,
+  or a crash inside the sync call itself on storage that reorders write-backs
+  beneath the OS. A sync failure is reported as `ErrLockNotDurable` rather
+  than swallowed: the lock is genuinely on disk either way, so the error
+  carries its id instead of pretending nothing happened.
+- **The directory-entry sync above only runs on Unix.** Directory `fsync` is
+  POSIX behaviour; Windows's `FlushFileBuffers` is not supported on a
+  directory handle, so there is no call available there that could tell the
+  truth about durability. `HoldLock` does not attempt one and discard the
+  result — that would report success while confirming nothing — and does not
+  fail the call over an operation that was never going to succeed on that
+  platform. It simply does not run: on Windows, `rdk lock` returning success
+  means only that `.rdk/lock` exists right now, with none of the
+  crash-durability guarantee described above.
 - **A `rdk lock` that loses the race to another `rdk lock`'s transient window
   reports "another rdk apply is running", naming the *transaction* lock's id
   rather than the held lock about to exist.** `HoldLock` holds

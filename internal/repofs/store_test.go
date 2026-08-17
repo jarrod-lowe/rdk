@@ -206,6 +206,32 @@ func chmodUnwritable(t *testing.T, dir string) {
 	t.Cleanup(func() { os.Chmod(dir, 0o700) })
 }
 
+// chmodUnreadable strips read permission from dir (keeping write and
+// execute) and restores it so the test's own cleanup can succeed. Skips as
+// root, which ignores the bits.
+//
+// This is not the same failure as chmodUnwritable: os.Root resolves every
+// path it is given by opening each directory component along the way (that
+// is how it refuses an escaping symlink — see New's doc comment), and that
+// open requires read permission on the directory, not just search
+// permission. So a directory with write+execute but no read still lets
+// os.Root create and link files inside it — an ordinary open(2)/openat(2)
+// create doesn't need read on the parent — but refuses os.Root.Open on the
+// directory itself. That is exactly the operation syncHeldLockDir performs,
+// and exactly why this (rather than chmodUnwritable) is what reaches it: the
+// held lock has to be fully written and linked — which needs write+execute
+// only — before there is anything for the directory sync to fail on.
+func chmodUnreadable(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced")
+	}
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+}
+
 // The failure that motivated this design: it must leave the published tree
 // untouched rather than half-deleted, and it must say so.
 func TestMaterializeReportsASweepFailureAndKeepsTheTree(t *testing.T) {
@@ -2402,6 +2428,103 @@ func TestHoldLockRefusesAnUnusableHeldLockPathEvenWhenAnApplyIsRunning(t *testin
 	_, err := s.HoldLock("work")
 	if !errors.Is(err, ErrLockTarget) {
 		t.Fatalf("HoldLock err = %v, want ErrLockTarget", err)
+	}
+}
+
+// A genuine test of surviving a power loss is not possible — nothing short
+// of actually cutting power (or an fsync-recording fault injector this repo
+// does not have) can prove a directory entry reached the platter, and a
+// test that merely calls Sync and checks it returned nil would prove nothing
+// about durability, only that the call exists. What this test verifies
+// instead, honestly: on the ordinary path, HoldLock still succeeds and still
+// returns a usable id and a lock file on disk. It says nothing about whether
+// that lock file would survive a real crash — only the test below,
+// TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced, demonstrates that the
+// added sync step is actually wired into the result, by making the
+// equivalent real syscall fail and observing that HoldLock's return value
+// changes because of it.
+func TestHoldLockSucceedsAndReturnsTheIDOnTheOrdinaryPath(t *testing.T) {
+	s, root := newTestStore(t)
+	info, err := s.HoldLock("working")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ID == "" {
+		t.Fatal("HoldLock returned an empty id")
+	}
+	b, err := os.ReadFile(filepath.Join(root, ScratchDir, "lock"))
+	if err != nil {
+		t.Fatalf("lock file missing after HoldLock: %v", err)
+	}
+	var got LockInfo
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != info.ID {
+		t.Errorf("lock file id = %q, want %q", got.ID, info.ID)
+	}
+}
+
+// This is the one thing about the directory-sync fix that a test run on a
+// single, healthy machine can actually demonstrate: that syncHeldLockDir's
+// call runs for real and that its result genuinely gates what HoldLock
+// reports, rather than the fsync step being dead code that happens to
+// compile. It does this by making the real operation syncHeldLockDir
+// performs — opening .rdk through os.Root — fail for a real OS reason
+// (chmodUnreadable, fired from the afterHeldLockLinked seam once the held
+// lock is already linked into place) and checking that failure surfaces as
+// ErrLockNotDurable with the lock's real id still attached, both in the
+// structured LockInfo and in the error text itself — the latter matters
+// because cmd/lock.go has no dedicated branch for this sentinel the way it
+// does for ErrLockNotReleased, so a caller that only prints err.Error()
+// still has to see the id (see lockNotDurableErrorFor's doc comment).
+//
+// What this does not, and cannot, test: whether a real fsync on a real disk
+// actually makes the entry durable against a power loss. That is the
+// documented, unfalsifiable-in-a-unit-test part of the guarantee — see
+// syncHeldLockDir's doc comment.
+//
+// The held lock itself is left on disk afterward, deliberately not rolled
+// back: acquireLock's Link had already succeeded before the sync ran, so the
+// lock is real regardless of whether this call reports success, and the
+// error exists to tell the caller that, not to pretend the lock was never
+// taken.
+func TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced(t *testing.T) {
+	s, root := newTestStore(t)
+	dir := filepath.Join(root, ScratchDir)
+
+	afterHeldLockLinked = func() { chmodUnreadable(t, dir) }
+	t.Cleanup(func() { afterHeldLockLinked = nil })
+
+	info, err := s.HoldLock("working")
+	if !errors.Is(err, ErrLockNotDurable) {
+		t.Fatalf("HoldLock err = %v, want ErrLockNotDurable", err)
+	}
+	if info.ID == "" {
+		t.Fatal("HoldLock returned an empty id alongside ErrLockNotDurable — the caller has nothing to act on")
+	}
+	if !strings.Contains(err.Error(), info.ID) {
+		t.Errorf("error text %q does not contain the lock id %q — a caller that only prints err.Error() loses it", err.Error(), info.ID)
+	}
+
+	// Restored inline, not left to chmodUnreadable's own t.Cleanup, because
+	// that Cleanup only runs after this test function returns and the file
+	// needs to be readable now, to check that the lock created before the
+	// sync ever ran is still the one on disk, matching the id HoldLock
+	// reported.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "lock"))
+	if err != nil {
+		t.Fatalf("lock file missing after a sync failure: %v", err)
+	}
+	var got LockInfo
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != info.ID {
+		t.Errorf("lock file id = %q, want %q — the lock a sync failure reports must be the one actually on disk", got.ID, info.ID)
 	}
 }
 
