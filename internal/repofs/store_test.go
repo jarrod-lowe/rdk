@@ -2474,10 +2474,15 @@ func TestHoldLockSucceedsAndReturnsTheIDOnTheOrdinaryPath(t *testing.T) {
 // (chmodUnreadable, fired from the afterHeldLockLinked seam once the held
 // lock is already linked into place) and checking that failure surfaces as
 // ErrLockNotDurable with the lock's real id still attached, both in the
-// structured LockInfo and in the error text itself — the latter matters
-// because cmd/lock.go has no dedicated branch for this sentinel the way it
-// does for ErrLockNotReleased, so a caller that only prints err.Error()
-// still has to see the id (see lockNotDurableErrorFor's doc comment).
+// structured LockInfo and in the error text itself. cmd/lock.go's
+// lockHoldError now has a dedicated branch for this sentinel, the same as
+// it does for ErrLockNotReleased (added by commit 84129eb), and that branch
+// gets the id from the LockInfo HoldLock already returned, not by parsing
+// err.Error() back apart. The id is folded into the error text anyway, as
+// defense-in-depth: any caller that reaches this sentinel without going
+// through lockHoldError — a future one, or anything that only prints
+// err.Error() — still gets an actionable message (see lockNotDurableError's
+// doc comment in store.go).
 //
 // What this does not, and cannot, test: whether a real fsync on a real disk
 // actually makes the entry durable against a power loss. That is the
