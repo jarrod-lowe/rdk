@@ -96,14 +96,16 @@ func (a *app) lockCmd() *cobra.Command {
 }
 
 // lockHoldError maps a HoldLock failure to the diagnostic rdk lock reports.
-// Pulled out of lockCmd's RunE so the ErrLockNotReleased branch can be
-// exercised directly from cli_test.go with a crafted error: making HoldLock's
-// own release genuinely fail needs .rdk to go unwritable in the narrow window
-// between HoldLock creating .rdk/lock and its deferred ReleaseLock running,
-// and nothing reaches that window from outside internal/repofs — the
-// equivalent failure in Materialize is only reachable in repofs's own test
-// suite via its unexported afterPublish seam (internal/repofs/store_test.go),
-// and HoldLock has no analogous seam at all.
+// Pulled out of lockCmd's RunE so the ErrLockNotReleased and ErrLockNotDurable
+// branches can be exercised directly from cli_test.go with a crafted error:
+// making HoldLock's own release genuinely fail needs .rdk to go unwritable in
+// the narrow window between HoldLock creating .rdk/lock and its deferred
+// ReleaseLock running, and making its directory-sync genuinely fail needs a
+// similarly narrow window right after that — neither is reachable from
+// outside internal/repofs. The equivalent failure in Materialize is only
+// reachable in repofs's own test suite via its unexported afterPublish seam
+// (internal/repofs/store_test.go), and the directory-sync failure only via
+// its own afterHeldLockLinked seam; HoldLock exposes neither to this package.
 func lockHoldError(err error, info repofs.LockInfo) error {
 	if errors.Is(err, repofs.ErrLockNotReleased) {
 		// Checked before LockTargetDiagnostic, deliberately, mirroring
@@ -151,6 +153,50 @@ func lockHoldError(err error, info repofs.LockInfo) error {
 	// differently-worded one.
 	if d, ok := apply.LockedDiagnostic(err); ok {
 		return diag.New(d)
+	}
+	if errors.Is(err, repofs.ErrLockNotDurable) {
+		// Placement here (after ErrLockNotReleased, before the bare
+		// fallback) is not load-bearing the way ErrLockNotReleased's is:
+		// unlike that one, this sentinel cannot co-occur with any other
+		// branch above. HoldLock only ever produces it from the assignment
+		// `err = lockNotDurableErrorFor(info, syncErr)` immediately before
+		// it returns (internal/repofs/store.go's HoldLock) — and the
+		// deferred release that runs after that assignment only overwrites
+		// err when err == nil, so a release failure can never also stack
+		// ErrLockNotReleased onto this err the way it stacks onto a nil
+		// one. Nor can syncErr itself surface as ErrLockTarget or
+		// ErrLocked: it comes from opening/syncing .rdk's directory
+		// (syncHeldLockDir), a different code path from the lock-file
+		// target check those sentinels come from. So this could equally
+		// sit first; it sits last among the special cases only to keep the
+		// diff next to the fallback it replaces.
+		//
+		// info is trustworthy here for the same reason it is in the
+		// ErrLockNotReleased branch above: HoldLock's named return is
+		// assigned once, by its own final acquireLock(scratchLock, ...),
+		// and nothing after that point — not the directory sync, not its
+		// deferred release — ever reassigns it, only err (see HoldLock's
+		// doc comment). So err wrapping ErrLockNotDurable here can only
+		// mean that acquireLock already succeeded: the held lock info
+		// describes is genuinely sitting in .rdk/lock right now.
+		return diag.Wrap(err, diag.Diagnostic{
+			Code: diag.CodeLockNotDurable,
+			Summary: fmt.Sprintf("rdk lock: held %s — %s, in force now, but its directory entry could not be confirmed durable",
+				info.ID, info.Message),
+			// No retry belongs here: there is nothing to retry. The lock
+			// already exists and works exactly like any other, so the
+			// usual --with-lock / unlock guidance is exactly right, not
+			// something to hedge on. What's actually at risk is narrow and
+			// stated plainly: an ordinary crash, SIGKILL, or process exit
+			// does not touch this lock at all; only a power loss or kernel
+			// panic landing before the filesystem flushes .rdk's directory
+			// entry on its own could make it vanish, and if that happens
+			// nothing notifies anyone — the repository would simply read as
+			// unlocked while someone still believes it is held.
+			Hint: fmt.Sprintf("the lock above is real and already in effect: apply while you hold it: rdk apply --with-lock=%s\nrelease when you are done: rdk unlock %s\nonly a power loss or kernel panic before .rdk's directory entry is flushed could lose it — an ordinary crash, SIGKILL, or process exit will not; if you need to be sure it survived, check whether .rdk/lock still exists",
+				info.ID, info.ID),
+			Attrs: []diag.Attr{diag.Str("lock_id", info.ID)},
+		})
 	}
 	return err
 }

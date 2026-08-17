@@ -85,3 +85,24 @@ var afterApplyLockHeldByHoldLock func()
 // ReleaseLock that runs after Materialize returns fails, reaching the path
 // where the apply itself succeeded but its lock is still on disk.
 var afterPublish func()
+
+// afterHeldLockLinked is a test seam. Nil in production, so it costs one nil
+// check on a path that already does filesystem work.
+//
+// It exists because the window it lets a test hit — HoldLock's held lock is
+// already linked into place, but the directory-entry sync that must run
+// before HoldLock reports success has not — lives, by construction, between
+// two syscalls: a test that tried to reach it by racing goroutines would be
+// timing-dependent, and a timing-dependent test for a timing bug is one that
+// passes on the machine where the bug is worst. This makes that window
+// reachable on demand instead. It is a package-level var rather than a field
+// on osStore for the same reason as the other seams in this file: nothing
+// outside this package can set it, and nothing inside sets it except a test.
+//
+// Fires inside HoldLock immediately after acquireLock(scratchLock, ...) has
+// returned success and before syncHeldLockDir runs. A test uses it the same
+// way store_test.go's afterPublish tests use their own callback: making .rdk
+// unreadable from inside the callback so the syncHeldLockDir call that
+// follows fails for a genuine OS reason — a real fsync-equivalent path that
+// cannot succeed — rather than a stubbed one.
+var afterHeldLockLinked func()

@@ -300,12 +300,16 @@ func (e *lockNotReleasedError) Is(target error) bool { return target == ErrLockN
 var ErrLockNotDurable = errors.New("held lock created, but its directory entry could not be confirmed durable")
 
 // lockNotDurableError carries the id alongside the sync failure the same way
-// lockedError and lockNotReleasedError do, but — unlike those — HoldLock's
-// only caller (cmd/lock.go) has no dedicated branch for this sentinel, so it
-// reaches the user through the bare fallback that just prints err.Error().
-// The id therefore has to live in the message text itself, not only in the
-// structured info field, or a caller that doesn't special-case this error
-// loses the one thing that makes it actionable.
+// lockedError and lockNotReleasedError do. cmd/lock.go's lockHoldError has a
+// dedicated branch for this sentinel, the same as it does for
+// ErrLockNotReleased — but it reaches info via the LockInfo HoldLock's own
+// named return already preserved (passed to lockHoldError directly), not by
+// parsing this error's text back apart. The id lives in the message text as
+// well anyway, the same defense-in-depth as lockedError and
+// lockNotReleasedError: any caller that reaches this sentinel without going
+// through lockHoldError — a future one, or anything that only prints
+// err.Error() — still gets an actionable message rather than a bare "sync
+// failed".
 type lockNotDurableError struct {
 	err  error
 	info LockInfo
@@ -1351,29 +1355,6 @@ func (s *osStore) publishScratchGitignore() error {
 	}
 	return nil
 }
-
-// afterHeldLockLinked is a test seam, in the same spirit as
-// afterLockOwnershipRecorded, afterStaging, afterApplyLockHeldByHoldLock and
-// afterPublish in seams.go — nil in production, so it costs one nil check on
-// a path that already does filesystem work. It is declared here rather than
-// alongside those because this task's file hygiene rule scopes its diff to
-// store.go, store_test.go, and the design doc.
-//
-// It exists because the window it lets a test hit — HoldLock's held lock is
-// already linked into place, but the directory-entry sync that must run
-// before HoldLock reports success has not — lives, by construction, between
-// two syscalls: a test that tried to reach it by racing goroutines would be
-// timing-dependent, and a timing-dependent test for a timing bug is one that
-// passes on the machine where the bug is worst. This makes that window
-// reachable on demand instead.
-//
-// Fires inside HoldLock immediately after acquireLock(scratchLock, ...) has
-// returned success and before syncHeldLockDir runs. A test uses it the same
-// way store_test.go's afterPublish tests use their own callback: making
-// .rdk unreadable from inside the callback so the syncHeldLockDir call that
-// follows fails for a genuine OS reason — a real fsync-equivalent path that
-// cannot succeed — rather than a stubbed one.
-var afterHeldLockLinked func()
 
 // HoldLock takes a lock that outlives this process, so a person or agent can
 // work on the tree without an apply running underneath them.

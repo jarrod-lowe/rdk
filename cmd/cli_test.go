@@ -709,6 +709,73 @@ func TestLockHoldErrorPrefersLockNotReleasedOverLockTarget(t *testing.T) {
 	}
 }
 
+// fakeLockNotDurable reproduces the shape repofs actually produces when
+// HoldLock's held lock is created but its directory-entry sync then fails
+// (repofs.lockNotDurableErrorFor, internal/repofs/store.go): an error that
+// Is(ErrLockNotDurable). Copied locally in the same spirit as
+// fakeLockNotReleased above rather than shared: reaching this branch for real
+// needs .rdk's directory sync to fail in the exact window between HoldLock
+// linking .rdk/lock and reporting success, and nothing outside internal/repofs
+// can land there — that package's own suite reaches it via its unexported
+// afterHeldLockLinked seam (store_test.go), and there is no production entry
+// point this copy stands in for that the other package could expose instead.
+type fakeLockNotDurable struct{ cause error }
+
+func (e fakeLockNotDurable) Error() string        { return e.cause.Error() }
+func (e fakeLockNotDurable) Unwrap() error        { return e.cause }
+func (e fakeLockNotDurable) Is(target error) bool { return target == repofs.ErrLockNotDurable }
+
+// TestLockHoldErrorReportsLockNotDurableWithTheHeldLockID exercises
+// lockHoldError directly rather than through rdk lock end to end, for the same
+// reason as TestLockHoldErrorReportsLockNotReleasedWithTheHeldLockID above:
+// reaching this branch for real needs a real OS failure in a window this
+// package cannot reach (see fakeLockNotDurable's doc comment). This test only
+// asserts what a unit test of the mapping can honestly assert: given the
+// sentinel HoldLock is documented to return alongside a LockInfo it already
+// created, the diagnostic built from it exits 1 — the lock is real and in
+// force, not an rdk bug — and carries the held lock's own id, without which a
+// lock that is genuinely blocking every apply right now would have nothing for
+// the user to act on. It does not, and cannot, exercise syncHeldLockDir itself
+// or any real fsync failure; that is internal/repofs's own suite's job.
+func TestLockHoldErrorReportsLockNotDurableWithTheHeldLockID(t *testing.T) {
+	info := repofs.LockInfo{ID: "deadbeefcafefeed", Message: "agent working"}
+	err := lockHoldError(fakeLockNotDurable{cause: errors.New("sync .rdk: input/output error")}, info)
+
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeLockNotDurable {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeLockNotDurable)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1 — the lock is real and in force, not an rdk bug", got)
+	}
+	if !strings.Contains(d.Summary, info.ID) {
+		t.Errorf("summary %q does not carry the held lock's id", d.Summary)
+	}
+	if !strings.Contains(d.Summary, info.Message) {
+		t.Errorf("summary %q does not carry the lock's message", d.Summary)
+	}
+	for _, want := range []string{"rdk apply --with-lock=" + info.ID, "rdk unlock " + info.ID} {
+		if !strings.Contains(d.Hint, want) {
+			t.Errorf("hint %q does not mention %q — the id is only useful if it's handed over", d.Hint, want)
+		}
+	}
+	found := false
+	for _, a := range d.Attrs {
+		if a.Key == "lock_id" && a.Value() == info.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("attrs %+v do not carry lock_id = %q", d.Attrs, info.ID)
+	}
+	if !errors.Is(err, repofs.ErrLockNotDurable) {
+		t.Errorf("err does not unwrap to ErrLockNotDurable: %v", err)
+	}
+}
+
 // rdk unlock with a wrong id must not remove the real lock.
 func TestUnlockRejectsAWrongID(t *testing.T) {
 	dir := t.TempDir()
