@@ -45,6 +45,18 @@ type Options struct {
 
 // Resolve applies the precedence flag > environment > default. An empty flag
 // string means the flag was not given.
+//
+// On rejection, Resolve returns whatever it had already resolved, not a zero
+// Options — a caller (cmd/root.go's PersistentPreRunE) uses that partial
+// result to render the rejection itself, rather than falling back to
+// FormatText and silently overriding a valid --log-format=jsonl sitting next
+// to the flag that was actually wrong. That is also why format is resolved
+// before level and colour: whichever of the three is bad, the fields checked
+// earlier are already settled on the returned Options. When format itself is
+// the rejected value, there is no honest way to know what the caller wanted —
+// the field that would say so is exactly the one that failed to parse — so
+// the returned Options simply keeps FormatText, its zero value, rather than
+// guess.
 func Resolve(flagFormat, flagLevel, flagColor string, env Env) (Options, error) {
 	o := Options{Format: FormatText, Level: slog.LevelInfo, Color: ColorAuto, Env: env}
 
@@ -55,7 +67,7 @@ func Resolve(flagFormat, flagLevel, flagColor string, env Env) (Options, error) 
 		case "jsonl":
 			o.Format = FormatJSONL
 		default:
-			return Options{}, diag.New(diag.Diagnostic{
+			return o, diag.New(diag.Diagnostic{
 				Code:    diag.CodeInvalidFlag,
 				Summary: fmt.Sprintf("unknown log format %q%s", s, origin),
 				Hint:    "valid formats: text, jsonl",
@@ -74,7 +86,7 @@ func Resolve(flagFormat, flagLevel, flagColor string, env Env) (Options, error) 
 		case "error":
 			o.Level = slog.LevelError
 		default:
-			return Options{}, diag.New(diag.Diagnostic{
+			return o, diag.New(diag.Diagnostic{
 				Code:    diag.CodeInvalidFlag,
 				Summary: fmt.Sprintf("unknown log level %q%s", s, origin),
 				Hint:    "valid levels: debug, info, warn, error",
@@ -92,7 +104,7 @@ func Resolve(flagFormat, flagLevel, flagColor string, env Env) (Options, error) 
 	case "never":
 		o.Color = ColorNever
 	default:
-		return Options{}, diag.New(diag.Diagnostic{
+		return o, diag.New(diag.Diagnostic{
 			Code:    diag.CodeInvalidFlag,
 			Summary: fmt.Sprintf("unknown colour mode %q", flagColor),
 			Hint:    "valid colour modes: auto, always, never",

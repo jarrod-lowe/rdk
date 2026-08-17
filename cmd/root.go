@@ -62,13 +62,19 @@ func (a *app) rootCmd() *cobra.Command {
 		// print errors itself.
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Resolve returns whatever it did manage to resolve even on
+			// rejection (see its doc comment), so a.log is built from that
+			// partial result unconditionally: a valid --log-format=jsonl next
+			// to a bad --log-level must still render the rejection as JSONL,
+			// not fall back to logger.New's zero-value default of
+			// FormatText.
 			opts, err := logger.Resolve(a.logFormat, a.logLevel, a.color, os.LookupEnv)
-			if err != nil {
-				return err
-			}
 			opts.Stdout = cmd.OutOrStdout()
 			opts.Stderr = cmd.ErrOrStderr()
 			a.log = logger.New(opts)
+			if err != nil {
+				return err
+			}
 			return kind.Validate()
 		},
 	}
@@ -190,10 +196,13 @@ func (a *app) handleSignals() func() {
 func (a *app) renderFailure(err error, stdout, stderr io.Writer) error {
 	log := a.log
 	if log == nil {
-		// Nothing has run yet, so cobra rejected the command line itself: an
-		// unknown flag, command, or argument. That is the user's input being
-		// wrong, never rdk's fault, so it must not exit 2 as an rdk bug.
-		// Resolve's own failures are already diagnostics and keep their code.
+		// PersistentPreRunE sets a.log unconditionally, from whatever
+		// logger.Resolve managed to resolve, even when Resolve itself
+		// rejects a value — so a nil a.log here means PersistentPreRunE
+		// never ran: cobra rejected the command line before it, on an
+		// unknown flag, command, or argument. That is the user's input
+		// being wrong, never rdk's fault, so it must not exit 2 as an rdk
+		// bug.
 		var d *diag.Error
 		if !errors.As(err, &d) {
 			err = diag.Wrap(err, diag.Diagnostic{

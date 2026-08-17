@@ -216,6 +216,58 @@ func TestBadFlagValueIsRejected(t *testing.T) {
 	}
 }
 
+// The whole point of --log-format=jsonl is that a caller parsing stdout/stderr
+// gets structured lines even when something goes wrong, so a rejected sibling
+// flag (here, a bad --log-level) must not silently fall back to plain text.
+// Before this was fixed, logger.Resolve discarded everything it had already
+// resolved — including a perfectly valid --log-format=jsonl — the moment it
+// rejected --log-level, so PersistentPreRunE built a.log from a zero
+// logger.Options and `rdk version --log-format=jsonl --log-level=bogus`
+// printed the plain-text line `error: unknown log level "bogus"` on stderr:
+// unparseable by exactly the caller --log-format=jsonl exists for.
+func TestBadLogLevelStillRendersAsJSONLWhenFormatIsValid(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	_, errOut, err := runSplit(t, dir, "version", "--log-format=jsonl", "--log-level=bogus")
+	if err == nil {
+		t.Fatal("want an error for an unknown log level")
+	}
+	var rec map[string]any
+	if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(errOut)), &rec); jsonErr != nil {
+		t.Fatalf("stderr is not JSON: %v (%q)", jsonErr, errOut)
+	}
+	if rec["code"] != diag.CodeInvalidFlag {
+		t.Errorf("code = %v, want %q", rec["code"], diag.CodeInvalidFlag)
+	}
+}
+
+// Precedence is flag > environment > default, and a partially-resolved
+// Options has to keep respecting it: RDK_LOG_FORMAT=jsonl from the
+// environment must be honoured on the same rejection path as an explicit
+// --log-format flag above.
+func TestBadLogLevelStillRendersAsJSONLWhenFormatComesFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := runSplit(t, dir, "init"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Setenv("RDK_LOG_FORMAT", "jsonl")
+
+	_, errOut, err := runSplit(t, dir, "version", "--log-level=bogus")
+	if err == nil {
+		t.Fatal("want an error for an unknown log level")
+	}
+	var rec map[string]any
+	if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(errOut)), &rec); jsonErr != nil {
+		t.Fatalf("stderr is not JSON: %v (%q)", jsonErr, errOut)
+	}
+	if rec["code"] != diag.CodeInvalidFlag {
+		t.Errorf("code = %v, want %q", rec["code"], diag.CodeInvalidFlag)
+	}
+}
+
 // The exit code is a contract: a script has to be able to tell "fix your
 // input" from "rdk is broken".
 func TestExitCodes(t *testing.T) {
