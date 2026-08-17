@@ -3,6 +3,7 @@ package initialize
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -226,5 +227,54 @@ func TestConfigPathIsADirectoryIsNotTreatedAsSeeded(t *testing.T) {
 	}
 	if got := diag.ExitCode(err); got != 1 {
 		t.Errorf("ExitCode = %d, want 1", got)
+	}
+}
+
+// repoToplevel used to run git with CombinedOutput and parse the merged
+// stream as the path. Git writes to stderr even when it succeeds — GIT_TRACE
+// is a real-world example, and advice/hint lines are another — so any such
+// output landing before the path text corrupted it. Confirm the parsed path
+// is stdout alone by making git as noisy as possible on stderr.
+func TestRepoToplevelParsesStdoutOnly(t *testing.T) {
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	t.Setenv("GIT_TRACE", "1")
+
+	top, _, err := repoToplevel(dir)
+	if err != nil {
+		t.Fatalf("repoToplevel: %v", err)
+	}
+	if strings.Contains(top, "trace:") {
+		t.Fatalf("parsed path contains git trace output: %q", top)
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realTop, err := filepath.EvalSymlinks(top)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", top, err)
+	}
+	if realTop != realDir {
+		t.Errorf("top = %q, want %q", realTop, realDir)
+	}
+}
+
+// The end-to-end version of the bug: with GIT_TRACE=1 in the environment
+// (exec.Command inherits the parent's env unless cmd.Env is set, and
+// repoToplevel never sets it), rev-parse's trace lines used to corrupt the
+// parsed toplevel enough that it no longer matched dir, so isRepoRoot
+// reported a healthy repository as not a repository at all.
+func TestIsRepoRootIgnoresGitTraceOnStderr(t *testing.T) {
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	t.Setenv("GIT_TRACE", "1")
+
+	if !isRepoRoot(dir) {
+		t.Fatal("isRepoRoot reported a healthy repository as not a repository while GIT_TRACE was set")
 	}
 }

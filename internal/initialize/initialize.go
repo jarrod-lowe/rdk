@@ -3,6 +3,7 @@
 package initialize
 
 import (
+	"bytes"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -20,19 +21,28 @@ import (
 //go:embed seed/config.yaml
 var seedConfig string
 
-// repoToplevel runs `git rev-parse --show-toplevel` and hands back git's raw
-// combined output alongside the result. isRepoRoot only ever needs the bool,
-// but the caller that must explain a directory git still can't use after
-// `git init` needs git's own words: git names the actionable fix (e.g. the
-// safe.directory command to run), and a bare bool would throw that away.
-func repoToplevel(dir string) (top string, out []byte, err error) {
+// repoToplevel runs `git rev-parse --show-toplevel` and hands back the
+// parsed path from stdout plus git's stderr, kept separate. isRepoRoot only
+// ever needs the bool, but the caller that must explain a directory git
+// still can't use after `git init` needs git's own words: git names the
+// actionable fix (e.g. the safe.directory command to run) on stderr, and a
+// bare bool would throw that away. The streams cannot be merged before
+// parsing: git writes to stderr even on success — GIT_TRACE=1,
+// GIT_CURL_VERBOSE, GIT_TRACE_SETUP, and advice/hint lines all land there —
+// so folding it into the same string as stdout corrupts the path with
+// trace/advice text that happens to precede it. top is therefore parsed from
+// stdout alone; stderr is returned only for a human-facing message.
+func repoToplevel(dir string) (top string, stderr []byte, err error) {
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
 	cmd.Dir = dir
-	out, err = cmd.CombinedOutput()
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	err = cmd.Run()
 	if err != nil {
-		return "", out, err
+		return "", stderrBuf.Bytes(), err
 	}
-	return strings.TrimSpace(string(out)), out, nil
+	return strings.TrimSpace(stdoutBuf.String()), stderrBuf.Bytes(), nil
 }
 
 // isRepoRoot asks git whether dir is itself the root of a working
