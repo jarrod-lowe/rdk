@@ -279,25 +279,29 @@ func (e *lockNotReleasedError) Error() string        { return e.err.Error() }
 func (e *lockNotReleasedError) Unwrap() error        { return e.err }
 func (e *lockNotReleasedError) Is(target error) bool { return target == ErrLockNotReleased }
 
-// ErrLockNotDurable reports that HoldLock created the held lock — .rdk/lock
-// is a complete, valid file the instant this fires, exactly as complete as it
-// would be without this check — but rdk could not confirm its directory
-// entry reached durable storage before returning. Without the fsync this
-// guards, a crash (power loss, a kernel panic — not an ordinary SIGKILL of
-// just the rdk process, since the entry Link already made is visible to any
-// other process on the same live filesystem regardless of durability) landing
-// after Link returns but before the filesystem flushes the entry on its own
-// can leave .rdk/lock entirely absent on the next boot, even though rdk lock
-// already printed success and handed the id to whoever ran it. That is the
-// broken promise this feature exists to prevent: a person or agent believing
-// applies are excluded returns to a repository that reports itself unlocked,
-// and nobody is notified, because from rdk's point of view the lock was never
-// taken. This sentinel is for the one related failure a unit test can
-// actually produce — the sync call itself erroring, on a platform and
-// filesystem where it is expected to succeed — reported rather than
-// swallowed, since the lock genuinely exists on disk right now and its id is
-// the only way to act on it either way (see lockNotDurableErrorFor).
-var ErrLockNotDurable = errors.New("held lock created, but its directory entry could not be confirmed durable")
+// ErrLockNotDurable reports that a change to the held lock's directory
+// entry — HoldLock creating .rdk/lock, or Unlock removing it — genuinely
+// happened, exactly as completely as it would have without this check, but
+// rdk could not confirm that change reached durable storage before
+// returning. Without the fsync this guards, a crash (power loss, a kernel
+// panic — not an ordinary SIGKILL of just the rdk process, since the change
+// already made is visible to any other process on the same live filesystem
+// regardless of durability) landing after the change returns but before the
+// filesystem flushes it on its own can undo that change on the next boot:
+// after a creation, .rdk/lock can be entirely absent even though rdk lock
+// already printed success and handed the id to whoever ran it; after a
+// removal, .rdk/lock can reappear even though rdk unlock already printed
+// success and the id needed to remove it again may already be gone. Both are
+// the same broken promise this feature exists to prevent: someone believing
+// the repository's lock state is what rdk just told them returns to find it
+// is not, and nobody is notified, because from rdk's own point of view the
+// change was never undone. This sentinel is for the one related failure a
+// unit test can actually produce — the sync call itself erroring, on a
+// platform and filesystem where it is expected to succeed — reported rather
+// than swallowed, since the change genuinely happened and the id is the only
+// way to act on it either way (see lockNotDurableErrorFor and
+// lockNotDurableErrorForRemoval).
+var ErrLockNotDurable = errors.New("held lock's directory entry could not be confirmed durable")
 
 // lockNotDurableError carries the id alongside the sync failure the same way
 // lockedError and lockNotReleasedError do. cmd/lock.go's lockHoldError has a
@@ -330,6 +334,49 @@ func lockNotDurableErrorFor(info LockInfo, syncErr error) error {
 		info: info,
 	}
 }
+
+// lockNotDurableErrorForRemoval wraps a directory-sync failure that followed
+// an otherwise-successful removal of the held lock by Unlock. info is the
+// record Unlock already read to confirm id matched before removing it — the
+// lock this call genuinely just removed — so the id folded into the message
+// is real, not fabricated.
+//
+// A separate constructor from lockNotDurableErrorFor rather than one shared
+// function branching on direction: both build the same *lockNotDurableError
+// wrapping the same ErrLockNotDurable (rule 7 — the sentinel, the struct, and
+// syncHeldLockDir are all reused), but the correct next step is opposite in
+// the two directions, so a single message covering both would have to hedge
+// or be wrong half the time. lockNotDurableErrorFor tells the reader the
+// lock is still on disk and in effect and how to use or release it — exactly
+// backwards here, where the lock is gone and what is unconfirmed is only
+// whether its directory entry's removal will stay durable.
+func lockNotDurableErrorForRemoval(info LockInfo, syncErr error) error {
+	return &lockNotDurableError{
+		err: fmt.Errorf("%w: lock %s was removed, but its directory entry's removal may not survive a crash before the filesystem flushes it on its own — if that happens %s can reappear and block applies again with nobody told; check whether it still exists, and remove it again if so: %v",
+			ErrLockNotDurable, info.ID, ScratchDir+"/lock", syncErr),
+		info: info,
+	}
+}
+
+// ErrShuttingDown reports that acquireLock refused to publish a new
+// transaction lock because this Store's PrepareShutdown had already been
+// called. It exists to close a window neither more mutex discipline inside
+// acquireLock nor a faster signal handler can close on its own: a handler
+// that has already decided "nothing is held, nothing to release" cannot be
+// made to also know about an acquisition that has not started yet. The fix is
+// to let it foreclose that acquisition instead — see PrepareShutdown and
+// acquireLock's own doc comments for the mechanism and exactly what it
+// closes.
+//
+// In practice this is almost never user-visible: PrepareShutdown's only
+// intended caller is a signal handler that calls os.Exit immediately
+// afterward, so a caller of Materialize or HoldLock almost never gets to
+// observe this error before the process ends anyway. It is still a real,
+// returned error rather than left implicit, because "almost never observed"
+// is not "never observed" — a slow write or a scheduler delay in that same
+// window could let it reach the top before the handler's os.Exit does, and a
+// caller that did observe it deserves an honest reason, not a panic.
+var ErrShuttingDown = errors.New("rdk is shutting down: refusing to create a new lock")
 
 // Store is the injected set of filesystem actions rdk performs. The real
 // implementation is rooted at the repo, so no operation can escape it.
@@ -394,6 +441,24 @@ type Store interface {
 	// exclude it. Idempotent, so both a deferred call and a signal handler
 	// can call it unconditionally.
 	ReleaseLock() error
+	// PrepareShutdown tells this Store that the process holding it is about
+	// to end: no acquireLock call that has not yet started may publish a new
+	// transaction lock after this returns, and whatever transaction lock
+	// this Store already holds is released, exactly as ReleaseLock would.
+	//
+	// It exists for one caller: a SIGINT/SIGTERM handler that used to call
+	// only ReleaseLock and, in doing so, left a window ReleaseLock alone
+	// cannot close — a handler whose ReleaseLock runs and correctly finds
+	// nothing to release, followed by a concurrent acquireLock that had not
+	// yet started completing and publishing a lock the handler will now
+	// never see, before os.Exit ends the process with no second release
+	// ever running (see acquireLock's own doc comment for the full
+	// argument). Calling this instead closes it: acquireLock refuses to
+	// publish once this has run, so the outcome is always one of two —
+	// refused, or acquired-then-released — never a stranded third.
+	//
+	// Idempotent, like ReleaseLock, which it calls.
+	PrepareShutdown() error
 	// BreakLock removes a lock only if its id matches, checking the held
 	// lock and the transaction lock and removing whichever carries the id —
 	// ids are unique across both, so the id alone is an unambiguous handle
@@ -411,25 +476,36 @@ type Store interface {
 	// lock is held: an apply is then genuinely in flight, and rdk lock
 	// returning success while that is true would be exactly the lie the
 	// feature exists to prevent. It also briefly takes the transaction lock
-	// itself while it creates the held one, and releases it before
-	// returning; if that release fails, the returned LockInfo is still the
-	// held lock this call genuinely created — the error wraps
-	// ErrLockNotReleased, the same sentinel Materialize uses, so the caller
-	// is not told the whole call failed when only the cleanup did. Before
-	// reporting success at all, it fsyncs the directory holding .rdk/lock —
-	// on Unix; see syncHeldLockDir for why not on Windows — so the promise
-	// "the repository is held" cannot outlive its own directory entry across
-	// a crash; a failure there is reported via ErrLockNotDurable, with the
-	// same info-survives-the-error treatment as ErrLockNotReleased, since the
-	// lock is genuinely on disk either way and its id is what makes that
-	// actionable.
+	// itself while it creates the held one, and releases it before the
+	// durability sync described below (not merely before returning — the
+	// order matters, see HoldLock's own doc comment in store.go); if that
+	// release fails, the returned LockInfo is still the held lock this call
+	// genuinely created — the error wraps ErrLockNotReleased, the same
+	// sentinel Materialize uses, so the caller is not told the whole call
+	// failed when only the cleanup did. Only once that release has
+	// succeeded, and before reporting success at all, it fsyncs the
+	// directory holding .rdk/lock — on Unix; see syncHeldLockDir for why not
+	// on Windows — so the promise "the repository is held, and only that" is
+	// what a crash can restore, not a state that still includes the
+	// transient transaction lock; a failure there is reported via
+	// ErrLockNotDurable, with the same info-survives-the-error treatment as
+	// ErrLockNotReleased, since the lock is genuinely on disk either way and
+	// its id is what makes that actionable.
 	HoldLock(message string) (LockInfo, error)
 	// Unlock ends a held lock, and only ever writes to the held lock file.
 	// It names the lock because between reading an id and typing it the lock
 	// may have been replaced. It reads the transaction lock too, purely to
 	// diagnose: an id that names a running apply gets a message redirecting
 	// to --break-lock instead of a generic "no lock" — ending someone's
-	// running apply is breaking, not unlocking.
+	// running apply is breaking, not unlocking. The removal is made durable
+	// the same way HoldLock's own creation is (syncHeldLockDir), and for the
+	// mirror-image reason: without it, a crash after Unlock has reported
+	// success could restore .rdk/lock on the next boot, blocking applies
+	// under a lock whose id the caller may already have discarded. A sync
+	// failure is reported via ErrLockNotDurable, the same sentinel HoldLock
+	// uses for the creation-side version of this gap — see
+	// lockNotDurableErrorForRemoval for why the message differs even though
+	// the sentinel does not.
 	Unlock(id string) error
 	// UseLock runs under an existing held lock without taking or releasing it.
 	// It returns the lock's details from the very read that verified id, rather
@@ -481,6 +557,19 @@ type osStore struct {
 	// than UseLock's own check being trusted to still hold by then.
 	usingLock   bool
 	usingLockID string
+
+	// shuttingDown records that PrepareShutdown has been called on this Store
+	// value, guarded by lockMu like the fields above it. Once true,
+	// acquireLock's owned (scratchApplyLock) path refuses to publish a lock
+	// rather than create one nothing will ever release — see acquireLock's
+	// own doc comment for why checking this under the same critical section
+	// that records ownership and performs Link is what makes the two
+	// mutually exclusive rather than merely likely to be, and PrepareShutdown's
+	// doc comment for the one caller this exists for. Never cleared: nothing
+	// calls PrepareShutdown except a handler about to end the process, so
+	// there is no later point in this Store value's life where "shutting
+	// down" would stop being true.
+	shuttingDown bool
 }
 
 // New opens a Store rooted at repoRoot. All operations are confined to it and
@@ -927,15 +1016,34 @@ func (s *osStore) writeScratchTemp(prefix string, b []byte, sync bool) (string, 
 // or the attempt failed (present as someone else's, or absent only because
 // this call never recorded anything for it to find).
 //
-// What is not closed, stated plainly rather than implied away (rule 12): a
-// signal whose handler's ReleaseLock call runs and returns — correctly
-// finding nothing yet to release — before this call ever takes lockMu, can
-// still be followed by this call completing and the process exiting with no
-// second release ever running. Synchronising signal delivery itself against
-// an in-flight acquisition would close it, and is out of scope here. What
-// this fix buys instead is narrower but real: a strand left this way is now
-// always a complete record --break-lock can name, never the zero-length file
-// that could not be.
+// What this specific fix does not close, stated plainly rather than implied
+// away (rule 12): a signal whose handler's ReleaseLock call runs and
+// returns — correctly finding nothing yet to release — before this call ever
+// takes lockMu, can still be followed by this call completing and the
+// process exiting with no second release ever running. Holding lockMu longer
+// here cannot help with that: the handler's ReleaseLock genuinely observed
+// "nothing held" and was correct about the state at the instant it ran: the
+// problem is a *future* acquisition landing after the handler has already
+// decided there is nothing to clean up, and no amount of mutex discipline
+// inside this call changes when it runs relative to that decision.
+//
+// That residual is what shuttingDown and PrepareShutdown close, not by
+// synchronising signal delivery against an in-flight acquisition (out of
+// scope, and unnecessary), but by letting the handler foreclose future
+// acquisitions instead of only reacting to past ones: the owned branch below
+// checks shuttingDown inside the exact critical section this comment already
+// established is atomic with the Link call. PrepareShutdown sets the flag in
+// its own such section before it ever calls ReleaseLock, so the mutex's total
+// order settles which of two outcomes happened — never a third: either this
+// call's critical section runs first and completes normally, in which case
+// PrepareShutdown's later ReleaseLock finds it and removes it; or
+// PrepareShutdown's critical section runs first, in which case this call
+// finds shuttingDown true, creates nothing, and PrepareShutdown's
+// ReleaseLock has nothing to find. This closes the window for good, not
+// merely further, but only once a caller actually invokes PrepareShutdown
+// before its own process-ending step — see PrepareShutdown's doc comment for
+// what that caller must be, and its own note on whether that call is wired
+// in yet.
 //
 // Only the transaction lock is recorded as this store's. ReleaseLock only
 // ever targets scratchApplyLock, so a held lock's id in those fields was
@@ -983,6 +1091,22 @@ func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 	owned := file == scratchApplyLock
 	if owned {
 		s.lockMu.Lock()
+		// Checked inside the same critical section that records ownership
+		// and performs Link, not before it: see acquireLock's own doc
+		// comment (the paragraph on shuttingDown and PrepareShutdown) for why
+		// that specific placement is what makes "refused" and "acquired" the
+		// only two possible outcomes once a shutdown has been recorded,
+		// rather than leaving a gap between checking the flag and acting on
+		// it. Only the owned (scratchApplyLock) path checks it: the held
+		// lock (scratchLock) is created by HoldLock only after this branch
+		// has already succeeded for the transaction lock protecting it, so a
+		// refusal here already stops HoldLock before it ever reaches that
+		// second acquireLock call.
+		if s.shuttingDown {
+			s.lockMu.Unlock()
+			_ = s.root.Remove(tmp)
+			return LockInfo{}, ErrShuttingDown
+		}
 		s.lockHeld = true
 		s.lockID = info.ID
 		if afterLockOwnershipRecorded != nil {
@@ -1207,6 +1331,41 @@ func (s *osStore) ReleaseLock() error {
 	return nil
 }
 
+// PrepareShutdown records that this Store must never publish another
+// transaction lock, then releases whatever transaction lock it already
+// holds. See the Store interface's own doc comment for the property this
+// gives a caller, and acquireLock's doc comment for the mutex-ordering
+// argument that makes it airtight rather than merely likely.
+//
+// The two steps are deliberately two separate lockMu critical sections, not
+// one: setting shuttingDown first and unlocking before calling ReleaseLock
+// (which takes lockMu again itself) is what lets acquireLock's own critical
+// section interleave cleanly between them rather than needing to reason
+// about a single call holding lockMu across both a flag write and a
+// filesystem read-and-remove. Whichever of the two — this flag write, or a
+// concurrent acquireLock's owned critical section — the mutex lets run
+// first fully determines the outcome before the other can start (see
+// acquireLock's doc comment for why that is true), so nothing is lost by
+// not combining them into one section.
+//
+// Idempotent: safe to call more than once. Nothing in this codebase does so
+// today (the signal channel this exists for is read at most once — see
+// cmd/root.go's handleSignals), but PrepareShutdown makes no assumption
+// about that; a second call simply finds shuttingDown already true and
+// ReleaseLock already a no-op.
+//
+// cmd/root.go's SIGINT/SIGTERM handler (handleSignals) is the caller this
+// exists for, and must call this in place of the bare ReleaseLock call it
+// makes today: adding this method to Store does not, by itself, change what
+// that handler calls, and the window acquireLock's doc comment describes
+// stays open in production until it does.
+func (s *osStore) PrepareShutdown() error {
+	s.lockMu.Lock()
+	s.shuttingDown = true
+	s.lockMu.Unlock()
+	return s.ReleaseLock()
+}
+
 // checkStillLocked verifies this run still holds the transaction lock it
 // acquired. Called immediately before each irreversible step, because between
 // acquiring and here someone may have run --break-lock on a live lock —
@@ -1307,6 +1466,21 @@ func (s *osStore) checkStillLockedAfterPublish() error  { return s.checkStillLoc
 // releases it via defer or the signal handler — working unchanged now that
 // there are two files to look in, rather than regressing to "only clears a
 // held lock" the moment the split landed.
+//
+// Deliberately does not get Unlock's directory-sync treatment when the file
+// it removes is scratchLock, even though the risk is the same shape: a crash
+// after this returns success could restore .rdk/lock, and the caller who ran
+// --break-lock may not still have the id handy to remove it again. Excluded,
+// not merely overlooked: this function's only caller (cmd/apply.go's
+// --break-lock flag) treats any non-nil error from BreakLock as "nothing was
+// removed" (diag.CodeLockMismatch, "cannot break lock") — that call site is
+// out of scope for this change, and today it has no branch that could report
+// "the lock was removed, but its removal is unconfirmed" without lying about
+// which of those two happened. Adding the sync here without a caller able to
+// surface its failure correctly would either drop a real error silently or
+// misreport a successful break as a no-op, and the second is worse than the
+// gap it would claim to close. The fix belongs at the cmd/apply.go call site
+// once it is in scope.
 func (s *osStore) BreakLock(id string) (LockInfo, error) {
 	// An empty id is not a compare-and-swap, it is "remove whatever is
 	// there" — the one thing this function exists not to be. It would also
@@ -1525,20 +1699,23 @@ func (s *osStore) HoldLock(message string) (info LockInfo, err error) {
 		return LockInfo{}, err
 	}
 	// Mirrors Materialize's named-return defer (see its doc comment for the
-	// full reasoning): a bare `defer s.ReleaseLock()` here had the identical
-	// shape of bug — a release that failed after the held lock was already
-	// created left rdk lock reporting success with .rdk/apply.lock still on
-	// disk, and every apply or rdk lock after it would then block on a
-	// transaction lock nobody holds. cmd/lock.go's lockHoldError special-cases
-	// that outcome — checking ErrLockNotReleased before its ErrLockTarget
-	// branch, deliberately, since a release that fails because .rdk/apply.lock
-	// itself is unusable wraps both sentinels, and reporting the target
-	// problem first would bury the fact that the held lock already exists —
-	// so this surfaces as a lock-not-released diagnostic at exit 1, not an
-	// unclassified error. That ordering depends on info surviving this
-	// function's own failure path: info is assigned once, by the final
-	// acquireLock below, and nothing after that point — not the directory
-	// sync, not this defer — ever reassigns it, only err. So a caller seeing
+	// full reasoning): this backstops every exit path that returns before
+	// the explicit release further down runs — most importantly, the
+	// acquireLock call right below failing, which returns before ever
+	// reaching it. On the ordinary path this defer finds nothing left to
+	// do: the explicit release has already run and cleared lockHeld, so
+	// this is a harmless idempotent no-op by the time it fires.
+	// cmd/lock.go's lockHoldError special-cases a release failure reaching
+	// it here — checking ErrLockNotReleased before its ErrLockTarget
+	// branch, deliberately, since a release that fails because
+	// .rdk/apply.lock itself is unusable wraps both sentinels, and
+	// reporting the target problem first would bury the fact that the held
+	// lock already exists — so this surfaces as a lock-not-released
+	// diagnostic at exit 1, not an unclassified error. That ordering
+	// depends on info surviving this function's own failure path: info is
+	// assigned once, by the acquireLock below, and nothing after that
+	// point — not the explicit release, not the directory sync, not this
+	// defer — ever reassigns it, only err. So a caller seeing
 	// ErrLockNotReleased or ErrLockNotDurable still has the real id to
 	// report.
 	defer func() {
@@ -1556,14 +1733,51 @@ func (s *osStore) HoldLock(message string) (info LockInfo, err error) {
 	if afterHeldLockLinked != nil {
 		afterHeldLockLinked()
 	}
-	// The held lock is complete and Link has already made it visible; what is
-	// not yet true is that its directory entry would survive a crash right
-	// now. Run only here, after Link has succeeded, not before: a crash
-	// between the two is harmless, since nothing has told the caller the lock
-	// exists yet. Scoped to the held lock alone — see syncHeldLockDir's own
-	// doc comment for why the transaction lock this function also uses does
-	// not get the same treatment, and why a failure here is reported rather
-	// than swallowed.
+	// Released here, explicitly, rather than left to the defer above: the
+	// held lock is complete and visible, but .rdk/apply.lock — the
+	// transaction lock this call took in order to create it — is still on
+	// disk, and the sync below is about to make durable whatever .rdk's
+	// directory looks like at the moment it runs. Syncing before this
+	// release (what this function used to do, relying solely on the
+	// deferred call after its own return) flushed a directory that still
+	// contained .rdk/apply.lock; the deferred release's own unlink then ran
+	// afterward, with no sync of its own. A crash landing after that unlink
+	// but before the filesystem flushed it on its own could restore
+	// .rdk/apply.lock on the next boot — not corrupt, just back — blocking
+	// every apply, including one run with --with-lock, exactly as if one
+	// were genuinely in flight, even though rdk lock had already reported
+	// success and no apply had run at all. That is the broken promise this
+	// reordering exists to prevent: releasing first makes the directory
+	// state the sync below captures match the one HoldLock is about to
+	// promise — only .rdk/lock exists — rather than a transient state that
+	// was never the promise at all.
+	//
+	// A release failure here is reported as ErrLockNotReleased and returned
+	// immediately, before the sync ever runs: there is nothing yet worth
+	// confirming durable, since .rdk/apply.lock is still there and still
+	// blocking every apply regardless of what a sync would say about it.
+	// The deferred call above still fires after this return — idempotent,
+	// so a transient failure gets a free retry, and a persistent one is
+	// simply observed twice and reported once, the same duplicate-
+	// suppression Materialize's own defer comment already accepts (rule
+	// 12).
+	if relErr := s.ReleaseLock(); relErr != nil {
+		return info, relErr
+	}
+	if afterHoldLockReleasedTransactionLock != nil {
+		afterHoldLockReleasedTransactionLock()
+	}
+	// The held lock is complete and Link already made it visible, and the
+	// transaction lock that protected its creation is now genuinely gone;
+	// what is not yet true is that this directory state would survive a
+	// crash right now. Run only here, after both of those, not before: a
+	// crash before Link is harmless (nothing has told the caller the lock
+	// exists yet), and a crash before the release above is exactly the
+	// failure this reordering exists to prevent. Scoped to the held lock
+	// alone — see syncHeldLockDir's own doc comment for why the transaction
+	// lock this function also used does not get the same treatment on its
+	// own account, and why a failure here is reported rather than
+	// swallowed.
 	if syncErr := s.syncHeldLockDir(); syncErr != nil {
 		err = lockNotDurableErrorFor(info, syncErr)
 	}
@@ -1571,17 +1785,23 @@ func (s *osStore) HoldLock(message string) (info LockInfo, err error) {
 }
 
 // syncHeldLockDir makes .rdk's directory entry for the held lock durable
-// before HoldLock reports success, closing the gap acquireLock's own fsync
-// does not: that call flushes the lock *file's* bytes before anything points
-// at them (see writeScratchTemp and acquireLock's doc comment), which stops a
-// crash from producing a zero-length lock, but says nothing about whether the
-// *name* Link just added is itself durable. Without this, a power loss or
-// kernel panic after Link returns but before the filesystem flushes the
-// directory entry on its own can leave .rdk/lock completely absent on the
-// next boot — not empty, gone — even though rdk lock already printed success
-// and handed the id to whoever ran it. That is a broken promise this feature
-// exists to prevent (see ErrLockNotDurable), so it is checked before HoldLock
-// reports success, not left to chance.
+// before HoldLock or Unlock reports success, closing a gap acquireLock's own
+// fsync does not cover on the creation side: that call flushes the lock
+// *file's* bytes before anything points at them (see writeScratchTemp and
+// acquireLock's doc comment), which stops a crash from producing a
+// zero-length lock, but says nothing about whether the *name* Link just added
+// (or, on Unlock's side, just removed) is itself durable. On the creation
+// side, without this, a power loss or kernel panic after Link returns but
+// before the filesystem flushes the directory entry on its own can leave
+// .rdk/lock completely absent on the next boot — not empty, gone — even
+// though rdk lock already printed success and handed the id to whoever ran
+// it. On the removal side the failure is the mirror image: the same kind of
+// crash after Remove returns can leave .rdk/lock's directory entry exactly as
+// it was before the remove, even though rdk unlock already printed success
+// and the caller may have already discarded the id needed to remove it again.
+// Both are the same broken promise this feature exists to prevent (see
+// ErrLockNotDurable), so both call this before reporting success, not left to
+// chance.
 //
 // Scoped to the held lock only, never called for the transaction lock: a
 // crash kills the transaction lock's own holder (the applying process) at
@@ -1646,6 +1866,15 @@ func (s *osStore) syncHeldLockDir() error {
 // reads scratchApplyLock too, purely to diagnose — an id naming a running
 // apply gets the redirecting message, rather than degrading to "no lock is
 // held" just because Unlock looked in the wrong file for it.
+//
+// The removal is made durable the same way HoldLock's creation is, and for
+// the same reason: without it, `rdk unlock` could report success and then a
+// crash could restore .rdk/lock, and the caller who was just told the
+// repository is free has no reason to have kept the id needed to remove it a
+// second time. This is the mirror this fix adds; it was missing when the
+// creation side's own durability sync landed, even though the two are the
+// same promise from opposite directions. See syncHeldLockDir's doc comment
+// for why the same helper covers both.
 func (s *osStore) Unlock(id string) error {
 	if id == "" {
 		return errors.New("a lock id is required: rdk unlock names the one lock it may release")
@@ -1657,6 +1886,12 @@ func (s *osStore) Unlock(id string) error {
 	if heldErr == nil && held.ID == id {
 		if err := s.root.Remove(scratchLock); err != nil && !os.IsNotExist(err) {
 			return err
+		}
+		if afterHeldLockRemoved != nil {
+			afterHeldLockRemoved()
+		}
+		if syncErr := s.syncHeldLockDir(); syncErr != nil {
+			return lockNotDurableErrorForRemoval(held, syncErr)
 		}
 		// No ownership to clear: lockHeld/lockID track only the
 		// transaction lock (see acquireLock), and a held lock's id can
@@ -1873,10 +2108,22 @@ func (s *osStore) seedNew(name string, data []byte) error {
 
 // modeKind names what occupies a seed target, for a message that says what's
 // actually in the way instead of just that it isn't a file.
+//
+// IsRegular is checked explicitly rather than falling through to the
+// "non-regular file" default: two callers (checkPathComponents,
+// ensureScratchDir) invoke this for anything that fails an IsDir check, which
+// includes plain regular files — a bare file at .rdk, say — and "it is a
+// non-regular file, not a directory" said the opposite of what was true about
+// exactly the thing it was describing. The other two callers (lockPathUsable,
+// seedExisting) only ever reach modeKind after already excluding regular
+// files by their own guard, so this case is unreachable from them; it exists
+// for the two callers that need it.
 func modeKind(mode fs.FileMode) string {
 	switch {
 	case mode.IsDir():
 		return "directory"
+	case mode.IsRegular():
+		return "file"
 	case mode&fs.ModeSymlink != 0:
 		return "symlink"
 	case mode&fs.ModeDevice != 0:

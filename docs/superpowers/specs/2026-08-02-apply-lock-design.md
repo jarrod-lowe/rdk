@@ -418,7 +418,18 @@ for `SIGTERM`, so a script can tell an interruption from a definition error (1)
 or an rdk bug (2).
 
 Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
-`--break-lock=<id>` is the stated recovery.
+`--break-lock=<id>` is the stated recovery — with one correction to that claim,
+found in review and closed by a later step (see "Stated limits" and step 7 in
+"Sequencing"): an ordinary `SIGINT`/`SIGTERM` *could* also leave one behind,
+through a window this section's own earlier wording did not admit. The
+handler's `ReleaseLock` call can correctly observe "nothing held" and return,
+and a concurrent `acquireLock` that had not yet started when it did so can
+still go on to complete and publish a lock afterward, with no second release
+ever running before `os.Exit`. `PrepareShutdown` closes that by letting the
+handler foreclose the acquisition instead of only reacting to one that already
+happened — see `acquireLock`'s own doc comment in `internal/repofs/store.go`
+for the mechanism, and the same "Stated limits" entry for the wiring this
+depends on.
 
 ## Stated limits (rule 12)
 
@@ -484,6 +495,35 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
   beneath the OS. A sync failure is reported as `ErrLockNotDurable` rather
   than swallowed: the lock is genuinely on disk either way, so the error
   carries its id instead of pretending nothing happened.
+- **The sync above used to run before `HoldLock` released the transaction
+  lock it took to protect the held lock's creation, which undermined its own
+  guarantee; it now runs after.** Found in review: `HoldLock` acquires
+  `.rdk/apply.lock`, creates `.rdk/lock` under it, and used to sync `.rdk`'s
+  directory *before* its own deferred release of `.rdk/apply.lock` had run —
+  so the state actually made durable still included the transaction lock,
+  and the unsynced `unlink` that removed it afterward could be undone by
+  exactly the crash this feature exists to guard against, restoring
+  `.rdk/apply.lock` on the next boot even though `rdk lock` had already
+  reported success and no apply had run at all — blocking every apply,
+  including one run with `--with-lock`, on a lock nothing held. `HoldLock`
+  now releases the transaction lock explicitly, checks that release
+  succeeded, and only then syncs — so the directory state the sync captures
+  matches the one `rdk lock` is about to promise. The same durability
+  guarantee was also extended to the removal side, which had none at all:
+  `rdk unlock` now syncs `.rdk`'s directory after removing `.rdk/lock` and
+  before reporting success, for the mirror-image reason — without it, a
+  crash after `rdk unlock` reports success could restore `.rdk/lock`, and the
+  caller who was just told the repository is free has no reason to have kept
+  the id needed to remove it a second time. Both share `ErrLockNotDurable`
+  and the directory-sync call itself (`syncHeldLockDir`) rather than each
+  getting their own — the underlying fact reported is the same in both
+  directions, just opposite in which change might not survive. `BreakLock`
+  does not get the same treatment when it removes a held lock: its only
+  caller treats any error from it as "nothing was removed," and that caller
+  is unchanged by this fix, so adding a sync here without a way to report its
+  failure correctly would risk misreporting a successful break as a no-op —
+  worse than the gap it would claim to close. See `BreakLock`'s own doc
+  comment in `internal/repofs/store.go`.
 - **The directory-entry sync above only runs on Unix.** Directory `fsync` is
   POSIX behaviour; Windows's `FlushFileBuffers` is not supported on a
   directory handle, so there is no call available there that could tell the
@@ -561,6 +601,36 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
   mixed managed tree, though: the two locks are independent files, so the
   worst case is the held lock and a fresh apply both existing at once, not a
   corrupted `rdk-managed/`.
+- **A signal handler whose `ReleaseLock` call correctly finds nothing to
+  release can still be followed by a concurrent `acquireLock` publishing a
+  lock nothing ever releases — this section used to document that as a
+  residual the design accepted, and it is now closed, not merely narrowed,
+  given one condition.** `acquireLock` already holds `lockMu` across
+  recording ownership and the `Link` call that makes a lock visible (see
+  "Two kinds, two files" and `acquireLock`'s own doc comment); that closed a
+  narrower window where a racing `ReleaseLock` could withdraw a claim about
+  to exist. What it left open: a handler's `ReleaseLock` running and
+  returning — correctly, since nothing was held yet — *before* a concurrent
+  `acquireLock` had even started, followed by that call completing normally
+  and `os.Exit` ending the process with no second release ever running.
+  Holding `lockMu` longer inside `acquireLock` cannot fix this, because the
+  handler was not wrong about the state at the instant it ran; the problem is
+  a *future* acquisition, not a stale read of a past one. The fix is a new
+  `Store.PrepareShutdown`, called by the handler in place of a bare
+  `ReleaseLock`: it records, under `lockMu`, that no further lock may be
+  published, then releases whatever is already held. `acquireLock`'s owned
+  (`.rdk/apply.lock`) path checks that flag inside the very critical section
+  already described above, so the mutex's total order settles the outcome
+  completely — either `PrepareShutdown`'s flag-write runs first and the
+  acquisition is refused before `Link` ever runs, or the acquisition's
+  critical section runs first and completes, in which case
+  `PrepareShutdown`'s own call to `ReleaseLock` finds it and removes it.
+  There is no third outcome. The one condition: this closes the window only
+  once the caller it exists for — `cmd/root.go`'s `SIGINT`/`SIGTERM` handler
+  — actually calls `PrepareShutdown` instead of the bare `ReleaseLock` it
+  calls today. Adding the method to `Store` does not by itself change what
+  that handler calls; see `PrepareShutdown`'s own doc comment in
+  `internal/repofs/store.go`.
 
 ## Migration
 
@@ -584,13 +654,15 @@ the JSON claims (see "Two kinds, two files" above).
 
 ## Sequencing
 
-Six steps. The first two share one file format designed for both, so the
+Seven steps. The first two share one file format designed for both, so the
 second was a command and a warning rather than a format migration; the third
 splits that one file into two without changing the format or the
 user-visible surface at all; the fourth closes a gap the split itself opened;
 the fifth is a full audit of the mechanism against its own goals, closing
 what it found a fix for and stating what it could not; the sixth closes a
-gap found in review of the fifth's own `HoldLock` fix:
+gap found in review of the fifth's own `HoldLock` fix; the seventh closes
+three more gaps found in review of the sixth's own change plus one this
+design had documented as permanent:
 
 1. **The apply lock** — the JSON file, acquire/release in `Materialize`,
    `--break-lock=<id>`, and the signal handler. This was the original P1.
@@ -642,6 +714,25 @@ gap found in review of the fifth's own `HoldLock` fix:
    (the new step 5), and refuses with `ErrLocked` if one has appeared — see
    that step's explanation above and "Stated limits" for precisely what
    closes and what does not.
+7. **Four review-driven fixes: two on `HoldLock`'s own durability ordering
+   and its removal-side mirror, one on `rdk lock`'s exit classification, and
+   one closing the last signal/acquisition race stated as permanent above.**
+   First, `HoldLock` used to sync `.rdk`'s directory before releasing the
+   transaction lock that protected the held lock's creation, so the state
+   made durable still contained that transaction lock and its later,
+   unsynced removal could be undone by the exact crash the sync exists to
+   guard against — release now runs first. Second, `rdk unlock` gained the
+   same durability sync on removal that `rdk lock` already had on creation,
+   which it should have had from the moment the creation side landed; see
+   the durability bullet in "Stated limits" for both. Third, `rdk lock`
+   reporting an unusable `.rdk` (`ErrScratchTarget`) fell through to an
+   unclassified error and exited 2 as an rdk bug, where `rdk apply` already
+   correctly exits 1 for the identical, user-fixable condition;
+   `cmd/lock.go`'s `lockHoldError` now has the matching branch. Fourth, the
+   signal-handler race stated as permanent in "Release on every exit" and in
+   "Stated limits" is closed via `Store.PrepareShutdown` — see that "Stated
+   limits" entry for the mechanism and the one condition its closure depends
+   on.
 
 ## Consequences
 

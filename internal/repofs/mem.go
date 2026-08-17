@@ -33,6 +33,15 @@ type Mem struct {
 	// re-verify it later — see store.go's Materialize for why.
 	usingLock   bool
 	usingLockID string
+
+	// shuttingDown mirrors osStore's: once PrepareShutdown has been called,
+	// no further acquireLock call may publish a transaction lock. Mem has no
+	// second goroutine to race this against (see the struct's own doc
+	// comment), so there is no window here for the flag to close — but the
+	// two Store implementations must still agree on the rule itself, not
+	// just on osStore's end state, or a component test written against Mem
+	// could assert a Store contract osStore does not actually have.
+	shuttingDown bool
 }
 
 // Compile-time assertion that *Mem satisfies Store.
@@ -150,6 +159,15 @@ func (m *Mem) acquireLock(file, message string) (LockInfo, error) {
 	// now acquires the transaction lock regardless of whether it also
 	// adopted the held lock via UseLock, so this running with usingLock true
 	// is the ordinary --with-lock path, not a bug to guard against.
+	//
+	// Mirrors osStore.acquireLock's shuttingDown check on the owned
+	// (scratchApplyLock) path only, for the same reason: the held lock is
+	// only ever created after this branch has already succeeded for the
+	// transaction lock protecting it, so refusing here already stops
+	// HoldLock before it gets there.
+	if file == scratchApplyLock && m.shuttingDown {
+		return LockInfo{}, ErrShuttingDown
+	}
 	if _, ok := m.files[file]; ok {
 		existing, _ := m.readLockFile(file)
 		return LockInfo{}, lockedErrorFor(existing)
@@ -235,6 +253,18 @@ func (m *Mem) ReleaseLock() error {
 	delete(m.files, scratchApplyLock)
 	m.lockHeld = false
 	return nil
+}
+
+// PrepareShutdown mirrors osStore.PrepareShutdown: sets shuttingDown so no
+// further transaction lock can be published, then releases whatever this Mem
+// already holds. Mem has no second goroutine to race a caller against (see
+// the struct's own doc comment), so unlike osStore's version there is no
+// mutex-ordering argument to make here — the two Store implementations must
+// still agree on the rule and the sequence (flag first, then release), not
+// just the end state.
+func (m *Mem) PrepareShutdown() error {
+	m.shuttingDown = true
+	return m.ReleaseLock()
 }
 
 // checkStillLocked mirrors osStore's pre-publish check only.

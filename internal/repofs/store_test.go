@@ -2314,6 +2314,65 @@ func TestHoldLockReleasesTheTransactionLock(t *testing.T) {
 	}
 }
 
+// A genuine power-loss test is impossible (see
+// TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced's own doc comment for
+// why); what this and the test below it verify instead is the observable
+// ordering the durability fix depends on: that HoldLock's own release of the
+// transaction lock happens strictly before the directory-entry sync that
+// follows it, not after. Before this fix, the sync ran first and the release
+// happened only via the deferred call after HoldLock had already returned —
+// so the directory state actually captured by the sync still contained
+// .rdk/apply.lock, and the unsynced unlink that removed it afterward could
+// come back after a crash even though rdk lock had already reported success
+// with no apply ever having run. Fails without the fix: run against the
+// pre-fix ordering (sync, then a bare `defer s.ReleaseLock()`), the
+// afterHoldLockReleasedTransactionLock seam this test relies on does not
+// exist at all — there was no point between "released" and "about to sync"
+// to fire it from, because release did not happen until after HoldLock had
+// already returned.
+func TestHoldLockReleasesTheTransactionLockBeforeSyncingTheDirectory(t *testing.T) {
+	s, root := newTestStore(t)
+
+	var applyLockGoneBeforeSync bool
+	afterHoldLockReleasedTransactionLock = func() {
+		_, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock"))
+		applyLockGoneBeforeSync = os.IsNotExist(err)
+	}
+	t.Cleanup(func() { afterHoldLockReleasedTransactionLock = nil })
+
+	if _, err := s.HoldLock("work"); err != nil {
+		t.Fatal(err)
+	}
+	if !applyLockGoneBeforeSync {
+		t.Error("the transaction lock was still on disk when the seam fired, immediately before the durability sync — the sync must run only after the release, or a crash between the two can restore .rdk/apply.lock")
+	}
+}
+
+// Complements the test above by checking the other side of the same
+// ordering: immediately after the held lock is linked into place — before
+// HoldLock's own explicit release runs at all — the transaction lock must
+// still be on disk. If it were already gone at this point, the release
+// would have to be running concurrently with, or before, the Link that
+// creates the held lock it exists to protect, which is not the sequence
+// HoldLock's doc comment describes.
+func TestHeldLockLinkDoesNotYetReleaseTheTransactionLock(t *testing.T) {
+	s, root := newTestStore(t)
+
+	var applyLockPresentAtLink bool
+	afterHeldLockLinked = func() {
+		_, err := os.Stat(filepath.Join(root, ScratchDir, "apply.lock"))
+		applyLockPresentAtLink = err == nil
+	}
+	t.Cleanup(func() { afterHeldLockLinked = nil })
+
+	if _, err := s.HoldLock("work"); err != nil {
+		t.Fatal(err)
+	}
+	if !applyLockPresentAtLink {
+		t.Error("the transaction lock was already gone right after the held lock was linked — the release must not run before this point")
+	}
+}
+
 // Two rdk locks must still read as "this repository is locked", not as
 // "another apply is running": the transaction lock is now an implementation
 // detail of rdk lock, and describing it to the user would be describing
@@ -2517,18 +2576,27 @@ func TestHoldLockSucceedsAndReturnsTheIDOnTheOrdinaryPath(t *testing.T) {
 // reports, rather than the fsync step being dead code that happens to
 // compile. It does this by making the real operation syncHeldLockDir
 // performs — opening .rdk through os.Root — fail for a real OS reason
-// (chmodUnreadable, fired from the afterHeldLockLinked seam once the held
-// lock is already linked into place) and checking that failure surfaces as
-// ErrLockNotDurable with the lock's real id still attached, both in the
-// structured LockInfo and in the error text itself. cmd/lock.go's
-// lockHoldError now has a dedicated branch for this sentinel, the same as
-// it does for ErrLockNotReleased (added by commit 84129eb), and that branch
-// gets the id from the LockInfo HoldLock already returned, not by parsing
-// err.Error() back apart. The id is folded into the error text anyway, as
-// defense-in-depth: any caller that reaches this sentinel without going
-// through lockHoldError — a future one, or anything that only prints
+// (chmodUnreadable, fired from the afterHoldLockReleasedTransactionLock seam
+// once the held lock is linked into place *and* the transaction lock that
+// protected its creation has already been released) and checking that
+// failure surfaces as ErrLockNotDurable with the lock's real id still
+// attached, both in the structured LockInfo and in the error text itself.
+// cmd/lock.go's lockHoldError now has a dedicated branch for this sentinel,
+// the same as it does for ErrLockNotReleased (added by commit 84129eb), and
+// that branch gets the id from the LockInfo HoldLock already returned, not
+// by parsing err.Error() back apart. The id is folded into the error text
+// anyway, as defense-in-depth: any caller that reaches this sentinel without
+// going through lockHoldError — a future one, or anything that only prints
 // err.Error() — still gets an actionable message (see lockNotDurableError's
 // doc comment in store.go).
+//
+// The seam fires after the release rather than at afterHeldLockLinked, its
+// old hook point, deliberately: the release itself now needs to read and
+// remove a file inside .rdk (see HoldLock's own doc comment on why the
+// release moved earlier), and on this platform that lookup needs more than
+// chmodUnreadable's search-only permission bits — firing any earlier would
+// make the release itself fail for the same reason the sync is supposed to,
+// which is not what this test is about.
 //
 // What this does not, and cannot, test: whether a real fsync on a real disk
 // actually makes the entry durable against a power loss. That is the
@@ -2544,8 +2612,8 @@ func TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced(t *testing.T) {
 	s, root := newTestStore(t)
 	dir := filepath.Join(root, ScratchDir)
 
-	afterHeldLockLinked = func() { chmodUnreadable(t, dir) }
-	t.Cleanup(func() { afterHeldLockLinked = nil })
+	afterHoldLockReleasedTransactionLock = func() { chmodUnreadable(t, dir) }
+	t.Cleanup(func() { afterHoldLockReleasedTransactionLock = nil })
 
 	info, err := s.HoldLock("working")
 	if !errors.Is(err, ErrLockNotDurable) {
@@ -2576,6 +2644,55 @@ func TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced(t *testing.T) {
 	}
 	if got.ID != info.ID {
 		t.Errorf("lock file id = %q, want %q — the lock a sync failure reports must be the one actually on disk", got.ID, info.ID)
+	}
+}
+
+// The mirror of TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced, for
+// removal: Unlock's own directory-entry sync (syncHeldLockDir, reused — see
+// its doc comment) must actually run and actually gate what Unlock reports,
+// not be dead code. Reached the same way — chmodUnreadable fired from the
+// afterHeldLockRemoved seam, once Remove has already taken .rdk/lock off
+// disk — and checked the same way: the failure surfaces as ErrLockNotDurable
+// with the lock's id still in the error text, and — the actual removal
+// having genuinely happened regardless of whether this call could confirm it
+// durable — .rdk/lock stays gone once the directory is readable again.
+//
+// Fails without the fix: before Unlock called syncHeldLockDir at all, this
+// call returned nil, and neither the afterHeldLockRemoved seam nor
+// ErrLockNotDurable was reachable from Unlock — the assertion below would
+// simply never see the sentinel.
+//
+// What this does not, and cannot, test: the same durability-against-a-real-
+// power-loss limit stated on TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced
+// and on syncHeldLockDir's own doc comment.
+func TestUnlockFailsWhenItsDirectoryEntryCannotBeSynced(t *testing.T) {
+	s, root := newTestStore(t)
+	dir := filepath.Join(root, ScratchDir)
+
+	info, err := s.HoldLock("working")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	afterHeldLockRemoved = func() { chmodUnreadable(t, dir) }
+	t.Cleanup(func() { afterHeldLockRemoved = nil })
+
+	err = s.Unlock(info.ID)
+	if !errors.Is(err, ErrLockNotDurable) {
+		t.Fatalf("Unlock err = %v, want ErrLockNotDurable", err)
+	}
+	if !strings.Contains(err.Error(), info.ID) {
+		t.Errorf("error text %q does not contain the lock id %q — a caller that only prints err.Error() loses it", err.Error(), info.ID)
+	}
+
+	// Restored inline, not left to chmodUnreadable's own t.Cleanup, for the
+	// same reason as TestHoldLockFailsWhenItsDirectoryEntryCannotBeSynced:
+	// the check below needs .rdk readable now.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lock")); !os.IsNotExist(err) {
+		t.Errorf("held lock still on disk after Unlock reported a removal (even one whose durability is unconfirmed): stat err = %v", err)
 	}
 }
 
@@ -2712,5 +2829,78 @@ func TestMaterializeDoesNotSweepOldAfterLosingItsLockAtPublish(t *testing.T) {
 	}
 	if string(got) != "original" {
 		t.Errorf(".rdk/old/keep.txt = %q, want %q", got, "original")
+	}
+}
+
+// PrepareShutdown's whole point is to make a future acquisition and the
+// handler's decision that "nothing is held" mutually exclusive (see
+// acquireLock's own doc comment for the mutex-ordering argument). A real
+// SIGTERM racing a real acquireLock call cannot be reproduced deterministically
+// — the same limitation store_test.go's other signal-adjacent tests already
+// state (see TestReleaseLockDuringHoldLockWindowReleasesOnlyTheTransactionLock)
+// — but the sequential case where PrepareShutdown has already run before any
+// acquisition starts is fully deterministic and is exactly the "handler
+// decided first" half of the argument: this test proves it directly. The
+// "acquisition decided first" half is the ordinary, already-covered case of
+// every other HoldLock/Materialize test in this file succeeding when
+// PrepareShutdown was never called at all — there is nothing new to prove
+// about it beyond what those already show.
+//
+// Fails without the fix: before acquireLock checked shuttingDown at all,
+// PrepareShutdown itself compiled to nothing but a plain ReleaseLock call
+// (or, absent the method entirely, this test would not compile), and
+// Materialize below would succeed, publishing a managed dir and leaving a
+// transaction lock on disk after a shutdown had already been recorded.
+func TestPrepareShutdownRefusesAFutureTransactionLockAcquisition(t *testing.T) {
+	s, root := newTestStore(t)
+
+	if err := s.PrepareShutdown(); err != nil {
+		t.Fatalf("PrepareShutdown with nothing held = %v, want nil", err)
+	}
+
+	set := NewFileSet()
+	add(t, set, Managed("a.txt"), []byte("a"))
+	err := s.Materialize("managed", set)
+	if !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("Materialize after PrepareShutdown err = %v, want ErrShuttingDown", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(statErr) {
+		t.Errorf("Materialize published a transaction lock after PrepareShutdown had already run: stat err = %v", statErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, "managed")); !os.IsNotExist(statErr) {
+		t.Error("Materialize wrote the managed dir after PrepareShutdown had already run")
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ScratchDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("a refused acquisition left a temp file behind: %s", e.Name())
+		}
+	}
+}
+
+// The other half of PrepareShutdown's contract: whatever transaction lock
+// this Store already holds is released, exactly as a bare ReleaseLock call
+// would have done before this fix. This is the pre-existing behaviour
+// PrepareShutdown must not regress, not new behaviour this fix adds — see
+// TestPrepareShutdownRefusesAFutureTransactionLockAcquisition for the
+// property that is actually new.
+func TestPrepareShutdownReleasesAnAlreadyHeldTransactionLock(t *testing.T) {
+	s, root := newTestStore(t)
+	st := s.(*osStore)
+	if err := st.ensureScratchDir(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.acquireLock(scratchApplyLock, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PrepareShutdown(); err != nil {
+		t.Fatalf("PrepareShutdown = %v, want nil", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(statErr) {
+		t.Errorf("PrepareShutdown left the transaction lock on disk: stat err = %v", statErr)
 	}
 }

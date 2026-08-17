@@ -107,6 +107,31 @@ func (a *app) lockCmd() *cobra.Command {
 // (internal/repofs/store_test.go), and the directory-sync failure only via
 // its own afterHeldLockLinked seam; HoldLock exposes neither to this package.
 func lockHoldError(err error, info repofs.LockInfo) error {
+	if errors.Is(err, repofs.ErrScratchTarget) {
+		// HoldLock's very first call is ensureScratchDir, before any lock is
+		// touched, so this can never co-occur with the branches below — info
+		// is still the zero value here, exactly as apply.Run's identical
+		// check finds ManagedDir untouched. Reproduced: `.rdk` present as a
+		// regular file made rdk apply report scratch-target at exit 1
+		// ("remove .rdk, then re-run") but made rdk lock fall through to this
+		// function's bare `return err` at the bottom — exit 2, "an rdk bug.
+		// Report it" — for the identical, user-fixable condition, reached
+		// through the one call site that had no branch for it.
+		//
+		// This duplicates apply.Run's construction (internal/apply/apply.go)
+		// rather than calling a shared helper the way the LockTargetDiagnostic
+		// and LockedDiagnostic branches below do: apply.Run builds this
+		// diagnostic inline, not as an exported function, and extracting one
+		// would mean editing internal/apply/apply.go, which is out of scope
+		// for this change. A shared helper is the better shape; this is the
+		// same message kept in sync by hand until one exists.
+		return diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeScratchTarget,
+			File:    repofs.ScratchDir,
+			Summary: "cannot use it as rdk's scratch space",
+			Hint:    "remove " + repofs.ScratchDir + ", then re-run",
+		})
+	}
 	if errors.Is(err, repofs.ErrLockNotReleased) {
 		// Checked before LockTargetDiagnostic, deliberately, mirroring
 		// apply.Run's identical ordering (internal/apply/apply.go): a release
@@ -226,27 +251,7 @@ func (a *app) unlockCmd() *cobra.Command {
 				return err
 			}
 			if err := store.Unlock(id); err != nil {
-				if d, ok := apply.LockTargetDiagnostic(err); ok {
-					return diag.Wrap(err, d)
-				}
-				// Unlock's own refusals (no lock, a mismatched id, or an
-				// apply lock — use --break-lock for that) are the user's
-				// mistake, not rdk's: exit 1, not 2. This is lock-mismatch,
-				// not apply-locked: nothing is necessarily holding the
-				// repository, you named a lock and the repository disagreed
-				// about it. Wrap (not New) so the underlying message — which
-				// already distinguishes all three cases, including naming
-				// --break-lock for the apply-lock one — reaches the user as
-				// the cause; the hint just points at it rather than repeating
-				// (or worse, guessing wrong at) which case applied. "re-run
-				// rdk apply to see the current lock" used to be the hint, but
-				// that describes a diagnostic step that will not happen when
-				// no lock exists at all — the next apply just succeeds.
-				return diag.Wrap(err, diag.Diagnostic{
-					Code:    diag.CodeLockMismatch,
-					Summary: fmt.Sprintf("cannot unlock %s", id),
-					Hint:    "read the cause above: it says whether nothing is locked, the id is wrong, or it's an apply lock (use --break-lock for that)",
-				})
+				return unlockError(err, id)
 			}
 			a.log.Result(diag.Diagnostic{
 				Code:    diag.CodeUnlocked,
@@ -256,4 +261,51 @@ func (a *app) unlockCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// unlockError maps an Unlock failure to the diagnostic rdk unlock reports.
+// Pulled out of unlockCmd's RunE, mirroring lockHoldError, so the
+// ErrLockNotDurable branch can be exercised directly from cli_test.go with a
+// crafted error: making Unlock's own directory sync genuinely fail needs
+// .rdk to go unreadable in the narrow window between Remove succeeding and
+// syncHeldLockDir running, which internal/repofs's own suite reaches via its
+// unexported afterHeldLockRemoved seam (store_test.go) — not reachable from
+// this package.
+func unlockError(err error, id string) error {
+	if d, ok := apply.LockTargetDiagnostic(err); ok {
+		return diag.Wrap(err, d)
+	}
+	if errors.Is(err, repofs.ErrLockNotDurable) {
+		// The removal already happened — Unlock only ever reaches this
+		// sentinel after its own Remove has already succeeded (see
+		// store.go's Unlock) — so the summary must not read like the
+		// release failed; it read exactly that way until this branch
+		// existed, since unclassified Unlock errors all fell through to the
+		// generic lock-mismatch case below, whose summary ("cannot unlock
+		// %s") is false here: the unlock happened, only its durability is
+		// unconfirmed.
+		return diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeLockNotDurable,
+			Summary: fmt.Sprintf("rdk unlock: removed %s, but its directory entry's removal could not be confirmed durable", id),
+			Hint:    "only a power loss or kernel panic before .rdk's directory entry is flushed could bring it back — an ordinary crash, SIGKILL, or process exit will not; if you need to be sure, check whether " + repofs.ScratchDir + "/lock still exists and remove it again if so",
+			Attrs:   []diag.Attr{diag.Str("lock_id", id)},
+		})
+	}
+	// Unlock's own refusals (no lock, a mismatched id, or an apply lock —
+	// use --break-lock for that) are the user's mistake, not rdk's: exit 1,
+	// not 2. This is lock-mismatch, not apply-locked: nothing is
+	// necessarily holding the repository, you named a lock and the
+	// repository disagreed about it. Wrap (not New) so the underlying
+	// message — which already distinguishes all three cases, including
+	// naming --break-lock for the apply-lock one — reaches the user as the
+	// cause; the hint just points at it rather than repeating (or worse,
+	// guessing wrong at) which case applied. "re-run rdk apply to see the
+	// current lock" used to be the hint, but that describes a diagnostic
+	// step that will not happen when no lock exists at all — the next apply
+	// just succeeds.
+	return diag.Wrap(err, diag.Diagnostic{
+		Code:    diag.CodeLockMismatch,
+		Summary: fmt.Sprintf("cannot unlock %s", id),
+		Hint:    "read the cause above: it says whether nothing is locked, the id is wrong, or it's an apply lock (use --break-lock for that)",
+	})
 }

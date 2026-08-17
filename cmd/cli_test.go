@@ -633,6 +633,39 @@ func TestLockRequiresAMessage(t *testing.T) {
 	}
 }
 
+// Reproduction from review: with .rdk present as a regular file, rdk apply
+// already reports scratch-target at exit 1 ("remove .rdk, then re-run" — see
+// internal/apply/apply_test.go's TestScratchTargetNamesRdkAndSaysToRemoveIt),
+// but rdk lock's HoldLock reaches the identical ensureScratchDir check first
+// (HoldLock's very first call) and, before this fix, had no branch for
+// ErrScratchTarget in lockHoldError — it fell through to that function's
+// bare `return err`, exit 2, "an rdk bug. Report it", for a condition the
+// user can fix by removing one file. Unlike the other lock diagnostics this
+// file tests via a crafted fake error, ErrScratchTarget needs no internal
+// fault injection to reach for real: a plain regular file at .rdk is enough,
+// so this runs the whole command.
+func TestLockReportsAnUnusableScratchDirAsScratchTarget(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, repofs.ScratchDir), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, dir, "lock", "-m", "agent working")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v (output: %s)", err, out)
+	}
+	if d.Code != diag.CodeScratchTarget {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeScratchTarget)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1 — this is user-fixable, not an rdk bug", got)
+	}
+	if !strings.Contains(d.Hint, "remove "+repofs.ScratchDir) {
+		t.Errorf("hint %q does not tell the user to remove %s", d.Hint, repofs.ScratchDir)
+	}
+}
+
 // A second rdk lock while one is held gets the same treatment as a blocked
 // apply, and exits 1 — this is the user's problem (someone else has it), not
 // rdk's.
@@ -822,6 +855,60 @@ func TestLockHoldErrorReportsLockNotDurableWithTheHeldLockID(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("attrs %+v do not carry lock_id = %q", d.Attrs, info.ID)
+	}
+	if !errors.Is(err, repofs.ErrLockNotDurable) {
+		t.Errorf("err does not unwrap to ErrLockNotDurable: %v", err)
+	}
+}
+
+// TestUnlockErrorReportsLockNotDurableWithoutClaimingTheReleaseFailed
+// exercises unlockError directly, the same way
+// TestLockHoldErrorReportsLockNotDurableWithTheHeldLockID exercises
+// lockHoldError, and for the same reason: reaching this branch for real
+// needs .rdk to go unreadable in the exact window between Unlock's Remove
+// succeeding and its own syncHeldLockDir call running, which internal/repofs's
+// own suite reaches via its unexported afterHeldLockRemoved seam
+// (store_test.go) — not from this package. Reusing fakeLockNotDurable rather
+// than defining a second copy: the shape it stands in for (an error that
+// Is(ErrLockNotDurable)) is identical regardless of whether HoldLock or
+// Unlock produced it.
+//
+// What matters here specifically, beyond the code and exit status already
+// covered by the HoldLock-side test: the summary must not read as though the
+// unlock failed. It already succeeded by the time Unlock can return this
+// sentinel (see store.go's Unlock — the sync runs after Remove, not
+// instead of it), so a summary built from the generic lock-mismatch
+// fallback ("cannot unlock %s") would be false here, not just imprecise.
+func TestUnlockErrorReportsLockNotDurableWithoutClaimingTheReleaseFailed(t *testing.T) {
+	err := unlockError(fakeLockNotDurable{cause: errors.New("sync .rdk: input/output error")}, "deadbeefcafefeed")
+
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeLockNotDurable {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeLockNotDurable)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1 — the lock really was removed, not an rdk bug", got)
+	}
+	if strings.Contains(d.Summary, "cannot unlock") {
+		t.Errorf("summary %q reads like the unlock failed — it already succeeded", d.Summary)
+	}
+	if !strings.Contains(d.Summary, "removed") {
+		t.Errorf("summary %q does not say the lock was removed", d.Summary)
+	}
+	if !strings.Contains(d.Summary, "deadbeefcafefeed") {
+		t.Errorf("summary %q does not carry the lock id", d.Summary)
+	}
+	found := false
+	for _, a := range d.Attrs {
+		if a.Key == "lock_id" && a.Value() == "deadbeefcafefeed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("attrs %+v do not carry lock_id", d.Attrs)
 	}
 	if !errors.Is(err, repofs.ErrLockNotDurable) {
 		t.Errorf("err does not unwrap to ErrLockNotDurable: %v", err)

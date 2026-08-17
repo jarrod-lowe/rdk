@@ -116,19 +116,69 @@ var afterHeldLockConfirmedAbsent func()
 // check on a path that already does filesystem work.
 //
 // It exists because the window it lets a test hit — HoldLock's held lock is
-// already linked into place, but the directory-entry sync that must run
-// before HoldLock reports success has not — lives, by construction, between
-// two syscalls: a test that tried to reach it by racing goroutines would be
-// timing-dependent, and a timing-dependent test for a timing bug is one that
-// passes on the machine where the bug is worst. This makes that window
-// reachable on demand instead. It is a package-level var rather than a field
-// on osStore for the same reason as the other seams in this file: nothing
-// outside this package can set it, and nothing inside sets it except a test.
+// already linked into place, but the transaction lock that protected its
+// creation has not yet been released and the directory-entry sync that must
+// run before HoldLock reports success has not yet run either — lives, by
+// construction, between two syscalls: a test that tried to reach it by
+// racing goroutines would be timing-dependent, and a timing-dependent test
+// for a timing bug is one that passes on the machine where the bug is worst.
+// This makes that window reachable on demand instead. It is a package-level
+// var rather than a field on osStore for the same reason as the other seams
+// in this file: nothing outside this package can set it, and nothing inside
+// sets it except a test.
 //
 // Fires inside HoldLock immediately after acquireLock(scratchLock, ...) has
-// returned success and before syncHeldLockDir runs. A test uses it the same
-// way store_test.go's afterPublish tests use their own callback: making .rdk
-// unreadable from inside the callback so the syncHeldLockDir call that
-// follows fails for a genuine OS reason — a real fsync-equivalent path that
-// cannot succeed — rather than a stubbed one.
+// returned success and before HoldLock's own explicit release of
+// scratchApplyLock (which now runs before syncHeldLockDir, not after — see
+// HoldLock's own doc comment for why the ordering changed). A test uses it
+// the same way store_test.go's afterPublish tests use their own callback:
+// making .rdk unreadable from inside the callback so the syncHeldLockDir
+// call that eventually follows fails for a genuine OS reason — a real
+// fsync-equivalent path that cannot succeed — rather than a stubbed one. The
+// intervening release still succeeds even with .rdk unreadable this way:
+// removing a directory entry needs search-and-write permission on the
+// directory, not read, so chmodUnreadable's 0o300 leaves it able to run.
 var afterHeldLockLinked func()
+
+// afterHoldLockReleasedTransactionLock is a test seam. Nil in production, so
+// it costs one nil check on a path that already does filesystem work.
+//
+// It exists to make an ordering assertion possible without racing goroutines:
+// that HoldLock's directory-entry sync (syncHeldLockDir) runs only after the
+// transaction lock it took to create the held lock has actually been
+// removed from disk, not merely scheduled for removal by a deferred call
+// that has not run yet. This is what closes the durability gap where a crash
+// between an unsynced release and the filesystem's own next flush could
+// restore .rdk/apply.lock even though rdk lock already reported success — see
+// HoldLock's own doc comment for the full argument. It is a package-level
+// var rather than a field on osStore for the same reason as the other seams
+// in this file: nothing outside this package can set it, and nothing inside
+// sets it except a test.
+//
+// Fires inside HoldLock immediately after its own explicit call to
+// ReleaseLock has returned successfully and before syncHeldLockDir runs. A
+// test uses it to check, from inside the callback, that scratchApplyLock is
+// already gone from disk — proving the sync that runs next captures a
+// directory state that no longer contains the transaction lock, rather than
+// one that still does.
+var afterHoldLockReleasedTransactionLock func()
+
+// afterHeldLockRemoved is a test seam. Nil in production, so it costs one nil
+// check on a path that already does filesystem work.
+//
+// It exists for the same reason as afterHeldLockLinked, mirrored for
+// removal: the window between Unlock's Remove of scratchLock succeeding and
+// the directory-entry sync that must run before Unlock reports success lives,
+// by construction, between two syscalls, and a test that tried to reach it by
+// racing goroutines would be timing-dependent for a timing bug — exactly the
+// failure mode this file's other seams already avoid the same way. It is a
+// package-level var rather than a field on osStore for the same reason as
+// the rest: nothing outside this package can set it, and nothing inside sets
+// it except a test.
+//
+// Fires inside Unlock immediately after s.root.Remove(scratchLock) has
+// succeeded and before syncHeldLockDir runs. A test uses it the same way
+// afterHeldLockLinked's own tests do: making .rdk unreadable from inside the
+// callback so the syncHeldLockDir call that follows fails for a genuine OS
+// reason rather than a stubbed one.
+var afterHeldLockRemoved func()
