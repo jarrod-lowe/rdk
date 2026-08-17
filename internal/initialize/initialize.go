@@ -42,7 +42,15 @@ func repoToplevel(dir string) (top string, stderr []byte, err error) {
 	if err != nil {
 		return "", stderrBuf.Bytes(), err
 	}
-	return strings.TrimSpace(stdoutBuf.String()), stderrBuf.Bytes(), nil
+	// TrimSpace would eat a real trailing/leading space in the directory
+	// name — git preserves it faithfully, on Unix a path may legitimately
+	// start or end with one, and isRepoRoot's comparison against dir would
+	// then fail for a healthy repository. git's plumbing output always
+	// terminates the line with a single "\n" (never "\r\n", even on
+	// Windows: that CRLF conversion applies to checked-out file content,
+	// not to command output), so only that trailing "\n" is git's framing;
+	// everything else is the path.
+	return strings.TrimSuffix(stdoutBuf.String(), "\n"), stderrBuf.Bytes(), nil
 }
 
 // isRepoRoot asks git whether dir is itself the root of a working

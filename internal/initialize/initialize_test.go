@@ -262,6 +262,51 @@ func TestRepoToplevelParsesStdoutOnly(t *testing.T) {
 	}
 }
 
+// repoToplevel used to TrimSpace the whole of stdout, which eats a real
+// trailing/leading space in the directory name as readily as it eats git's
+// line terminator — git preserves such a name faithfully. isRepoRoot then
+// compared the mangled path against dir, they never matched, and a healthy
+// repository whose name ends in a space was reported as not a repository at
+// all. Confirm only git's "\n" is stripped, not a trailing space that is
+// genuinely part of the path.
+func TestRepoToplevelPreservesTrailingSpace(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "repo ")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Skipf("filesystem rejected a directory name ending in a space: %v", err)
+	}
+	if out, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+
+	top, _, err := repoToplevel(dir)
+	if err != nil {
+		t.Fatalf("repoToplevel: %v", err)
+	}
+	if !strings.HasSuffix(top, " ") {
+		t.Fatalf("top = %q, lost the trailing space that is genuinely part of the path", top)
+	}
+}
+
+// The end-to-end version of the same bug: rdk init on a perfectly healthy
+// repository whose directory name ends in a space used to run `git init`
+// again (isRepoRoot wrongly said "not a repo") and then report the
+// directory git-unusable, because the same mangled comparison failed a
+// second time. Neither should happen for a repository git itself is happy
+// with.
+func TestInitAcceptsDirectoryWithTrailingSpaceInName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "repo ")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Skipf("filesystem rejected a directory name ending in a space: %v", err)
+	}
+	if out, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+
+	if err := Run(newStore(t, dir), dir); err != nil {
+		t.Fatalf("Run reported a healthy repository unusable: %v", err)
+	}
+}
+
 // The end-to-end version of the bug: with GIT_TRACE=1 in the environment
 // (exec.Command inherits the parent's env unless cmd.Env is set, and
 // repoToplevel never sets it), rev-parse's trace lines used to corrupt the
