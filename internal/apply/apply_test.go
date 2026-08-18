@@ -453,6 +453,50 @@ func TestRunReportsAnExistingHeldLockWithAttrs(t *testing.T) {
 	}
 }
 
+// Before this test's fix, repofs.ErrShuttingDown had no branch in Run and
+// fell through to the generic write-managed-dir diagnostic — "cannot write
+// rdk-managed/ / check permissions and free space" — which is simply false
+// when the actual cause is that the user pressed Ctrl-C (or something sent
+// SIGTERM) and acquireLock's shutdown check refused a lock acquisition that
+// had not started yet. See ErrShuttingDown's own doc comment and
+// acquireLock's comment right before its writeScratchTemp call
+// (internal/repofs/store.go) for why an ordinary signal, not only a
+// pathological timing, can make this reach here.
+//
+// This test proves the classification (code, and that the message neither
+// claims a write failed nor sends the reader after permissions or disk
+// space) using materializeErrStore, the same stub the lock-not-released test
+// above uses to reach a Materialize failure repofs's own state cannot
+// produce on demand. What this does NOT cover: the actual signal race
+// (PrepareShutdown winning acquireLock's mutex mid-writeScratchTemp) is not
+// deterministically reproducible from a test — it depends on a signal
+// landing inside a real fsync's duration — so this only proves Run's
+// handling of the sentinel once repofs has already decided to return it, not
+// that repofs decides correctly. repofs's own suite (store_test.go) is where
+// PrepareShutdown/acquireLock's mutex-ordering guarantees are tested.
+func TestRunReportsShuttingDownAsInterruptedNotAsAWriteFailure(t *testing.T) {
+	store, _ := setupRepo(t)
+	wrapped := &materializeErrStore{Store: store, err: repofs.ErrShuttingDown}
+
+	_, err := Run(wrapped, "v")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeInterrupted {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeInterrupted)
+	}
+	line := d.Line()
+	for _, falseClaim := range []string{"permission", "free space", "cannot write"} {
+		if strings.Contains(strings.ToLower(line), falseClaim) {
+			t.Errorf("message %q falsely suggests a write or permissions failure (contains %q)", line, falseClaim)
+		}
+	}
+	if !strings.Contains(d.Hint, "nothing is wrong") {
+		t.Errorf("hint %q does not reassure the reader that nothing is wrong", d.Hint)
+	}
+}
+
 // The summary is a diagnostic like any other, so JSONL consumers get the
 // counts as attrs rather than having to parse the sentence.
 func TestResultDiagnosticCarriesCounts(t *testing.T) {

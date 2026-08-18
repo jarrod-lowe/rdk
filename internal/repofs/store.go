@@ -373,9 +373,16 @@ func lockNotDurableErrorForRemoval(info LockInfo, syncErr error) error {
 // afterward, so a caller of Materialize or HoldLock almost never gets to
 // observe this error before the process ends anyway. It is still a real,
 // returned error rather than left implicit, because "almost never observed"
-// is not "never observed" — a slow write or a scheduler delay in that same
-// window could let it reach the top before the handler's os.Exit does, and a
-// caller that did observe it deserves an honest reason, not a panic.
+// is not "never observed" — a concrete, named window makes it so: acquireLock
+// calls writeScratchTemp (open, write, fsync, close) before it ever checks
+// shuttingDown, so an ordinary SIGINT/SIGTERM landing during that write — not
+// only a pathological scheduler delay — can let this error reach the top
+// before the handler's os.Exit does (see acquireLock's own comment right
+// before that call for the full argument, including why the check cannot
+// simply move earlier without cost). A caller that did observe it deserves an
+// honest reason, not a panic — and, for rdk apply specifically, not the
+// generic write-managed-dir message either: see
+// internal/apply/apply.go's branch for this sentinel (diag.CodeInterrupted).
 var ErrShuttingDown = errors.New("rdk is shutting down: refusing to create a new lock")
 
 // Store is the injected set of filesystem actions rdk performs. The real
@@ -1083,6 +1090,29 @@ func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 	if err != nil {
 		return LockInfo{}, err
 	}
+	// This call — open, write, fsync, close — runs before lockMu is ever
+	// taken below, so it is real, unguarded I/O time during which a
+	// concurrent PrepareShutdown can set shuttingDown and this call's own
+	// check a few lines down will correctly see it. That is not a gap in the
+	// check (see below for why the check itself cannot run any earlier
+	// without giving up the atomicity that makes "refused" and "acquired"
+	// the only two outcomes) — it is the width of the window in which an
+	// ordinary SIGINT/SIGTERM, not only a pathological delay, can make an
+	// in-flight acquireLock call observe shuttingDown true and return
+	// ErrShuttingDown after already having done this write. See
+	// ErrShuttingDown's own doc comment for why that is still correct rather
+	// than surprising, and internal/apply/apply.go's ErrShuttingDown branch
+	// (diag.CodeInterrupted) for how a caller that does observe it now
+	// reports that honestly instead of guessing at disk or permissions.
+	//
+	// Narrowing this by widening lockMu to also cover this write would
+	// close it, but at a cost the design deliberately declined a few
+	// paragraphs up ("not by synchronising signal delivery against an
+	// in-flight acquisition (out of scope, and unnecessary)"): PrepareShutdown
+	// takes the same mutex, so widening it here would make a signal handler
+	// wait out this call's fsync before it could even set shuttingDown,
+	// trading a rare, now-honestly-reported message for a slower Ctrl-C on
+	// every apply. Left as is on that basis, not overlooked.
 	tmp, err := s.writeScratchTemp("lock", b, true)
 	if err != nil {
 		return LockInfo{}, err

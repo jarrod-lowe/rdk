@@ -178,6 +178,32 @@ func Run(store repofs.Store, version string) (res Result, err error) {
 				Hint:    "nothing is lost; clear the cause above, then re-run to publish it",
 			})
 		}
+		if errors.Is(err, repofs.ErrShuttingDown) {
+			// Reachable, not hypothetical: acquireLock's shutdown check runs
+			// only after writeScratchTemp's own write-and-fsync — a real I/O
+			// window — so a SIGINT/SIGTERM landing there lets the signal
+			// handler's PrepareShutdown (cmd/root.go's handleSignals) win the
+			// race and foreclose this acquisition instead of the acquisition
+			// winning and the handler cleaning up afterward. See
+			// acquireLock's and PrepareShutdown's own doc comments in
+			// repofs/store.go for the mechanism this relies on.
+			//
+			// This is also Materialize's very first possible failure —
+			// ensureScratchDir, then this acquireLock, before a single byte
+			// of the new tree is written and before ManagedDir is touched at
+			// all — so unlike every other branch above, there is no tree
+			// state to reassure the reader about: it was never approached,
+			// not merely left correct. The generic write-managed-dir hint
+			// would be doubly false here: there is no permissions or disk
+			// problem to check, and the run did not fail — the user pressed
+			// Ctrl-C (or something sent SIGTERM), and rdk did exactly what
+			// that asked.
+			return Result{}, diag.Wrap(err, diag.Diagnostic{
+				Code:    diag.CodeInterrupted,
+				Summary: fmt.Sprintf("rdk apply: interrupted before writing to %s/", ManagedDir),
+				Hint:    fmt.Sprintf("nothing is wrong and nothing was written: %s/ is exactly as it was before this run — rdk was asked to shut down before this apply began; re-run rdk apply if you still want it applied", ManagedDir),
+			})
+		}
 		return Result{}, diag.Wrap(err, diag.Diagnostic{
 			Code:    diag.CodeWriteManagedDir,
 			Summary: fmt.Sprintf("cannot write %s/", ManagedDir),

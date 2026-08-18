@@ -35,6 +35,7 @@ const (
 	CodeUnsafePath         = "unsafe-path"
 	CodeSeedNotAFile       = "seed-not-a-file"
 	CodeSeedFailed         = "seed-failed"
+	CodeInterrupted        = "interrupted"
 	CodeApplyComplete      = "apply-complete"
 	CodeInitComplete       = "init-complete"
 	CodeVersion            = "version"
@@ -63,6 +64,7 @@ var all = []string{
 	CodeReadDefsDir,
 	CodeReadFile, CodeGitInit, CodeGitUnusable, CodeWriteManagedDir, CodePublishFailed,
 	CodeScratchNotRemoved, CodeScratchTarget, CodeUnsafePath, CodeSeedNotAFile, CodeSeedFailed,
+	CodeInterrupted,
 	CodeApplyComplete, CodeInitComplete,
 	CodeVersion, CodeInternal, CodeInvalidFlag,
 	CodeApplyLocked, CodeLockMismatch, CodeLockTarget, CodeLockLost, CodeLockNotReleased, CodeLockNotDurable, CodeLockHeld, CodeUnlocked,
