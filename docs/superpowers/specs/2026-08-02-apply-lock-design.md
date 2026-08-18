@@ -1,13 +1,16 @@
 # One apply at a time, per repository
 
-**Status:** implemented. Landed in six steps — see "Sequencing" — the third
+**Status:** implemented. Landed in seven steps — see "Sequencing" — the third
 of which split one lock file into two (see "Two kinds, two files" and
 "Migration"), the fourth of which closed a P1 in the split's own
 `--with-lock` path (step 6 of "Where the lock sits in the sequence"), the
 fifth of which hardened the mechanism against a full audit of it against its
-own goals, and the sixth of which closed the mirror of a race the fifth
-step's own `HoldLock` fix left open (step 5 of "Where the lock sits in the
-sequence") — see "Stated limits" for what that closed and what it left open.
+own goals, the sixth of which closed the mirror of a race the fifth step's
+own `HoldLock` fix left open (step 5 of "Where the lock sits in the
+sequence") — see "Stated limits" for what that closed and what it left
+open — and the seventh of which closed four more review-driven gaps,
+including the last signal/acquisition race stated as permanent through the
+sixth step (see "Stated limits" and step 7 of "Sequencing").
 
 ## Problem
 
@@ -421,15 +424,15 @@ Only `SIGKILL`, a power loss, or an OOM kill now leave a lock behind, and
 `--break-lock=<id>` is the stated recovery — with one correction to that claim,
 found in review and closed by a later step (see "Stated limits" and step 7 in
 "Sequencing"): an ordinary `SIGINT`/`SIGTERM` *could* also leave one behind,
-through a window this section's own earlier wording did not admit. The
-handler's `ReleaseLock` call can correctly observe "nothing held" and return,
-and a concurrent `acquireLock` that had not yet started when it did so can
-still go on to complete and publish a lock afterward, with no second release
-ever running before `os.Exit`. `PrepareShutdown` closes that by letting the
-handler foreclose the acquisition instead of only reacting to one that already
-happened — see `acquireLock`'s own doc comment in `internal/repofs/store.go`
-for the mechanism, and the same "Stated limits" entry for the wiring this
-depends on.
+through a window this section's own earlier wording did not admit. A handler
+that only called `ReleaseLock` could correctly observe "nothing held" and
+return, and a concurrent `acquireLock` that had not yet started when it did so
+could still go on to complete and publish a lock afterward, with no second
+release ever running before `os.Exit`. `cmd/root.go`'s `handleSignals` now
+calls `Store.PrepareShutdown` instead, which closes that by foreclosing the
+acquisition rather than only reacting to one that already happened — see
+`acquireLock`'s own doc comment in `internal/repofs/store.go` for the
+mechanism and the same "Stated limits" entry below for the full history.
 
 ## Stated limits (rule 12)
 
@@ -602,22 +605,22 @@ depends on.
   worst case is the held lock and a fresh apply both existing at once, not a
   corrupted `rdk-managed/`.
 - **A signal handler whose `ReleaseLock` call correctly finds nothing to
-  release can still be followed by a concurrent `acquireLock` publishing a
+  release could still be followed by a concurrent `acquireLock` publishing a
   lock nothing ever releases — this section used to document that as a
-  residual the design accepted, and it is now closed, not merely narrowed,
-  given one condition.** `acquireLock` already holds `lockMu` across
-  recording ownership and the `Link` call that makes a lock visible (see
-  "Two kinds, two files" and `acquireLock`'s own doc comment); that closed a
-  narrower window where a racing `ReleaseLock` could withdraw a claim about
-  to exist. What it left open: a handler's `ReleaseLock` running and
-  returning — correctly, since nothing was held yet — *before* a concurrent
-  `acquireLock` had even started, followed by that call completing normally
-  and `os.Exit` ending the process with no second release ever running.
-  Holding `lockMu` longer inside `acquireLock` cannot fix this, because the
-  handler was not wrong about the state at the instant it ran; the problem is
-  a *future* acquisition, not a stale read of a past one. The fix is a new
-  `Store.PrepareShutdown`, called by the handler in place of a bare
-  `ReleaseLock`: it records, under `lockMu`, that no further lock may be
+  residual the design accepted, and it is now closed, not merely narrowed.**
+  `acquireLock` already holds `lockMu` across recording ownership and the
+  `Link` call that makes a lock visible (see "Two kinds, two files" and
+  `acquireLock`'s own doc comment); that closed a narrower window where a
+  racing `ReleaseLock` could withdraw a claim about to exist. What it left
+  open: a handler's `ReleaseLock` running and returning — correctly, since
+  nothing was held yet — *before* a concurrent `acquireLock` had even
+  started, followed by that call completing normally and `os.Exit` ending the
+  process with no second release ever running. Holding `lockMu` longer inside
+  `acquireLock` cannot fix this, because the handler was not wrong about the
+  state at the instant it ran; the problem is a *future* acquisition, not a
+  stale read of a past one. The fix is `Store.PrepareShutdown`, which
+  `cmd/root.go`'s `handleSignals` now calls in place of the bare `ReleaseLock`
+  it used to: it records, under `lockMu`, that no further lock may be
   published, then releases whatever is already held. `acquireLock`'s owned
   (`.rdk/apply.lock`) path checks that flag inside the very critical section
   already described above, so the mutex's total order settles the outcome
@@ -625,12 +628,12 @@ depends on.
   acquisition is refused before `Link` ever runs, or the acquisition's
   critical section runs first and completes, in which case
   `PrepareShutdown`'s own call to `ReleaseLock` finds it and removes it.
-  There is no third outcome. The one condition: this closes the window only
-  once the caller it exists for — `cmd/root.go`'s `SIGINT`/`SIGTERM` handler
-  — actually calls `PrepareShutdown` instead of the bare `ReleaseLock` it
-  calls today. Adding the method to `Store` does not by itself change what
-  that handler calls; see `PrepareShutdown`'s own doc comment in
-  `internal/repofs/store.go`.
+  There is no third outcome, and it is a live guarantee now, not a pending
+  one: the handler that used to call only `ReleaseLock` calls
+  `PrepareShutdown` (see `handleSignals`' own doc comment in `cmd/root.go`
+  for why, and `prepareStoreForShutdown` for the exact call). See
+  `PrepareShutdown`'s own doc comment in `internal/repofs/store.go` for the
+  mechanism from the `Store` side.
 
 ## Migration
 
@@ -730,9 +733,9 @@ design had documented as permanent:
    correctly exits 1 for the identical, user-fixable condition;
    `cmd/lock.go`'s `lockHoldError` now has the matching branch. Fourth, the
    signal-handler race stated as permanent in "Release on every exit" and in
-   "Stated limits" is closed via `Store.PrepareShutdown` — see that "Stated
-   limits" entry for the mechanism and the one condition its closure depends
-   on.
+   "Stated limits" is closed via `Store.PrepareShutdown`, now wired into
+   `cmd/root.go`'s `handleSignals` in place of the bare `ReleaseLock` it used
+   to call — see that "Stated limits" entry for the mechanism.
 
 ## Consequences
 
