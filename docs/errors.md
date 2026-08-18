@@ -20,6 +20,19 @@ lock `rdk lock` leaves behind on purpose; see
 docs/superpowers/specs/2026-08-02-apply-lock-design.md for why the two are
 different files.
 
+The same kind of interruption — a hard kill or power loss, this time between
+`Materialize`'s two renames (`rdk-managed` to `.rdk/old`, then `.rdk/new` to
+`rdk-managed`) — can leave `rdk-managed/` absent with the last good tree
+sitting untouched at `.rdk/old`. rdk detects this before parsing and, if the
+run then fails for any reason, appends a note to that failure's own `hint`
+saying so — the failure's own `code` is unchanged, since that is still what
+tells you why the run actually failed; a JSONL consumer looking for this
+specific fact matches on the `prev_tree_path` attr instead. rdk never
+restores `.rdk/old` on your behalf: it was built from the definitions as they
+stood before, and publishing it would put a tree in place that no current run
+would generate. A run whose definitions parse republishes `rdk-managed/` and
+clears `.rdk/old` on its own, so nothing needs saying once that happens.
+
 ## Failures
 
 | Code | Means | Fix |

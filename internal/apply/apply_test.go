@@ -93,6 +93,172 @@ func TestRunFailsWithoutDefinitions(t *testing.T) {
 	}
 }
 
+// interruptedSwapPending is exercised directly against Mem first, ahead of
+// the full Run-level tests below: it is the one piece of new logic pure
+// enough to table-test in isolation, and doing so pins down the exact
+// boundary (ManagedDir absent AND .rdk/old present — neither alone) without
+// the noise of a real apply run.
+func TestInterruptedSwapPendingOnlyFiresWhenManagedIsAbsentAndOldHoldsATree(t *testing.T) {
+	cases := []struct {
+		name  string
+		files map[string][]byte
+		want  bool
+	}{
+		{"fresh repo: neither exists", nil, false},
+		{"managed dir present, no old", map[string][]byte{ManagedDir + "/manifest.json": []byte("{}")}, false},
+		{"only old present", map[string][]byte{repofs.ScratchDir + "/old/manifest.json": []byte("{}")}, true},
+		{"both present: a healthy apply just ran", map[string][]byte{
+			ManagedDir + "/manifest.json":            []byte("{}"),
+			repofs.ScratchDir + "/old/manifest.json": []byte("{}"),
+		}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := repofs.NewMem()
+			for p, b := range c.files {
+				m.Files()[p] = b
+			}
+			if got := interruptedSwapPending(m); got != c.want {
+				t.Errorf("interruptedSwapPending = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// simulateInterruptedSwap reproduces the state a hard kill or power loss
+// leaves between Materialize's two renames (see Store.Materialize's doc
+// comment): the current tree already displaced to .rdk/old, the replacement
+// never published. A real Materialize call has no seam this package can
+// reach to stop it mid-swap (see materializeErrStore's own comment on the
+// seams that do exist), so this reproduces the end state directly: run a
+// real, successful apply, then perform just the first of the two renames
+// Materialize's next call would have done, by hand.
+func simulateInterruptedSwap(t *testing.T, root string) {
+	t.Helper()
+	old := filepath.Join(root, repofs.ScratchDir, "old")
+	if err := os.RemoveAll(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, ManagedDir), old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// This is the state a hard kill or power loss between Materialize's two
+// renames leaves behind: rdk-managed absent, the last good tree safe at
+// .rdk/old, and definitions broken by the same interruption (mid-edit when
+// the machine died). Before this fix, the failure below said only "field
+// must be a string" — reproduced by hand against this exact repo shape
+// before writing this test — with no way to learn the managed tree was gone
+// and safe rather than gone for good.
+func TestRunReportsInterruptedSwapWhenABrokenDefinitionFollowsIt(t *testing.T) {
+	store, root := setupRepo(t)
+	if _, err := Run(store, "v"); err != nil {
+		t.Fatal(err)
+	}
+	simulateInterruptedSwap(t, root)
+	if err := os.WriteFile(filepath.Join(root, "rdk", "assets.yaml"),
+		[]byte("kind: s3-bucket\nname: assets\ndescription: [not a string]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Run(store, "v")
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	// The parse failure's own code must survive: that is what tells the
+	// reader why the run actually failed (see withInterruptedSwapNotice's own
+	// doc comment on why this is not a new code), and a fact riding alongside
+	// it must not crowd that out.
+	if d.Code != diag.CodeFieldNotString {
+		t.Errorf("code = %q, want %q — the parse failure's own code must survive", d.Code, diag.CodeFieldNotString)
+	}
+	if !strings.Contains(d.Hint, repofs.ScratchDir+"/old") {
+		t.Errorf("hint %q does not name %s/old", d.Hint, repofs.ScratchDir)
+	}
+	attrs := map[string]any{}
+	for _, a := range d.Attrs {
+		attrs[a.Key] = a.Value()
+	}
+	if attrs["prev_tree_path"] != repofs.ScratchDir+"/old" {
+		t.Errorf("prev_tree_path attr = %v, want %q", attrs["prev_tree_path"], repofs.ScratchDir+"/old")
+	}
+	// The report is a report, not a repair: .rdk/old must still hold exactly
+	// what simulateInterruptedSwap left there.
+	if _, statErr := os.Stat(filepath.Join(root, repofs.ScratchDir, "old", "manifest.json")); statErr != nil {
+		t.Errorf(".rdk/old was not left alone: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ManagedDir)); !os.IsNotExist(statErr) {
+		t.Errorf("%s was restored rather than reported: %v", ManagedDir, statErr)
+	}
+}
+
+// The other half of the state: definitions that parse. Materialize's final
+// sweep is unconditional, so a run that gets this far heals the interrupted
+// swap completely on its own — republishing ManagedDir and clearing .rdk/old
+// — and the design decision this implements says plainly that this case
+// "needs saying" nothing. Asserting the success alone would not catch a
+// regression that made Run noisy about a fact nobody needs told twice, so
+// this checks the diagnostic text too.
+func TestRunSilentlyHealsInterruptedSwapWhenDefinitionsAreGood(t *testing.T) {
+	store, root := setupRepo(t)
+	if _, err := Run(store, "v"); err != nil {
+		t.Fatal(err)
+	}
+	simulateInterruptedSwap(t, root)
+
+	res, err := Run(store, "v")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.FilesWritten == 0 {
+		t.Error("FilesWritten = 0")
+	}
+	if strings.Contains(res.Diagnostic().Summary, repofs.ScratchDir) {
+		t.Errorf("successful result mentions %s: %q", repofs.ScratchDir, res.Diagnostic().Summary)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ManagedDir, "manifest.json")); statErr != nil {
+		t.Errorf("managed dir was not republished: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, repofs.ScratchDir, "old")); !os.IsNotExist(statErr) {
+		t.Errorf(".rdk/old was not swept: %v", statErr)
+	}
+}
+
+// The third state this task requires covering: an ordinary fresh repository,
+// which must never produce this message — there is no previous tree to
+// report, and claiming one exists would be false (the standard this task set:
+// every user-facing message must be true in every case that reaches it).
+func TestRunSaysNothingAboutInterruptedSwapOnAFreshRepo(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "rdk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "rdk", "assets.yaml"),
+		[]byte("kind: s3-bucket\nname: assets\ndescription: [not a string]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := repofs.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, runErr := Run(store, "v")
+	var d *diag.Error
+	if !errors.As(runErr, &d) {
+		t.Fatalf("error is not a diagnostic: %v", runErr)
+	}
+	if strings.Contains(d.Hint, repofs.ScratchDir+"/old") {
+		t.Errorf("hint %q mentions %s/old on a fresh repo with nothing there", d.Hint, repofs.ScratchDir)
+	}
+	for _, a := range d.Attrs {
+		if a.Key == "prev_tree_path" {
+			t.Errorf("attrs carries prev_tree_path on a fresh repo: %v", a.Value())
+		}
+	}
+}
+
 // This failure happens after the tree is already correct, so the message has
 // to say so — otherwise the reader goes looking for damage that is not there,
 // or starts deleting rdk-managed/ to fix a problem that does not exist.

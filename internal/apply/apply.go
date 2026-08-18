@@ -5,6 +5,7 @@ package apply
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 
 	"github.com/jarrod-lowe/rdk/internal/diag"
 	"github.com/jarrod-lowe/rdk/internal/generate"
@@ -31,7 +32,39 @@ type Result struct {
 
 // Run performs apply against the repo the store is rooted at. Pure generation:
 // definitions in, repo content out — no network, no cloud (rules 1-2).
-func Run(store repofs.Store, version string) (Result, error) {
+func Run(store repofs.Store, version string) (res Result, err error) {
+	// Checked before parsing, not only once something fails: a hard kill or
+	// power loss between Materialize's two renames (see Store.Materialize's
+	// doc comment — displace the current tree to .rdk/old, then publish the
+	// new one in its place) can leave ManagedDir absent with the last good
+	// tree sitting at .rdk/old. If the definitions are also broken — mid-edit
+	// when the machine died — the very next step, parse.Dir, fails with an
+	// error that only ever talks about a YAML field, and the reader has no
+	// way to learn their managed tree is gone and safe rather than gone for
+	// good. Detecting it now and carrying the fact through the defer below is
+	// what lets whatever failure Run ultimately returns say that too.
+	//
+	// Detected, not failed on: a run that goes on to succeed republishes
+	// ManagedDir and sweeps .rdk/old unconditionally (Materialize's final
+	// step, on every path including this one), healing the state completely.
+	// Failing here outright would block the very re-run that fixes it.
+	hadInterruptedSwap := interruptedSwapPending(store)
+	defer func() {
+		if err == nil || !hadInterruptedSwap {
+			return
+		}
+		// Re-checked, not trusted to still be true: if this run's own
+		// Materialize got as far as publishing before failing on something
+		// after that — ErrSweep, ErrLockNotReleased, or the after-publish
+		// half of ErrLockLost (see their own doc comments in repofs) —
+		// ManagedDir exists again and those diagnostics already say the tree
+		// is correct. Claiming it's still absent here would be false.
+		if _, statErr := store.ReadDir(ManagedDir); !errors.Is(statErr, fs.ErrNotExist) {
+			return
+		}
+		err = withInterruptedSwapNotice(err)
+	}()
+
 	defs, warnings, err := parse.Dir(store, DefsDir)
 	if err != nil {
 		return Result{}, err
@@ -152,6 +185,88 @@ func Run(store repofs.Store, version string) (Result, error) {
 		})
 	}
 	return Result{FilesWritten: set.Len(), Warnings: warnings}, nil
+}
+
+// interruptedSwapPending reports whether ManagedDir is absent while
+// repofs.ScratchDir+"/old" holds a tree — the state Store.Materialize's own
+// doc comment describes as reachable only by a hard kill or power loss
+// between its two renames (the current tree displaced to .rdk/old, then the
+// new one published in its place).
+//
+// A read error other than "not found" on either path is treated as "not this
+// state" rather than guessed at: this function only ever adds a fact to a
+// failure that already has its own cause (see withInterruptedSwapNotice), so
+// understating is the safe direction. In particular a fresh repository —
+// nothing at ManagedDir, nothing at .rdk/old — must not trip it: the first
+// ReadDir there returns not-exist, which is also what this function itself
+// returns for, so both checks report "not this state" and it correctly stays
+// silent on the very first apply anyone ever runs.
+func interruptedSwapPending(store repofs.Store) bool {
+	if _, err := store.ReadDir(ManagedDir); !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	_, err := store.ReadDir(repofs.ScratchDir + "/old")
+	return err == nil
+}
+
+// interruptedSwapHintSuffix and interruptedSwapAttrs carry the interrupted-
+// swap fact appended by withInterruptedSwapNotice. Appended to Hint, not
+// Summary: this is what to do about a fact separate from whatever the
+// diagnostic's own cause names, not a restatement of what went wrong — the
+// existing Summary and Code still say why the run actually failed (rule 11:
+// that is the one obligation a report of this fact must not crowd out).
+//
+// Deliberately does not say "restore .rdk/old" or offer any way to do so:
+// that tree was generated from the definitions as they stood before this
+// failure, not whatever is in rdk/ now, and rule 1 (the managed tree is a
+// pure function of the definitions) makes publishing it exactly the hazard
+// the locking work exists to prevent, reached from the recovery side instead
+// of the concurrency side. The only correct recovery is fixing the cause
+// above and re-running, which republishes it under today's definitions and
+// clears .rdk/old on its own.
+const interruptedSwapHintSuffix = ". Separately: " + ManagedDir + "/ is currently absent — an earlier apply was interrupted after displacing it to " + repofs.ScratchDir + "/old but before publishing a replacement. That copy is untouched and safe; fix the cause above and re-run, which republishes it under the current definitions and clears " + repofs.ScratchDir + "/old automatically. Do not copy " + repofs.ScratchDir + "/old into " + ManagedDir + "/ by hand — it reflects the definitions as they stood before this failure, not what's in " + DefsDir + "/ now."
+
+func interruptedSwapAttrs() []diag.Attr {
+	// prev_tree_path alone is the detection signal for a JSONL consumer —
+	// mirroring how apply-complete's own doc comment says a consumer detects
+	// an under-lock apply by lock_id's presence rather than a dedicated code
+	// (see withInterruptedSwapNotice's doc comment for why this stays a
+	// suffix/attrs addition rather than a new diag code).
+	return []diag.Attr{diag.Str("prev_tree_path", repofs.ScratchDir+"/old")}
+}
+
+// withInterruptedSwapNotice folds the interrupted-swap fact detected at the
+// top of Run into whatever diagnostic its failure produced — the same shape
+// cmd/apply.go's withLockErr uses for the under-lock and broke-lock notices:
+// a fact discovered outside the failure that ultimately fires still has to
+// ride on it, since the failure is the only thing the CLI prints, and Run has
+// no access to cmd/apply.go's helper (this fact has to be settled before
+// apply.Run returns, not after).
+//
+// No new diag code for this: the code the caller already picked
+// (invalid-yaml, missing-field, publish-failed, whatever actually broke this
+// run) is what tells the reader why the run failed, and replacing it here
+// with one meaning "the previous tree wants reporting" would answer a
+// different question than the one they are asking. A JSONL consumer that
+// wants this fact specifically can match on prev_tree_path's presence, the
+// same way apply-complete's lock_id already works.
+func withInterruptedSwapNotice(err error) error {
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		// Not every path through Run upgrades its error to *diag.Error: the
+		// manifest write (FileSet.JSON) and a few of generate.Build's own
+		// internal-consistency checks (an unknown kind reaching it despite
+		// parse.Dir's own rejection, an embedded module's fs.WalkDir/ReadFile
+		// failing) return a plain error instead — reachable in principle, not
+		// in practice, but not provably impossible either. Mirrors
+		// cmd/apply.go's withLockErr, which keeps the same fallback for the
+		// same reason rather than assuming it away.
+		return fmt.Errorf("%w%s", err, interruptedSwapHintSuffix)
+	}
+	upgraded := *d
+	upgraded.Hint += interruptedSwapHintSuffix
+	upgraded.Attrs = append(append([]diag.Attr{}, d.Attrs...), interruptedSwapAttrs()...)
+	return &upgraded
 }
 
 // LockedDiagnostic builds the apply-locked diagnostic from an error wrapping
