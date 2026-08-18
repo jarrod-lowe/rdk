@@ -861,6 +861,58 @@ func TestLockHoldErrorReportsLockNotDurableWithTheHeldLockID(t *testing.T) {
 	}
 }
 
+// TestLockHoldErrorReportsShuttingDownAsInterruptedNotAsABug exercises
+// lockHoldError directly with repofs.ErrShuttingDown itself, not a fake
+// stand-in: unlike ErrLockNotReleased and ErrLockNotDurable above,
+// ErrShuttingDown is an exported sentinel (repofs.ErrShuttingDown) that
+// errors.Is compares by identity, so no wrapper type is needed to reproduce
+// its shape.
+//
+// Before lockHoldError grew a branch for it, this sentinel fell through to
+// the bare `return err` at the bottom of lockHoldError, which diag.ExitCode
+// treats as an unclassified error — exit 2, "an rdk bug. Report it" — for a
+// user who had simply pressed Ctrl-C during rdk lock. This test proves the
+// fix: the diagnostic carries diag.CodeInterrupted, exits 1, and its text
+// does not claim rdk is broken.
+//
+// What this does NOT cover: the actual signal race (PrepareShutdown's
+// shuttingDown flag winning acquireLock's owned-path check mid-writeScratchTemp,
+// see acquireLock's own doc comment in internal/repofs/store.go) is not
+// deterministically reachable from a test — it depends on a signal landing
+// inside a real fsync's duration — so this only proves lockHoldError's
+// mapping once HoldLock has already decided to return the sentinel, not that
+// HoldLock decides correctly. That mechanism is internal/repofs's own
+// suite's job (store_test.go).
+func TestLockHoldErrorReportsShuttingDownAsInterruptedNotAsABug(t *testing.T) {
+	err := lockHoldError(repofs.ErrShuttingDown, repofs.LockInfo{})
+
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("error is not a diagnostic: %v", err)
+	}
+	if d.Code != diag.CodeInterrupted {
+		t.Errorf("code = %q, want %q", d.Code, diag.CodeInterrupted)
+	}
+	if got := diag.ExitCode(err); got != 1 {
+		t.Errorf("ExitCode = %d, want 1 — the user pressed Ctrl-C, this is not an rdk bug", got)
+	}
+	line := d.Line()
+	for _, falseClaim := range []string{"bug", "report it", "panic"} {
+		if strings.Contains(strings.ToLower(line), falseClaim) {
+			t.Errorf("message %q falsely suggests an rdk bug (contains %q)", line, falseClaim)
+		}
+	}
+	if !strings.Contains(d.Hint, "nothing is wrong") {
+		t.Errorf("hint %q does not reassure the reader that nothing is wrong", d.Hint)
+	}
+	if !strings.Contains(d.Hint, "no lock was created") {
+		t.Errorf("hint %q does not say that no lock was created", d.Hint)
+	}
+	if !errors.Is(err, repofs.ErrShuttingDown) {
+		t.Errorf("err does not unwrap to ErrShuttingDown: %v", err)
+	}
+}
+
 // TestUnlockErrorReportsLockNotDurableWithoutClaimingTheReleaseFailed
 // exercises unlockError directly, the same way
 // TestLockHoldErrorReportsLockNotDurableWithTheHeldLockID exercises

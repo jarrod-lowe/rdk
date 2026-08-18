@@ -223,6 +223,35 @@ func lockHoldError(err error, info repofs.LockInfo) error {
 			Attrs: []diag.Attr{diag.Str("lock_id", info.ID)},
 		})
 	}
+	if errors.Is(err, repofs.ErrShuttingDown) {
+		// Only reachable from HoldLock's *first* acquireLock call
+		// (scratchApplyLock, the transaction lock): acquireLock's shutdown
+		// check runs only on the owned path, gated by `owned := file ==
+		// scratchApplyLock` (see acquireLock's own doc comment in
+		// repofs/store.go, the paragraph beginning "Only the owned
+		// (scratchApplyLock) path checks it"), and that same comment states
+		// HoldLock never reaches its second acquireLock call (scratchLock,
+		// the held lock) until the first one has already succeeded. So a
+		// caller here can be certain .rdk/lock was never created: info is
+		// still the zero value, exactly as it is for ErrScratchTarget above,
+		// and unlike ErrLockNotReleased and ErrLockNotDurable there is no
+		// lock id to hand back, because none was ever taken.
+		//
+		// Placed last among the special cases, mirroring apply.Run's
+		// identical branch (internal/apply/apply.go): ErrShuttingDown is
+		// returned bare from acquireLock (`return LockInfo{}, ErrShuttingDown`),
+		// never wrapped together with ErrLocked, ErrLockTarget,
+		// ErrLockNotReleased, or ErrLockNotDurable — each of those comes
+		// from a different, later return statement in store.go, reachable
+		// only once this acquireLock call has already succeeded — so this
+		// cannot co-occur with any branch above and this placement is free,
+		// not load-bearing.
+		return diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeInterrupted,
+			Summary: "rdk lock: interrupted before taking the lock",
+			Hint:    "nothing is wrong and no lock was created: this repository is exactly as it was before this run — rdk was asked to shut down before rdk lock could acquire anything; re-run rdk lock if you still want to hold it",
+		})
+	}
 	return err
 }
 
