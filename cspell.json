@@ -46,7 +46,8 @@
     "Kustomize",
     "Ampt",
     "ITNEXT",
-    "Spacelift"
+    "Spacelift",
+    "testdata"
   ],
   "flagWords": [],
   "ignorePaths": [

@@ -84,11 +84,17 @@ Make hooks. No invented language, no vendor synthesis SDK, no format a
 five-year-old tool can't parse. Definitions may *name* a value that lives
 elsewhere — a structured `{ ref: resource.output }` — but may never *compute*
 one: no interpolation in strings, no conditionals, loops, or composition.
-Terraform's `${…}` appears only in generated output.
+Terraform's `${…}` is Terraform's syntax, not rdk's: rdk never generates one
+from a definition, never parses one, and never resolves one. A user may still
+write one into a value — around custom Terraform there is sometimes no other
+way — and it passes through verbatim. That is an escape hatch (rule 8), not a
+feature: rdk's guarantees stop at the `${`, provenance cannot explain what is
+inside it, and no rdk behaviour may come to depend on it.
 *Therefore:* when tempted by a DSL, expression language, or template syntax
 inside definitions — stop; computation belongs in a module or a policy, which
-receives refs as plain inputs. (DD-2, DD-12, and Winglang/CDKTF's scars in
-`alternatives.md`)
+receives refs as plain inputs. No rdk feature may require the user to write
+`${…}` to accomplish it, and no rdk behaviour may key off whether a value
+contains one. (DD-2, DD-12, and Winglang/CDKTF's scars in `alternatives.md`)
 
 ## 10. Narrow and finished beats broad and partial
 
@@ -105,7 +111,10 @@ who must act on it: what's wrong, where, and what to do next, citing
 provenance. This is a design constraint, not a polish pass.
 *Therefore:* no error message that names an internal concept without naming
 the user's file/field that triggered it; a feature whose failures can't be
-explained clearly isn't finished. (GOAL.md "AI Friendly", DD-7)
+explained clearly isn't finished. Mechanically: everything rdk says is a
+`diag.Diagnostic` carrying a documented code, the user's file and field, and a
+hint; `internal/logger` is the only path to stdout or stderr, and a test
+enforces it. (GOAL.md "AI Friendly", DD-7)
 
 ## 12. Messiness is budgeted
 

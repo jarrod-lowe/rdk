@@ -72,6 +72,9 @@ modules rdk ships.
   small repos, but adds a `terraform init` network dependency and supply-chain
   surface. DD-1's determinism goal and the AI-friendly/offline goal lean toward
   (a); repo size leans toward (b). Pick deliberately.
+  **→ Ratified (PR-1):** option (a), vendored — modules are embedded in the rdk
+  binary (`go:embed`) and written into the managed dir by apply. Fully hermetic
+  and offline; module version ≡ rdk version.
 - **Address stability moved *inside* the module.** The DD-1 residual doesn't
   vanish — a module upgrade that renames internal resources still
   destroys/recreates unless the module authors `moved {}` blocks. Convention:
@@ -303,6 +306,17 @@ explainability, because each layer announces itself.
   mechanism; setting-level pins are the exception for when rdk *does* move
   everyone to a new module version but must preserve one specific legacy value).
   Do not build both without settling this.
+- **Provider naming rules are unvalidated until the policy exists.** A
+  definition's `name` is validated as a Terraform identifier (it becomes the
+  module label verbatim), but *not* against the target provider's own naming
+  rules — and today that same name is used as the physical resource name. So
+  `Assets`, `asset_store` and the single character `a` all pass rdk and are
+  rejected by S3. Deliberately not fixed at the kind level: the naming policy
+  is what will derive physical names from the logical one, and that is where
+  provider rules belong — validating them twice, in two places, with two
+  notions of what the name *is*, would be worse than the gap. **When the naming
+  policy is built, this must be part of it**: the policy owns the mapping, so
+  it owns rejecting a logical name it cannot map. (Raised in review of PR-1.)
 - **Intra-layer conflicts, not just inter-layer.** Two applied policies both
   setting `memory` is a conflict *within* layer 3. Need a rule: explicit policy
   priority, or error-on-conflict (leaning error, unless one is a mandate).
@@ -708,6 +722,31 @@ rdk's or wholly the user's. Where both want a say (`.gitignore`), split by
 mechanism: rdk's ignore rules live in per-directory `.gitignore` files inside
 rdk-owned dirs; the root `.gitignore` is seeded-once user property.
 
+**Decision — rdk claims three fixed paths, and names them here.** Every other
+rdk-owned file is an outside file, justified under rule 12 and manifest-tracked
+by the algorithm below. A path not in this table and not in the manifest is the
+user's, and apply may not write to or delete it.
+
+| Path | Owner | Committed | Notes |
+| --- | --- | --- | --- |
+| `rdk/` | the user | yes | definitions; rdk reads them, and seeds `config.yaml` once (DD-3) |
+| `rdk-managed/` | rdk | yes | deleted and wholly regenerated every apply |
+| `.rdk/` | rdk | no | scratch for the materialize swap; carries its own `.gitignore` of `*`, so git never sees it |
+
+`.rdk/` earns its place by holding no state that is ever *read back*: `new/` is
+cleared at the start of every apply, and `old/` is cleared whenever a tree is
+about to be renamed onto that name. Neither is ever inspected, parsed, or
+promoted — the contents of a previous run can only be deleted, never trusted.
+That is what lets rdk clear it without validating it first: it is rdk's working
+space, not rdk's memory, and the manifest above remains rdk's only cross-apply
+state. (`old/` is deliberately *not* cleared when the managed dir is absent,
+since the name is not needed then and clearing it would destroy the only local
+copy of the previous tree after a failed publish. Not reading it and not
+needlessly deleting it are different properties; only the first is load-bearing.) It has to be a directory
+rather than siblings of `rdk-managed/` because a per-directory `.gitignore`
+governs only its own directory: nothing rdk owns could ignore a sibling, and the
+root `.gitignore` is the user's.
+
 **Decision — the apply algorithm per outside file.**
 
 | Manifest entry | On disk | Still generated? | Action |
@@ -865,6 +904,59 @@ retrofitting external sets reshuffles nothing.
   platform-team preview story ("what would v15 do to repo X?") — the update-PR
   plan output covers consumers; producer-side preview is open.
 
+## DD-17 — rdk targets recent Go (itself and managed projects)
+
+**Decision.** rdk requires a recent Go toolchain and does not support trailing/EOL
+versions. `go.mod`'s `go` directive tracks the current toolchain rather than a low
+floor. This is a *policy*, not just a build detail: keeping the Go version current
+applies both to rdk's own build and — as something rdk actively manages — to the
+Go projects it generates.
+
+**Why.** Recent Go brings security fixes, performance, and language features;
+letting managed repos drift onto EOL toolchains is exactly the invisible, latent
+debt rdk exists to prevent (cf. Improved Defaults, DD-7). Supporting old
+toolchains would constrain rdk's own code and dilute the "keep repos current"
+value proposition. (Prompted by a reviewer suggesting we lower the floor to match
+a stale doc; the fix was to correct the doc, not lower the floor.)
+
+**Residual risk / still open.**
+
+- The advance cadence is unspecified — likely track Go's release cycle (support
+  the current and previous minor, drop older on each release). Decide deliberately.
+- Enforcing recent Go in *managed* projects (a generated toolchain policy/check)
+  is future feature work, not built yet.
+- Contributors/CI on trailing Go fail the build by design; state the minimum in
+  the repo README when one exists.
+
+## DD-18 — All file handling goes through an injected `internal/repofs`
+
+**Decision.** Components never touch the filesystem directly. A single injected
+library, `internal/repofs`, performs the file *actions* rdk needs (materialize a
+managed tree atomically, seed a user file once, read within the repo), rooted at
+the repo via `os.Root` so confinement and symlink-safety are structural — not
+per-call-site guards. Components build an in-memory `FileSet` (`Bytes`, `JSON`)
+describing desired output; `repofs` owns directory creation, permissions,
+deterministic serialization (DD-1), the atomic staging/swap, and security. An
+in-memory fake makes component tests filesystem-free.
+
+**Why.** The escape/symlink/atomicity fixes had accreted at scattered call sites
+(securejoin, `O_EXCL`, lexical path checks, hand-rolled swap). Centralizing makes
+insecure file access unrepresentable in component code, deletes the
+`filepath-securejoin` dependency, and unifies the tf.json/manifest serialization
+that DD-1 depends on. Enabled by `os.Root` (DD-17's recent-Go policy paying off).
+
+**Scope.** Folded into PR-1 before merge. Only the actions PR-1 uses are built
+(`Materialize`, `Seed`, `ReadFile`, `ReadDir`; `FileSet.Bytes`/`JSON`);
+`WriteOutside`/`RemoveOutside`, `YAML`, and template entries are deferred to when
+a component needs them (YAGNI).
+
+**Full design:** `docs/superpowers/specs/2026-07-29-repofs-design.md`.
+
+**Residual risk / still open.** Golden churn if `repofs.JSON` doesn't byte-match
+the current encoders (manifest `MarshalIndent` vs tf.json `Encoder` trailing
+newline) — verify, don't blind-update. Error quality drops slightly where lexical
+path validation is removed (acceptable; rdk-generated paths).
+
 ---
 
 ### Fault scorecard (see `alternatives.md`)
@@ -890,4 +982,7 @@ retrofitting external sets reshuffles nothing.
 | — Outside-files manifest (DD-4 residual) | Resolved by DD-14 (three-way hash comparison; hard errors; clean stale files deleted) — adds philosophy rule 13 |
 | — Bootstrap chicken-and-egg (DD-8 residual) | Resolved by DD-15 (generated per-env bootstrap TF + script; plan/apply role split; self-hosted state) |
 | — External policy sets (new, deferred) | Shaped as DD-16 (vendored, semver-tagged, hash-locked; never fetched at apply); v1 hooks only |
+| — Module distribution (DD-2 residual) | Ratified in PR-1: vendored via `go:embed`; module version ≡ rdk version |
+| — Recent-Go policy (new) | DD-17: rdk targets recent Go for itself and managed projects; no old-toolchain support |
+| — Injected file handling (new) | DD-18: all FS access via `internal/repofs` (os.Root-rooted, injected, faked); centralizes security/determinism/atomicity |
 | All faults #1–#12 now have a decision | #12 traceability solved; broader AI-friendly output remains cross-cutting |

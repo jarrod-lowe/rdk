@@ -1,0 +1,3 @@
+kind: s3-bucket
+name: assets
+description: Static assets

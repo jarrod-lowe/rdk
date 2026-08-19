@@ -1,0 +1,290 @@
+// Package parse loads and validates the rdk/ definitions directory.
+package parse
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/goccy/go-yaml"
+	"github.com/jarrod-lowe/rdk/internal/diag"
+	"github.com/jarrod-lowe/rdk/internal/kind"
+	"github.com/jarrod-lowe/rdk/internal/repofs"
+	"github.com/jarrod-lowe/rdk/internal/schema"
+)
+
+// identifierPattern approximates HCL's real identifier grammar:
+//
+//	Ident = (ID_Start | '_') (ID_Continue | '-')*
+//
+// (hashicorp/hcl/v2 hclsyntax/scan_tokens.rl), where ID_Start/ID_Continue are
+// the Unicode UAX#31 properties, not ASCII ranges — an earlier version of
+// this pattern was ASCII-only ([A-Za-z_][A-Za-z0-9_-]*) and so rejected
+// legal names like "café" or "日本語".
+//
+// Verified empirically against `terraform validate` (v1.14.6, the ground
+// truth: `terraform` shells out to the real HCL parser) by generating module
+// blocks with candidate labels and checking init/validate. Confirmed:
+// Unicode letters (café, naïve, 日本語, Ω) and Unicode decimal digits
+// (\p{Nd}, e.g. Arabic-Indic ۱) are accepted anywhere ASCII letters/digits
+// are; a leading digit, dot, space, leading dash, or emoji are all still
+// rejected, matching the ASCII-only cases already covered.
+//
+// \p{L} and \p{Nd} do not cover the whole of UAX#31: real ID_Start also
+// includes Nl (letter-numbers, e.g. Roman numeral code points), and real
+// ID_Continue also includes Mn/Mc (combining marks) and Pc (connector
+// punctuation generally, of which ASCII '_' is only one member) — all
+// confirmed accepted by `terraform validate` in the same experiment. Those
+// are left out here: no legitimate resource name is expected to use them,
+// and omitting them keeps the pattern auditable while staying safely
+// under-accepting rather than accepting something Terraform would reject.
+var identifierPattern = regexp.MustCompile(`^[\p{L}_][\p{L}\p{Nd}_-]*$`)
+
+// Definition is one parsed, schema-validated definition file.
+type Definition struct {
+	Kind  string
+	Name  string
+	File  string         // path relative to the definitions dir, for error messages
+	Attrs map[string]any // all fields except kind, validated against the schema
+}
+
+// Dir loads every *.yaml in dir (read through the store, sorted), validates each
+// against its kind schema, and enforces cross-file rules (unique names, exactly
+// one config). Entries rdk cannot process are errors, not clutter to step
+// around; the few that are ignorable come back as warnings for the caller to
+// report. Warnings inherit ReadDir's sorted order (DD-1).
+func Dir(store repofs.Store, dir string) ([]Definition, []diag.Diagnostic, error) {
+	entries, err := store.ReadDir(dir)
+	if err != nil {
+		return nil, nil, diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeReadDefsDir,
+			File:    dir,
+			Summary: "cannot read the definitions directory",
+			Hint:    "run 'rdk init' if this repository has not been initialised",
+		})
+	}
+
+	var defs []Definition
+	var warnings []diag.Diagnostic
+	seen := map[string]string{} // resource name -> file
+	configs := 0
+	for _, e := range entries {
+		name := e.Name
+		if e.IsDir {
+			return nil, nil, diag.New(diag.Diagnostic{
+				Code:    diag.CodeDirInDefs,
+				File:    name,
+				Summary: "rdk/ holds definition files, not directories",
+				Hint:    fmt.Sprintf("move the definitions in %s/ up into %s/", name, dir),
+			})
+		}
+		if !strings.HasSuffix(name, ".yaml") {
+			w, err := classify(name)
+			if err != nil {
+				return nil, nil, err
+			}
+			warnings = append(warnings, w)
+			continue
+		}
+		def, err := parseFile(store, dir, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		// The "exactly one config" cardinality rule is config-specific and not
+		// yet modeled by the kind registry, so it names the kind directly here.
+		if def.Kind == "config" {
+			configs++
+		} else {
+			if prev, dup := seen[def.Name]; dup {
+				return nil, nil, diag.New(diag.Diagnostic{
+					Code:    diag.CodeDuplicateName,
+					File:    name,
+					Field:   "name",
+					Summary: fmt.Sprintf("duplicate resource name %q (also defined in %s)", def.Name, prev),
+					Hint:    "resource names must be unique; rename one of them",
+				})
+			}
+			seen[def.Name] = name
+		}
+		defs = append(defs, def)
+	}
+	if configs != 1 {
+		return nil, nil, diag.New(diag.Diagnostic{
+			Code:    diag.CodeConfigCardinality,
+			File:    dir,
+			Summary: fmt.Sprintf("expected exactly one 'kind: config' definition, found %d", configs),
+			Hint:    "add the missing one, or remove the extras",
+		})
+	}
+	return defs, warnings, nil
+}
+
+func parseFile(store repofs.Store, dir, name string) (Definition, error) {
+	raw, err := store.ReadFile(path.Join(dir, name))
+	if err != nil {
+		return Definition{}, diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeReadFile,
+			File:    name,
+			Summary: "cannot read this definition file",
+		})
+	}
+	// Decode document-by-document rather than with yaml.Unmarshal, which reads
+	// only the first document and drops the rest without complaint. A file that
+	// bundles definitions the Kubernetes way would otherwise apply partially and
+	// silently, so a second document is an error rather than a lost resource.
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
+		return Definition{}, diag.Wrap(err, diag.Diagnostic{
+			Code:    diag.CodeInvalidYAML,
+			File:    name,
+			Summary: "invalid YAML",
+		})
+	}
+	var next map[string]any
+	if err := dec.Decode(&next); !errors.Is(err, io.EOF) {
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeMultiDocument,
+			File:    name,
+			Summary: "contains more than one YAML document (separated by '---')",
+			Hint:    "rdk takes one definition per file — split them into separate files",
+		})
+	}
+
+	if len(doc) == 0 {
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeEmptyFile,
+			File:    name,
+			Summary: "file is empty",
+			Hint:    "every definition starts with a 'kind' field (e.g. kind: s3-bucket)",
+		})
+	}
+	rawKind, present := doc["kind"]
+	if !present {
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeMissingKind,
+			File:    name,
+			Field:   "kind",
+			Summary: "missing 'kind' field",
+			Hint:    "add one, e.g. kind: s3-bucket",
+		})
+	}
+	kindVal, isStr := rawKind.(string)
+	if !isStr {
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeKindNotString,
+			File:    name,
+			Field:   "kind",
+			Summary: fmt.Sprintf("'kind' must be a string, got %s", yamlType(rawKind)),
+			Hint:    "e.g. kind: s3-bucket",
+		})
+	}
+	if kindVal == "" {
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeEmptyKind,
+			File:    name,
+			Field:   "kind",
+			Summary: "'kind' must not be empty",
+			Hint:    "e.g. kind: s3-bucket",
+		})
+	}
+	ki, ok := kind.Lookup(kindVal)
+	if !ok {
+		known := knownKinds()
+		return Definition{}, diag.New(diag.Diagnostic{
+			Code:    diag.CodeUnknownKind,
+			File:    name,
+			Field:   "kind",
+			Summary: fmt.Sprintf("unknown kind %q%s", kindVal, didYouMean(kindVal, known)),
+			Hint:    "known kinds: " + strings.Join(known, ", "),
+		})
+	}
+	k := ki.Schema()
+
+	// Sorted, not map order: with two unknown fields, Go's randomised map
+	// iteration would report a different one each run, so identical input
+	// would produce different diagnostics (rule 1).
+	keys := make([]string, 0, len(doc))
+	for key := range doc {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	attrs := map[string]any{}
+	for _, key := range keys {
+		if key == "kind" {
+			continue
+		}
+		val := doc[key]
+		if _, ok := k.Field(key); !ok {
+			valid := fieldNames(k)
+			return Definition{}, diag.New(diag.Diagnostic{
+				Code:    diag.CodeUnknownField,
+				File:    name,
+				Field:   key,
+				Summary: fmt.Sprintf("unknown field %q for kind %q%s", key, kindVal, didYouMean(key, valid)),
+				Hint:    "valid fields: " + strings.Join(valid, ", "),
+			})
+		}
+		attrs[key] = val
+	}
+	for _, f := range k.Fields {
+		if f.Required {
+			if _, present := attrs[f.Name]; !present {
+				return Definition{}, diag.New(diag.Diagnostic{
+					Code:    diag.CodeMissingField,
+					File:    name,
+					Field:   f.Name,
+					Summary: fmt.Sprintf("kind %q has required field %q — %s", kindVal, f.Name, f.Description),
+					Hint:    "example: " + f.Example,
+				})
+			}
+		}
+		if v, present := attrs[f.Name]; present && (f.Type == schema.StringType || f.Type == schema.IdentifierType) {
+			s, isStr := v.(string)
+			if !isStr {
+				return Definition{}, diag.New(diag.Diagnostic{
+					Code:    diag.CodeFieldNotString,
+					File:    name,
+					Field:   f.Name,
+					Summary: fmt.Sprintf("field %q must be a string, got %s", f.Name, yamlType(v)),
+					Hint:    "example: " + f.Example,
+				})
+			}
+			switch f.Type {
+			case schema.IdentifierType:
+				// The pattern itself excludes "", so a blank or whitespace-only
+				// value is reported as an illegal identifier rather than as a
+				// separate empty-field case — one diagnostic, not two disagreeing
+				// ones for the same field.
+				if !identifierPattern.MatchString(s) {
+					return Definition{}, diag.New(diag.Diagnostic{
+						Code:    diag.CodeFieldNotIdentifier,
+						File:    name,
+						Field:   f.Name,
+						Summary: fmt.Sprintf("field %q must be a Terraform identifier: %q", f.Name, s),
+						Hint:    "start with a letter or underscore; letters, digits, underscores and dashes only",
+					})
+				}
+			case schema.StringType:
+				if f.Required && strings.TrimSpace(s) == "" {
+					return Definition{}, diag.New(diag.Diagnostic{
+						Code:    diag.CodeEmptyField,
+						File:    name,
+						Field:   f.Name,
+						Summary: fmt.Sprintf("required field %q must not be empty", f.Name),
+						Hint:    "give it a value",
+					})
+				}
+			}
+		}
+	}
+
+	defName, _ := attrs["name"].(string)
+	return Definition{Kind: kindVal, Name: defName, File: name, Attrs: attrs}, nil
+}

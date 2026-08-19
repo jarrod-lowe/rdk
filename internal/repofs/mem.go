@@ -1,0 +1,493 @@
+package repofs
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path"
+	"sort"
+	"strings"
+	"time"
+)
+
+// Mem is an in-memory Store for filesystem-free component tests. It does not
+// reproduce os.Root's confinement semantics — security is verified against the
+// real Store; Mem is for logic.
+type Mem struct {
+	files map[string][]byte // repo-relative path -> content
+
+	// lockHeld and lockID mirror osStore's: they record whether this Mem
+	// value itself acquired the transaction lock, so ReleaseLock never
+	// removes one it didn't grant. No mutex — Mem is single-goroutine test
+	// scaffolding, unlike the real Store.
+	lockHeld bool
+	lockID   string
+
+	// usingLock and usingLockID mirror osStore's: this Mem adopted a lock it
+	// did not take (UseLock), so Materialize neither acquires nor releases
+	// it, and usingLockID is the id UseLock verified, kept so Materialize can
+	// re-verify it later — see store.go's Materialize for why.
+	usingLock   bool
+	usingLockID string
+
+	// shuttingDown mirrors osStore's: once PrepareShutdown has been called,
+	// no further acquireLock call may publish a lock, transaction or held.
+	// Mem has no second goroutine to race this against (see the struct's own
+	// doc comment), so there is no window here for the flag to close — but the
+	// two Store implementations must still agree on the rule itself, not
+	// just on osStore's end state, or a component test written against Mem
+	// could assert a Store contract osStore does not actually have.
+	shuttingDown bool
+}
+
+// Compile-time assertion that *Mem satisfies Store.
+var _ Store = (*Mem)(nil)
+
+// NewMem returns an empty in-memory Store.
+func NewMem() *Mem { return &Mem{files: map[string][]byte{}} }
+
+// Files exposes the backing map for test assertions.
+func (m *Mem) Files() map[string][]byte { return m.files }
+
+func (m *Mem) Materialize(managedDir string, set *FileSet) (err error) {
+	// Mem must reject exactly what osStore rejects, or a component test could
+	// pass against the fake while misrepresenting what production does.
+	if err := set.checkNoOutsideEntries(); err != nil {
+		return err
+	}
+	// Mirrors osStore.Materialize: check the held lock (unless this Mem
+	// adopted it via UseLock), then always acquire the transaction lock — see
+	// store.go for why both still run on the usingLock path.
+	if !m.usingLock {
+		if held, err := m.readLockFile(scratchLock); err == nil {
+			return lockedErrorFor(held)
+		} else if err != fs.ErrNotExist {
+			return err
+		}
+	}
+	if _, err := m.acquireLock(scratchApplyLock, ""); err != nil {
+		return err
+	}
+	// Mirrors osStore.Materialize's named-return defer, so the two Store
+	// implementations agree on shape even though Mem's ReleaseLock — no
+	// filesystem, so no read or Remove that can fail unexpectedly — never
+	// actually has a release error to surface here.
+	defer func() {
+		if relErr := m.ReleaseLock(); relErr != nil && err == nil {
+			err = relErr
+		}
+	}()
+	// Mirrors osStore.Materialize's non-adopted-path re-check: production
+	// closes a race here where a concurrent HoldLock's whole
+	// acquire-create-release cycle completes inside the gap between the
+	// pre-acquire read above and this call's own acquireLock — see
+	// store.go's Materialize for the full argument that this closes rather
+	// than merely narrows that race. Mem is single-goroutine test scaffolding
+	// (see the struct's own doc comment) and has no seam for a second
+	// goroutine to hit that gap, so this can never actually find a lock here
+	// that the pre-acquire read above didn't already catch — but it must
+	// still exist and still refuse, or Mem would accept what production
+	// refuses from a test that plants a lock directly in m.files between the
+	// two reads (the same reasoning checkStillLocked's own doc comment below
+	// gives for keeping its check even though Materialize alone can't reach
+	// it non-nil).
+	if !m.usingLock {
+		if held, err := m.readLockFile(scratchLock); err == nil {
+			return lockedErrorFor(held)
+		} else if err != fs.ErrNotExist {
+			return err
+		}
+	}
+	// Mirrors osStore.Materialize's re-verification: see its comment for why
+	// this has to happen now, under the transaction lock, rather than trust
+	// UseLock's own read to still hold.
+	if m.usingLock {
+		switch held, err := m.readLockFile(scratchLock); {
+		case err == nil && held.ID == m.usingLockID:
+			// still the lock this run adopted
+		case err == nil:
+			return lockedErrorFor(held)
+		case err == fs.ErrNotExist:
+			return fmt.Errorf("lock %s is gone: it was released or broken after this apply had already begun running under it", m.usingLockID)
+		default:
+			return err
+		}
+	}
+	// Mirrors osStore.Materialize: the last point before anything the caller
+	// can observe changes.
+	if err := m.checkStillLocked(); err != nil {
+		return err
+	}
+	prefix := managedDir + "/"
+	for p := range m.files {
+		if strings.HasPrefix(p, prefix) {
+			delete(m.files, p)
+		}
+	}
+	for _, p := range set.sortedPaths() {
+		m.files[path.Join(managedDir, p)] = append([]byte(nil), set.managedBytes(p)...)
+	}
+	return nil
+}
+
+// acquireLock mirrors osStore.acquireLock's exclusive-create semantics using
+// the same map that models the rest of the tree, keyed under file (scratchLock
+// for a held lock, scratchApplyLock for a transaction lock) so a planted lock
+// and a materialized file can never collide. No separate kind argument, for
+// the same reason as osStore.acquireLock: lockKindFor(file) is the one
+// authority on what a lock found at file is.
+//
+// Where the mirror stops: osStore's fix for this task is two things —
+// atomicity (write the complete record to a scratch name and only then Link
+// it into place, so nothing ever observes a half-written lock, with lockMu
+// held across that Link so a racing ReleaseLock cannot withdraw the claim
+// before the file exists to back it) and ownership scoping (record only for
+// scratchApplyLock). Mem models only the second, below. m.files[file] = b is
+// a single map write with nothing else able to observe it mid-assignment, so
+// there is no half-written state for a temp-then-link step to guard against,
+// and Mem has no mutex or second goroutine to race in the first place (see
+// the struct's own doc comment) — the atomicity half of this fix is not
+// something Mem could misrepresent even if it tried. What it can
+// misrepresent is the scoping, which is why that half is mirrored and tested
+// here.
+func (m *Mem) acquireLock(file, message string) (LockInfo, error) {
+	// No usingLock guard here — see osStore.acquireLock: every Materialize
+	// now acquires the transaction lock regardless of whether it also
+	// adopted the held lock via UseLock, so this running with usingLock true
+	// is the ordinary --with-lock path, not a bug to guard against.
+	//
+	// Mirrors osStore.acquireLock's shuttingDown check for every file, not
+	// just scratchApplyLock. It used to be scoped to the transaction lock
+	// alone, on the reasoning that a refusal there already stops HoldLock
+	// before it reaches the held-lock acquisition — true only for the
+	// ordering where shutdown was recorded before the first acquisition ran.
+	// osStore's own fix (see its acquireLock doc comment) checks on every
+	// call because a shutdown recorded *between* the two acquisitions must
+	// also refuse the second; Mem has no second goroutine to race that
+	// ordering against (see the struct's own doc comment), but the two Store
+	// implementations must still agree on the rule itself, not just on
+	// osStore's end state — a component test written against Mem should not
+	// be able to assert a Store contract osStore does not actually have.
+	if m.shuttingDown {
+		return LockInfo{}, ErrShuttingDown
+	}
+	if _, ok := m.files[file]; ok {
+		existing, _ := m.readLockFile(file)
+		return LockInfo{}, lockedErrorFor(existing)
+	}
+	idBytes := make([]byte, 8)
+	if _, err := rand.Read(idBytes); err != nil {
+		return LockInfo{}, err
+	}
+	info := LockInfo{
+		ID:      hex.EncodeToString(idBytes),
+		Kind:    lockKindFor(file),
+		Host:    hostname(),
+		PID:     os.Getpid(),
+		Since:   time.Now().UTC().Format(time.RFC3339),
+		Message: message,
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		return LockInfo{}, err
+	}
+	m.files[file] = b
+	// Only the transaction lock is this Mem's to release — mirrors
+	// osStore.acquireLock, where recording a held lock's id would make
+	// HoldLock's deferred release compare the wrong id.
+	if file == scratchApplyLock {
+		m.lockHeld = true
+		m.lockID = info.ID
+	}
+	return info, nil
+}
+
+// readLockFile mirrors osStore.readLockFile: a lock file that exists but
+// fails to parse still reports Held, since the malformed file is itself what
+// has to keep blocking (rule 6).
+//
+// Kind and Path come from the file, not the record, exactly as osStore does —
+// otherwise a component test could plant a record whose kind disagrees with
+// its file and see Mem describe it differently from production.
+//
+// Where the mirror stops: osStore.readLockFile also Lstats file and refuses
+// anything that is not a regular file (ErrLockTarget). Mem has no
+// filesystem — m.files is a map from path to bytes, so every entry it holds
+// is already exactly one "regular file's" worth of content — so there is no
+// symlink or directory state for it to model, and no component test can
+// exercise ErrLockTarget against Mem. That path is verified against the real
+// Store only.
+func (m *Mem) readLockFile(file string) (LockInfo, error) {
+	b, ok := m.files[file]
+	if !ok {
+		return LockInfo{}, fs.ErrNotExist
+	}
+	var info LockInfo
+	_ = json.Unmarshal(b, &info) // best effort; see doc comment
+	info.Held = true
+	info.Path = file
+	info.Kind = lockKindFor(file)
+	return info, nil
+}
+
+// ReleaseLock removes the transaction lock only if this Mem value acquired
+// it and it still carries the id this call took — see osStore.ReleaseLock
+// for why the id recheck matters (a broken-and-replaced lock must not be
+// deleted by the run whose lock was broken) and why this only ever touches
+// scratchApplyLock, never scratchLock: a held lock is not this function's to
+// remove, and now that the two live in different files that is structural,
+// not a check. Idempotent.
+//
+// lockHeld is cleared only once the removal (or the discovery that there is
+// nothing of this call's left to remove) is settled, mirroring osStore: Mem
+// has no concurrent callers of its own (see the doc comment on the struct),
+// but the two Store implementations must agree on when ownership is
+// surrendered, not just on the end state, so a test written against one
+// cannot describe a sequencing osStore does not actually have.
+func (m *Mem) ReleaseLock() error {
+	if !m.lockHeld {
+		return nil
+	}
+	info, err := m.readLockFile(scratchApplyLock)
+	if err != nil || !info.Held || info.ID != m.lockID {
+		m.lockHeld = false
+		return nil
+	}
+	delete(m.files, scratchApplyLock)
+	m.lockHeld = false
+	return nil
+}
+
+// PrepareShutdown mirrors osStore.PrepareShutdown: sets shuttingDown so no
+// further lock, transaction or held, can be published, then releases
+// whatever transaction lock this Mem already holds — a held lock, same as
+// osStore's ReleaseLock, is never this call's to release. Mem has no second
+// goroutine to race a caller against (see the struct's own doc comment), so
+// unlike osStore's version there is no mutex-ordering argument to make here —
+// the two Store implementations must still agree on the rule and the
+// sequence (flag first, then release), not just the end state.
+func (m *Mem) PrepareShutdown() error {
+	m.shuttingDown = true
+	return m.ReleaseLock()
+}
+
+// checkStillLocked mirrors osStore's pre-publish check only.
+//
+// Where the mirror stops: osStore calls this twice — once before the renames
+// and again before the sweep — with a published bool that changes what the
+// message can honestly say once the tree has already been written. Mem has
+// no publish/sweep split to mirror: Materialize replaces m.files with a
+// single unconditional set of map writes (see Materialize's own doc
+// comment), so there is only ever one point in Mem's Materialize where this
+// applies, and it is always the pre-publish one — the published axis simply
+// does not exist here, not just isn't modelled.
+//
+// It also cannot return non-nil through Mem.Materialize today: everything
+// between acquiring the lock and calling this is a read
+// (checkNoOutsideEntries, the two readLockFile calls above), and Mem has no
+// seam and no second goroutine to change m.lockHeld or the map underneath a
+// single-threaded call (see the struct's own doc comment), so this always
+// finds exactly what Materialize just acquired. Kept anyway, mirroring
+// osStore's shape rather than osStore's reachability, and callable directly
+// by a test that plants a broken or replaced lock in the map first — the
+// same way the direct tests against osStore's checkStillLocked do, without
+// going through Materialize.
+func (m *Mem) checkStillLocked() error {
+	if !m.lockHeld {
+		return &lockLostError{err: errors.New("this apply is not holding a lock")}
+	}
+	switch info, err := m.readLockFile(scratchApplyLock); {
+	case err == nil && info.ID == m.lockID:
+		return nil
+	case err == nil:
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running, and %s holds the repository now: nothing was published, re-run when it is free", m.lockID, info.ID)}
+	case err == fs.ErrNotExist:
+		return &lockLostError{err: fmt.Errorf("lock %s was broken while this apply was running: nothing was published, re-run", m.lockID)}
+	default:
+		return err
+	}
+}
+
+// BreakLock mirrors osStore.BreakLock: the id is required, checked against
+// both the held lock and the transaction lock, and only a match is removed.
+func (m *Mem) BreakLock(id string) (LockInfo, error) {
+	// Mirrors osStore.BreakLock: an empty id must never match, or this fake
+	// could accept what production refuses.
+	if id == "" {
+		return LockInfo{}, errors.New("a lock id is required: --break-lock names the one lock it may remove")
+	}
+	var found []LockInfo
+	for _, file := range []string{scratchLock, scratchApplyLock} {
+		info, err := m.readLockFile(file)
+		if err != nil {
+			if err == fs.ErrNotExist {
+				continue
+			}
+			return LockInfo{}, err
+		}
+		if info.ID != id {
+			found = append(found, info)
+			continue
+		}
+		delete(m.files, file)
+		return info, nil
+	}
+	if len(found) == 0 {
+		return LockInfo{}, fmt.Errorf("no lock %q is held", id)
+	}
+	ids := make([]string, len(found))
+	for i, f := range found {
+		ids[i] = f.ID
+	}
+	return LockInfo{}, fmt.Errorf("lock %s does not match the current lock(s): %s", id, strings.Join(ids, ", "))
+}
+
+// Seed mirrors osStore.Seed's create-once contract. It needs none of
+// osStore's write-to-a-scratch-name-then-Link machinery: that exists to keep
+// a write that fails partway from leaving a half-written file at name, and a
+// map assignment has no partway — it either happens or the earlier error
+// return means it never runs, so there is no truncated state for Mem to
+// produce or guard against.
+func (m *Mem) Seed(name string, data []byte) error {
+	if _, ok := m.files[name]; ok {
+		return nil
+	}
+	m.files[name] = append([]byte(nil), data...)
+	return nil
+}
+
+func (m *Mem) ReadFile(name string) ([]byte, error) {
+	d, ok := m.files[name]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	return append([]byte(nil), d...), nil
+}
+
+func (m *Mem) ReadDir(dir string) ([]Entry, error) {
+	prefix := dir + "/"
+	seen := map[string]bool{} // entry name -> is a directory
+	for p := range m.files {
+		if !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		rest := p[len(prefix):]
+		// A remaining separator means the entry is a directory: this model has
+		// no directory objects, only the paths that imply them.
+		isDir := false
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			rest, isDir = rest[:i], true
+		}
+		seen[rest] = seen[rest] || isDir
+	}
+	// A directory with no entries doesn't exist in the in-memory model (dirs
+	// are implied by file paths). Match the real Store, which errors on a
+	// missing directory rather than returning an empty listing — otherwise a
+	// component test could pass on Mem but fail against os.Root.
+	if len(seen) == 0 {
+		return nil, fs.ErrNotExist
+	}
+	out := make([]Entry, 0, len(seen))
+	for n, isDir := range seen {
+		out = append(out, Entry{Name: n, IsDir: isDir})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// HoldLock mirrors osStore.HoldLock: it creates the held lock while holding
+// the transaction lock, so rdk lock and an apply can never both succeed on
+// the ordinary interleaving that used to let both of their mutually-checking
+// creates through. Mem is single-goroutine and cannot race, but the two
+// implementations must agree on the sequence and not merely on the end
+// state — otherwise a component test could describe an ordering production
+// does not have.
+func (m *Mem) HoldLock(message string) (info LockInfo, err error) {
+	if _, err := m.acquireLock(scratchApplyLock, ""); err != nil {
+		// A held lock takes precedence in the message when there is one —
+		// mirrors osStore.HoldLock's reasoning: describing rdk's own
+		// transaction-lock plumbing back at a user whose actual situation is
+		// that someone else holds the repository would be the wrong thing to
+		// say.
+		if errors.Is(err, ErrLocked) {
+			if held, readErr := m.readLockFile(scratchLock); readErr == nil {
+				return LockInfo{}, lockedErrorFor(held)
+			}
+		}
+		return LockInfo{}, err
+	}
+	// Mirrors osStore.HoldLock's named-return defer, so the two Store
+	// implementations agree on shape — even though Mem's ReleaseLock, with
+	// no filesystem to fail a read or a Remove against, never actually has a
+	// release error to surface here.
+	defer func() {
+		if relErr := m.ReleaseLock(); relErr != nil && err == nil {
+			err = relErr
+		}
+	}()
+	return m.acquireLock(scratchLock, message)
+}
+
+// Unlock mirrors osStore.Unlock: it only ever writes to scratchLock, and
+// reads scratchApplyLock too purely to diagnose an id that names a running
+// apply, redirecting to --break-lock instead of degrading to "no lock is
+// held".
+func (m *Mem) Unlock(id string) error {
+	// Mirrors osStore.Unlock: an empty id must never match.
+	if id == "" {
+		return errors.New("a lock id is required: rdk unlock names the one lock it may release")
+	}
+	held, heldErr := m.readLockFile(scratchLock)
+	if heldErr != nil && heldErr != fs.ErrNotExist {
+		return heldErr
+	}
+	if heldErr == nil && held.ID == id {
+		delete(m.files, scratchLock)
+		// No ownership to clear: lockHeld/lockID track only the
+		// transaction lock (see acquireLock), and a held lock's id can
+		// never appear there, so there is nothing here this call could be
+		// the owner of.
+		return nil
+	}
+	if applying, err := m.readLockFile(scratchApplyLock); err == nil && applying.ID == id {
+		return fmt.Errorf("lock %s belongs to a running apply, not to you — use --break-lock=%s if it is stranded", id, id)
+	}
+	if heldErr != nil {
+		return fmt.Errorf("no lock %q is held", id)
+	}
+	return fmt.Errorf("lock %s does not match %s", held.ID, id)
+}
+
+// UseLock mirrors osStore.UseLock: only ever reads scratchLock, so a running
+// apply's lock (scratchApplyLock) can never be what this finds — see
+// osStore.UseLock for why that makes the old Kind check structural now
+// rather than something this still has to test for.
+func (m *Mem) UseLock(id string) (LockInfo, error) {
+	// Mirrors osStore.UseLock: an empty id must never match.
+	if id == "" {
+		return LockInfo{}, errors.New("a lock id is required: --with-lock names the one lock it may run under")
+	}
+	info, err := m.readLockFile(scratchLock)
+	if err != nil {
+		if err == fs.ErrNotExist {
+			return LockInfo{}, fmt.Errorf("no lock is held: %s was broken out from under you", id)
+		}
+		return LockInfo{}, err
+	}
+	if info.ID != id {
+		return LockInfo{}, fmt.Errorf("lock %s does not match %s", info.ID, id)
+	}
+	// lockHeld alone — mirrors osStore.UseLock: lockID, when set, is always a
+	// transaction lock's id, never a held lock's, so comparing it against id
+	// (always a held lock's id here) could never be what makes this refuse.
+	if m.lockHeld {
+		return LockInfo{}, errors.New("this store already holds a lock and cannot also run under one")
+	}
+	m.usingLock = true
+	m.usingLockID = id
+	return info, nil
+}
