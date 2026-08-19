@@ -1445,6 +1445,35 @@ func TestApplyRejectsAnEmptyBreakLock(t *testing.T) {
 	}
 }
 
+// A lock's id can fail to be readable on either lock file — .rdk/lock (the
+// held lock) or .rdk/apply.lock (the transaction lock); LockedDiagnostic's
+// info.ID == "" branch (internal/apply/apply.go) names whichever one it
+// actually read. The hint here used to hard-code .rdk/apply.lock, which was
+// wrong whenever the unreadable lock was the held one instead — telling the
+// user to remove a file that had nothing to do with what was blocking them,
+// while leaving the repository still locked. Assert the hint no longer
+// guesses a specific path and instead defers to the diagnostic that already
+// read one.
+func TestApplyEmptyBreakLockHintDoesNotGuessALockFile(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run(t, dir, "init"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := run(t, dir, "apply", "--break-lock=")
+	if err == nil {
+		t.Fatal("apply --break-lock= succeeded, want a flag error")
+	}
+	var d *diag.Error
+	if !errors.As(err, &d) {
+		t.Fatalf("err = %v, want a *diag.Error", err)
+	}
+	for _, path := range []string{repofs.ScratchDir + "/apply.lock", repofs.ScratchDir + "/lock"} {
+		if strings.Contains(d.Hint, path) {
+			t.Errorf("hint %q names %q, but the unreadable lock could be either file — it must defer to the blocked-apply diagnostic's own path instead of guessing", d.Hint, path)
+		}
+	}
+}
+
 func TestApplyRejectsAnEmptyWithLock(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := run(t, dir, "init"); err != nil {

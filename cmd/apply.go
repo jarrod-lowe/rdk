@@ -52,7 +52,18 @@ func (a *app) applyCmd() *cobra.Command {
 				return diag.New(diag.Diagnostic{
 					Code:    diag.CodeInvalidFlag,
 					Summary: "rdk apply: --break-lock needs the id of the lock to remove",
-					Hint:    "the blocked-apply error prints the id; if it prints none, the lock file is unreadable — remove " + repofs.ScratchDir + "/apply.lock",
+					// There are two lock files (.rdk/lock, the held lock; and
+					// .rdk/apply.lock, the transaction lock), and an unreadable
+					// id can happen to either — LockedDiagnostic's info.ID == ""
+					// branch (internal/apply/apply.go) reports whichever one it
+					// actually read, in both its summary text and its lock_path
+					// attr. Naming a path here would be a guess right half the
+					// time; naming both would read as "delete whichever exists",
+					// which could tell someone to remove a live transaction lock
+					// out from under a running apply. Deferring to the
+					// diagnostic that already did the read is the only way to
+					// be right in both cases.
+					Hint: "the blocked-apply error prints the id; if it prints none, it names the lock file's path instead (its summary, or the lock_path attr) — remove exactly that path, and only if no rdk is running",
 				})
 			}
 			if gaveWith && withLock == "" {
