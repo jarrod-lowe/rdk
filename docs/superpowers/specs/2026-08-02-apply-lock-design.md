@@ -1,6 +1,6 @@
 # One apply at a time, per repository
 
-**Status:** implemented. Landed in seven steps — see "Sequencing" — the third
+**Status:** implemented. Landed in eight steps — see "Sequencing" — the third
 of which split one lock file into two (see "Two kinds, two files" and
 "Migration"), the fourth of which closed a P1 in the split's own
 `--with-lock` path (step 6 of "Where the lock sits in the sequence"), the
@@ -8,9 +8,15 @@ fifth of which hardened the mechanism against a full audit of it against its
 own goals, the sixth of which closed the mirror of a race the fifth step's
 own `HoldLock` fix left open (step 5 of "Where the lock sits in the
 sequence") — see "Stated limits" for what that closed and what it left
-open — and the seventh of which closed four more review-driven gaps,
-including the last signal/acquisition race stated as permanent through the
-sixth step (see "Stated limits" and step 7 of "Sequencing").
+open — the seventh of which closed four more review-driven gaps, including a
+signal/acquisition race this document used to state as permanently open —
+and the eighth of which found that the seventh's own fix reached only half
+of that race: it closed the window on the transaction lock's own
+acquisition, but not on `HoldLock`'s second acquisition, the one that
+actually publishes the held lock, which a signal landing between the two
+could still slip past entirely (see "Stated limits" for exactly what the
+eighth step closes and what a signal handler that calls `os.Exit` leaves
+permanently outside any code's reach).
 
 ## Problem
 
@@ -607,7 +613,11 @@ mechanism and the same "Stated limits" entry below for the full history.
 - **A signal handler whose `ReleaseLock` call correctly finds nothing to
   release could still be followed by a concurrent `acquireLock` publishing a
   lock nothing ever releases — this section used to document that as a
-  residual the design accepted, and it is now closed, not merely narrowed.**
+  residual the design accepted, and step 7 closed it for the transaction
+  lock. It did not, on its own, close it for the held lock, even though the
+  fix was written to look file-agnostic; step 8 found and closed that
+  remaining half, and this entry is corrected to say so rather than repeat
+  the earlier, too-broad claim.**
   `acquireLock` already holds `lockMu` across recording ownership and the
   `Link` call that makes a lock visible (see "Two kinds, two files" and
   `acquireLock`'s own doc comment); that closed a narrower window where a
@@ -621,19 +631,76 @@ mechanism and the same "Stated limits" entry below for the full history.
   stale read of a past one. The fix is `Store.PrepareShutdown`, which
   `cmd/root.go`'s `handleSignals` now calls in place of the bare `ReleaseLock`
   it used to: it records, under `lockMu`, that no further lock may be
-  published, then releases whatever is already held. `acquireLock`'s owned
-  (`.rdk/apply.lock`) path checks that flag inside the very critical section
-  already described above, so the mutex's total order settles the outcome
-  completely — either `PrepareShutdown`'s flag-write runs first and the
-  acquisition is refused before `Link` ever runs, or the acquisition's
-  critical section runs first and completes, in which case
-  `PrepareShutdown`'s own call to `ReleaseLock` finds it and removes it.
-  There is no third outcome, and it is a live guarantee now, not a pending
-  one: the handler that used to call only `ReleaseLock` calls
-  `PrepareShutdown` (see `handleSignals`' own doc comment in `cmd/root.go`
-  for why, and `prepareStoreForShutdown` for the exact call). See
-  `PrepareShutdown`'s own doc comment in `internal/repofs/store.go` for the
-  mechanism from the `Store` side.
+  published, then releases whatever transaction lock is already held.
+
+  Step 7's own version of `acquireLock` checked that flag only on the path
+  that also records ownership — `scratchApplyLock`, the transaction lock —
+  reasoning that a refusal there already stops `HoldLock` before it ever
+  reaches its second acquisition. That reasoning is correct for a shutdown
+  recorded *before* `HoldLock`'s first acquisition, and wrong for one
+  recorded *between* `HoldLock`'s two acquisitions: after the transaction
+  lock is taken but before the held lock is published, nothing checked
+  `shuttingDown` at all, and `HoldLock` would link `.rdk/lock` regardless of
+  whether `PrepareShutdown` had already run and removed `.rdk/apply.lock` out
+  from under it. `os.Exit` could then end the process before `rdk lock` ever
+  returned to print the id — a held lock left on disk, genuinely in effect,
+  that nobody was told about, blocking every later apply until someone finds
+  it by other means (a blocked apply's own error, or a second `rdk lock`).
+
+  Step 8 makes `acquireLock` check `shuttingDown` inside the same critical
+  section as `Link` for *every* acquisition, not only the one recording
+  ownership — see `acquireLock`'s own doc comment for the `recordsOwnership`
+  /`shuttingDown` split this required, and the field's own doc comment on
+  `osStore`. For a single `acquireLock` call the mutex's total order still
+  settles the outcome completely, exactly as step 7 established: either
+  `PrepareShutdown`'s flag-write runs first and the acquisition is refused
+  before `Link` ever runs, or the acquisition's critical section runs first
+  and `Link` completes. There is no third outcome for that one call — but
+  what "completes" leads to next is not the same for the two files, and
+  treating it as if it were is the mistake this entry now avoids repeating:
+
+  - For `scratchApplyLock`, "completes" is followed by `PrepareShutdown`'s
+    own call to `ReleaseLock`, which finds what was just recorded and removes
+    it. Across the pair of calls the outcome really is binary — refused
+    before anything is created, or created-and-then-released — and nothing of
+    this call's is ever left stranded by a concurrent `PrepareShutdown`.
+  - For `scratchLock` (`HoldLock`'s second acquisition), there is no
+    equivalent second call: `ReleaseLock` is hardcoded to `scratchApplyLock`
+    and structurally cannot reach the held lock (see `ReleaseLock`'s own doc
+    comment). So "completes" here means the held lock is genuinely created
+    and *stays* created — correctly, not as a stranding, since nothing but
+    `rdk unlock` or `--break-lock` is ever supposed to remove one. What step 8
+    buys for this file is narrower than for the transaction lock: it turns an
+    *unconditional* hole — the held lock used to be created regardless of
+    `shuttingDown`, no matter how long after the flag was set — into the same
+    mutex-decided race already accepted above, where the outcome depends on
+    which of the two critical sections the scheduler runs first. It does not,
+    and cannot, guarantee that `HoldLock`'s caller ever *sees* that id: a
+    creation that wins its race against `PrepareShutdown` still has to return
+    through `HoldLock`, past its transaction-lock release and directory sync,
+    and back up to `cmd/lock.go`'s print statement, and `os.Exit` in the
+    handler can end the process at any point before that returns — whether or
+    not this check ran at all. That window — a signal landing after `HoldLock`
+    has already committed the held lock but before its id reaches the
+    terminal — is not narrowed by anything in `internal/repofs`: it lives
+    entirely in the time between a successful return from `HoldLock` and a
+    `Result` log line in `cmd/lock.go`, code this fix does not touch and, by
+    the nature of `os.Exit`, no amount of locking inside `acquireLock` can
+    reach. It is accepted, not overlooked, for the same reason the
+    hard-kill residual above is: nothing short of the held lock's id being
+    discoverable by someone else — which it already is, the moment
+    `--break-lock` or a second `rdk lock` reads `.rdk/lock` — mitigates it, and
+    that discoverability was already true before step 8 and is unchanged by
+    it.
+
+  `TestPrepareShutdownRefusesAHeldLockAcquisitionBetweenTheTwoLocks` in
+  `internal/repofs/store_test.go` demonstrates the newly closed window: it
+  fires `PrepareShutdown` from the `afterApplyLockHeldByHoldLock` seam, which
+  marks exactly the gap between `HoldLock`'s two acquisitions, and asserts
+  `.rdk/lock` does not exist afterward. See `PrepareShutdown`'s own doc
+  comment in `internal/repofs/store.go` for the mechanism from the `Store`
+  side, and `HoldLock`'s own doc comment for what its error path guarantees
+  when the second acquisition is refused this way.
 
 ## Migration
 
@@ -657,7 +724,7 @@ the JSON claims (see "Two kinds, two files" above).
 
 ## Sequencing
 
-Seven steps. The first two share one file format designed for both, so the
+Eight steps. The first two share one file format designed for both, so the
 second was a command and a warning rather than a format migration; the third
 splits that one file into two without changing the format or the
 user-visible surface at all; the fourth closes a gap the split itself opened;
@@ -665,7 +732,11 @@ the fifth is a full audit of the mechanism against its own goals, closing
 what it found a fix for and stating what it could not; the sixth closes a
 gap found in review of the fifth's own `HoldLock` fix; the seventh closes
 three more gaps found in review of the sixth's own change plus one this
-design had documented as permanent:
+design had documented as permanent; the eighth, found in live review after
+the seventh had shipped, is the correction that the seventh's own fix for
+that "permanent" gap covered only the transaction lock's own acquisition,
+leaving `HoldLock`'s second acquisition — the one that actually publishes
+the held lock — checking nothing at all:
 
 1. **The apply lock** — the JSON file, acquire/release in `Materialize`,
    `--break-lock=<id>`, and the signal handler. This was the original P1.
@@ -735,7 +806,40 @@ design had documented as permanent:
    signal-handler race stated as permanent in "Release on every exit" and in
    "Stated limits" is closed via `Store.PrepareShutdown`, now wired into
    `cmd/root.go`'s `handleSignals` in place of the bare `ReleaseLock` it used
-   to call — see that "Stated limits" entry for the mechanism.
+   to call — see that "Stated limits" entry for the mechanism. That entry
+   turned out to describe less than it claimed; see item 8.
+8. **Close the mirror of the seventh step's own `PrepareShutdown` fix, on
+   `HoldLock`'s second acquisition.** Found in live review of that fix, on
+   the same reasoning that caught step 6's gap in step 5's own `HoldLock`
+   fix: `acquireLock`'s `shuttingDown` check ran only on the `scratchApplyLock`
+   (transaction-lock) path, gated by an `owned` boolean that conflated two
+   different questions — which file's id belongs in `lockHeld`/`lockID` for
+   `ReleaseLock` to find later, and whether this acquisition has to respect a
+   shutdown already recorded on the Store. The first is genuinely about the
+   file; the second is not, and `HoldLock`'s second `acquireLock` call — the
+   one that actually creates `.rdk/lock` — was exempted from it entirely, on
+   the reasoning that a refusal at the *first* call already stops `HoldLock`
+   before it gets there. That reasoning proved only the ordering where a
+   shutdown is recorded before `HoldLock` starts; it does not hold for one
+   recorded *between* `HoldLock`'s two acquisitions — after the transaction
+   lock is taken but before the held lock is published — which is exactly
+   the ordering a `SIGINT`/`SIGTERM` lands in most easily, since that span is
+   `HoldLock`'s longest uninterrupted stretch of work. In that ordering the
+   old code let `PrepareShutdown` remove `.rdk/apply.lock` and then linked
+   `.rdk/lock` anyway, with `os.Exit` free to end the process before `rdk
+   lock` ever printed the id it had just created — a held lock on disk that
+   nobody was told about, blocking every later apply. `acquireLock` now
+   checks `shuttingDown` inside the same critical section as `Link` for
+   *every* acquisition, not just the one that records ownership, closing the
+   unconditional version of that hole down to the same mutex-decided race
+   already accepted for the transaction lock. See "Stated limits" for what
+   that race resolves to for the held lock specifically — it is not the same
+   shape as the transaction lock's, because nothing automatically releases a
+   held lock by design — and for the one ordering (a signal after `HoldLock`
+   has already returned) that no amount of locking here can reach at all.
+   `TestPrepareShutdownRefusesAHeldLockAcquisitionBetweenTheTwoLocks` in
+   `internal/repofs/store_test.go` demonstrates the closed window directly,
+   firing `PrepareShutdown` from the `afterApplyLockHeldByHoldLock` seam.
 
 ## Consequences
 

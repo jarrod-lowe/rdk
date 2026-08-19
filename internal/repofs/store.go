@@ -450,8 +450,9 @@ type Store interface {
 	ReleaseLock() error
 	// PrepareShutdown tells this Store that the process holding it is about
 	// to end: no acquireLock call that has not yet started may publish a new
-	// transaction lock after this returns, and whatever transaction lock
-	// this Store already holds is released, exactly as ReleaseLock would.
+	// lock — transaction lock or held lock alike — after this returns, and
+	// whatever transaction lock this Store already holds is released,
+	// exactly as ReleaseLock would.
 	//
 	// It exists for one caller: a SIGINT/SIGTERM handler that used to call
 	// only ReleaseLock and, in doing so, left a window ReleaseLock alone
@@ -461,8 +462,20 @@ type Store interface {
 	// never see, before os.Exit ends the process with no second release
 	// ever running (see acquireLock's own doc comment for the full
 	// argument). Calling this instead closes it: acquireLock refuses to
-	// publish once this has run, so the outcome is always one of two —
-	// refused, or acquired-then-released — never a stranded third.
+	// publish once this has run. For the transaction lock the outcome is
+	// always one of two — refused, or acquired-then-released — never a
+	// stranded third. The held lock has no "released" side to this call at
+	// all (see ReleaseLock's own doc comment: it structurally cannot reach
+	// scratchLock), so its two outcomes are refused, or created exactly as an
+	// ordinary uninterrupted HoldLock would create it — which is correct, not
+	// a stranding, since nothing but rdk unlock or --break-lock is ever
+	// supposed to remove a held lock. What this does not guarantee, for the
+	// held lock, is that the caller who ran rdk lock ever sees the id: a
+	// creation that wins its race against this call still has to return
+	// through HoldLock and print, and os.Exit in the handler can end the
+	// process before that happens regardless of what this method does — see
+	// HoldLock's own doc comment and the design doc's "Stated limits" for
+	// that window named rather than implied closed.
 	//
 	// Idempotent, like ReleaseLock, which it calls.
 	PrepareShutdown() error
@@ -566,12 +579,23 @@ type osStore struct {
 	usingLockID string
 
 	// shuttingDown records that PrepareShutdown has been called on this Store
-	// value, guarded by lockMu like the fields above it. Once true,
-	// acquireLock's owned (scratchApplyLock) path refuses to publish a lock
-	// rather than create one nothing will ever release — see acquireLock's
-	// own doc comment for why checking this under the same critical section
-	// that records ownership and performs Link is what makes the two
-	// mutually exclusive rather than merely likely to be, and PrepareShutdown's
+	// value, guarded by lockMu like the fields above it. Once true, every
+	// acquireLock call — scratchApplyLock (the transaction lock) or
+	// scratchLock (the held lock) alike — refuses to publish rather than
+	// create one this call's own bookkeeping cannot get back: for the
+	// transaction lock that would be a lock nothing will ever release, and
+	// for the held lock a lock nobody was ever told exists. Checking applies
+	// to both files, not just the one recorded as this store's own (see
+	// acquireLock's recordsOwnership), because ownership-recording and
+	// shutdown-refusal are different questions — the file only answers the
+	// first. HoldLock's held-lock acquisition used to be exempt on the
+	// reasoning that a refusal at its transaction-lock acquisition already
+	// stops it before that second call runs; that reasoning covered only the
+	// ordering where the signal lands before the first call, not one landing
+	// after the transaction lock is already held but before the held lock is
+	// created — see acquireLock's own doc comment for why checking this
+	// under the same critical section that performs Link is what makes
+	// "refused" and "published" the only two outcomes, and PrepareShutdown's
 	// doc comment for the one caller this exists for. Never cleared: nothing
 	// calls PrepareShutdown except a handler about to end the process, so
 	// there is no later point in this Store value's life where "shutting
@@ -1007,23 +1031,36 @@ func (s *osStore) writeScratchTemp(prefix string, b []byte, sync bool) (string, 
 // there. Now the visible name only ever comes into existence already
 // complete.
 //
-// Ownership is recorded before the link, not after — and lockMu stays held
-// from that recording through the Link call itself, not just across the two
-// assignments that record it. Releasing in between (what an earlier version
-// of this fix still did) reopened a narrower version of the same window: a
-// concurrent ReleaseLock could see lockHeld true, read scratchApplyLock, find
-// nothing there yet because the Link had not run, and conclude there was
-// nothing of this call's left to remove — withdrawing ownership of a lock
-// that was about to exist. This call would then complete the Link and
-// return, and a signal handler whose ReleaseLock lands in exactly that gap
-// (its read-then-no-op before the Link, its os.Exit after) is the SIGTERM
-// scenario this task exists for. Holding lockMu across the Link closes it:
-// ReleaseLock cannot run at all until this call has released, and by then
-// the file is either linked (present, matching the id ReleaseLock will read)
-// or the attempt failed (present as someone else's, or absent only because
-// this call never recorded anything for it to find).
+// This function conflates two questions that used to share one boolean
+// (`owned`), and treating them as one is what caused the bug the rest of
+// this comment describes: "does this acquisition's id belong in
+// lockHeld/lockID, for ReleaseLock to find later" is answered purely by
+// which file this call is writing (recordsOwnership, below) — but "does this
+// acquisition have to respect a shutdown already recorded on this Store" is
+// not a question about the file at all, and applies to every acquireLock
+// call, transaction lock or held lock alike. Collapsing the two meant the
+// held lock's Link never consulted shuttingDown, because it was never the
+// file ReleaseLock owns. See the shuttingDown paragraphs below for the
+// window that left open, and the shuttingDown field's own doc comment for
+// the fix.
 //
-// What this specific fix does not close, stated plainly rather than implied
+// Ownership (recordsOwnership) is recorded before the link, not after — and
+// lockMu stays held from that recording through the Link call itself, not
+// just across the two assignments that record it. Releasing in between (what
+// an earlier version of this fix still did) reopened a narrower version of
+// the same window: a concurrent ReleaseLock could see lockHeld true, read
+// scratchApplyLock, find nothing there yet because the Link had not run, and
+// conclude there was nothing of this call's left to remove — withdrawing
+// ownership of a lock that was about to exist. This call would then complete
+// the Link and return, and a signal handler whose ReleaseLock lands in
+// exactly that gap (its read-then-no-op before the Link, its os.Exit after)
+// is the SIGTERM scenario this task exists for. Holding lockMu across the
+// Link closes it: ReleaseLock cannot run at all until this call has
+// released, and by then the file is either linked (present, matching the id
+// ReleaseLock will read) or the attempt failed (present as someone else's,
+// or absent only because this call never recorded anything for it to find).
+//
+// What that specific fix did not close, stated plainly rather than implied
 // away (rule 12): a signal whose handler's ReleaseLock call runs and
 // returns — correctly finding nothing yet to release — before this call ever
 // takes lockMu, can still be followed by this call completing and the
@@ -1037,27 +1074,53 @@ func (s *osStore) writeScratchTemp(prefix string, b []byte, sync bool) (string, 
 // That residual is what shuttingDown and PrepareShutdown close, not by
 // synchronising signal delivery against an in-flight acquisition (out of
 // scope, and unnecessary), but by letting the handler foreclose future
-// acquisitions instead of only reacting to past ones: the owned branch below
-// checks shuttingDown inside the exact critical section this comment already
-// established is atomic with the Link call. PrepareShutdown sets the flag in
-// its own such section before it ever calls ReleaseLock, so the mutex's total
-// order settles which of two outcomes happened — never a third: either this
-// call's critical section runs first and completes normally, in which case
-// PrepareShutdown's later ReleaseLock finds it and removes it; or
-// PrepareShutdown's critical section runs first, in which case this call
-// finds shuttingDown true, creates nothing, and PrepareShutdown's
-// ReleaseLock has nothing to find. This closes the window for good, not
-// merely further, but only once a caller actually invokes PrepareShutdown
-// before its own process-ending step — see PrepareShutdown's doc comment for
-// what that caller must be, and its own note on whether that call is wired
-// in yet.
+// acquisitions instead of only reacting to past ones: every call — not just
+// the one that records ownership — checks shuttingDown inside the exact
+// critical section this comment already established is atomic with the Link
+// call. PrepareShutdown sets the flag in its own such section before it ever
+// calls ReleaseLock, so the mutex's total order settles which of two
+// outcomes happened for *this* call: either this call's critical section
+// runs first and completes normally, or PrepareShutdown's critical section
+// runs first, in which case this call finds shuttingDown true and creates
+// nothing. There is no third outcome for a single acquireLock call — but
+// what "completes normally" then leads to differs by file, and conflating
+// the two here would be the same mistake this comment opened by naming:
 //
-// Only the transaction lock is recorded as this store's. ReleaseLock only
-// ever targets scratchApplyLock, so a held lock's id in those fields was
-// always meaningless; it becomes actively wrong once HoldLock acquires both
-// (see HoldLock), because the second acquisition would overwrite the first's
-// id and the deferred release would then fail its own id compare and strand
-// the transaction lock.
+//   - scratchApplyLock (recordsOwnership true): PrepareShutdown's own
+//     ReleaseLock call, which runs immediately after it sets the flag, finds
+//     what this call just recorded and removes it. So across the *pair* of
+//     calls — this acquisition and PrepareShutdown's release — the outcome
+//     really is one of two: refused before anything is created, or
+//     created-and-then-released. Nothing of this call's is ever left
+//     stranded by a PrepareShutdown that ran concurrently with it.
+//   - scratchLock (recordsOwnership false, i.e. HoldLock's second call):
+//     PrepareShutdown's ReleaseLock is hardcoded to scratchApplyLock (see
+//     its own doc comment) and structurally cannot reach this file. So
+//     "completes normally" here means the held lock is genuinely created and
+//     stays created — which is correct, not a stranding: that is what every
+//     ordinary, uninterrupted HoldLock call does, and a shutdown racing a
+//     legitimate creation is not a reason to invent an auto-release this
+//     feature's whole point is to not have (see HoldLock's own doc comment).
+//     What checking shuttingDown here buys is narrowing an unconditional
+//     hole — the held lock used to be created regardless of shuttingDown, no
+//     matter how long after the flag was set — down to the same
+//     mutex-decided race already accepted for the transaction lock above:
+//     either this call's critical section already lost to PrepareShutdown's
+//     flag-write (refused, nothing created), or it had already legitimately
+//     won it (created, exactly as it would have with no shutdown in
+//     progress at all). What this does not, and cannot, guarantee is that
+//     HoldLock's caller ever sees that id: os.Exit in the signal handler can
+//     still end the process before HoldLock returns to cmd/lock.go and the
+//     id is printed, whether or not this check ran at all — see HoldLock's
+//     own doc comment and the design doc's "Stated limits" for that
+//     remaining window stated rather than implied closed.
+//
+// recordsOwnership itself only ever names the transaction lock. ReleaseLock
+// only ever targets scratchApplyLock, so a held lock's id in lockHeld/lockID
+// was always meaningless; it becomes actively wrong once HoldLock acquires
+// both (see HoldLock), because the second acquisition would overwrite the
+// first's id and the deferred release would then fail its own id compare and
+// strand the transaction lock.
 func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 	// No usingLock guard here any more: before the split, adopting the held
 	// lock (UseLock) meant Materialize skipped acquiring anything at all, so
@@ -1118,25 +1181,37 @@ func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 		return LockInfo{}, err
 	}
 
-	owned := file == scratchApplyLock
-	if owned {
-		s.lockMu.Lock()
-		// Checked inside the same critical section that records ownership
-		// and performs Link, not before it: see acquireLock's own doc
-		// comment (the paragraph on shuttingDown and PrepareShutdown) for why
-		// that specific placement is what makes "refused" and "acquired" the
-		// only two possible outcomes once a shutdown has been recorded,
-		// rather than leaving a gap between checking the flag and acting on
-		// it. Only the owned (scratchApplyLock) path checks it: the held
-		// lock (scratchLock) is created by HoldLock only after this branch
-		// has already succeeded for the transaction lock protecting it, so a
-		// refusal here already stops HoldLock before it ever reaches that
-		// second acquireLock call.
-		if s.shuttingDown {
-			s.lockMu.Unlock()
-			_ = s.root.Remove(tmp)
-			return LockInfo{}, ErrShuttingDown
-		}
+	// recordsOwnership governs only whether this acquisition's id belongs in
+	// lockHeld/lockID for ReleaseLock to find later — that question is about
+	// which file this call writes (see this function's own doc comment,
+	// "Only the transaction lock is recorded as this store's"). It does not
+	// govern whether shuttingDown is consulted: every acquisition checks
+	// that, held lock or transaction lock alike, in the same critical
+	// section that performs Link, below.
+	recordsOwnership := file == scratchApplyLock
+
+	s.lockMu.Lock()
+	// Checked inside the same critical section that (when recordsOwnership)
+	// records ownership and, unconditionally, performs Link — not before it:
+	// see this function's own doc comment (the paragraphs on shuttingDown and
+	// PrepareShutdown) for why that specific placement is what makes
+	// "refused" and "published" the only two outcomes for *this* call once a
+	// shutdown has been recorded, and for what "published" then means for
+	// each of the two files. Every call checks it, not just the one that
+	// records ownership: HoldLock's held-lock acquisition used to be exempt
+	// on the reasoning that a refusal at its transaction-lock acquisition
+	// already stops HoldLock before it gets here — true only when the signal
+	// lands before that first call runs. A signal landing after the
+	// transaction lock is already held but before this second call starts
+	// sets shuttingDown with nothing before this line able to see it; without
+	// this check running here too, the held lock would still be created
+	// regardless, on a Store that had already recorded it was shutting down.
+	if s.shuttingDown {
+		s.lockMu.Unlock()
+		_ = s.root.Remove(tmp)
+		return LockInfo{}, ErrShuttingDown
+	}
+	if recordsOwnership {
 		s.lockHeld = true
 		s.lockID = info.ID
 		if afterLockOwnershipRecorded != nil {
@@ -1146,11 +1221,9 @@ func (s *osStore) acquireLock(file, message string) (LockInfo, error) {
 		}
 	}
 	linkErr := s.root.Link(tmp, file)
-	if owned {
-		s.lockMu.Unlock()
-	}
+	s.lockMu.Unlock()
 	if linkErr != nil {
-		if owned {
+		if recordsOwnership {
 			s.lockMu.Lock()
 			// Only this call's own claim is withdrawn, and only if it is
 			// still there to withdraw. ReleaseLock clears lockHeld alone and
@@ -1362,10 +1435,14 @@ func (s *osStore) ReleaseLock() error {
 }
 
 // PrepareShutdown records that this Store must never publish another
-// transaction lock, then releases whatever transaction lock it already
-// holds. See the Store interface's own doc comment for the property this
-// gives a caller, and acquireLock's doc comment for the mutex-ordering
-// argument that makes it airtight rather than merely likely.
+// lock — transaction or held — then releases whatever transaction lock it
+// already holds (a held lock, if this Store's most recent acquireLock call
+// happened to be creating one, is not released here: see acquireLock's doc
+// comment for why "published" means something different for that file, and
+// ReleaseLock's own doc comment for why it structurally cannot reach
+// scratchLock at all). See the Store interface's own doc comment for the
+// property this gives a caller, and acquireLock's doc comment for the
+// mutex-ordering argument that makes it airtight rather than merely likely.
 //
 // The two steps are deliberately two separate lockMu critical sections, not
 // one: setting shuttingDown first and unlocking before calling ReleaseLock
@@ -1373,10 +1450,10 @@ func (s *osStore) ReleaseLock() error {
 // section interleave cleanly between them rather than needing to reason
 // about a single call holding lockMu across both a flag write and a
 // filesystem read-and-remove. Whichever of the two — this flag write, or a
-// concurrent acquireLock's owned critical section — the mutex lets run
-// first fully determines the outcome before the other can start (see
-// acquireLock's doc comment for why that is true), so nothing is lost by
-// not combining them into one section.
+// concurrent acquireLock's critical section, for either file — the mutex
+// lets run first fully determines the outcome before the other can start
+// (see acquireLock's doc comment for why that is true), so nothing is lost
+// by not combining them into one section.
 //
 // Idempotent: safe to call more than once. Nothing in this codebase does so
 // today (the signal channel this exists for is read at most once — see
@@ -1683,6 +1760,24 @@ func (s *osStore) publishScratchGitignore() error {
 // acquireLock): if it were, the second acquisition below would overwrite the
 // transaction lock's id and the deferred release would then fail its own id
 // compare and strand the transaction lock.
+//
+// A shutdown recorded on this Store (PrepareShutdown) between the two
+// acquireLock calls below is handled entirely inside acquireLock itself, not
+// here: the second call checks shuttingDown in the same critical section as
+// its own Link, exactly as the first call does (see acquireLock's own doc
+// comment), so it either refuses before ever creating .rdk/lock or creates
+// it exactly as it would with no shutdown in progress — there is no partial
+// state for this function to clean up in either case. When it refuses,
+// err wraps ErrShuttingDown and info is still the zero value (acquireLock
+// never assigns it on that path), and this function's own error return a few
+// lines down hands both back unchanged; the deferred ReleaseLock just above
+// still fires on the way out and releases this call's transaction lock
+// exactly as it would for any other failed second acquisition (ErrLocked
+// included) — whether that transaction lock is still this Store's to release
+// or PrepareShutdown's own ReleaseLock already claimed it concurrently makes
+// no difference, since ReleaseLock is idempotent and safe either way. So a
+// caller seeing ErrShuttingDown from this function can rely on: nothing was
+// left behind, and .rdk/lock does not exist because of this call.
 //
 // This makes "HoldLock cannot create a held lock while an apply genuinely
 // holds the transaction lock" true against ordinary interleaving — the case

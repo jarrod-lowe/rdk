@@ -2904,3 +2904,55 @@ func TestPrepareShutdownReleasesAnAlreadyHeldTransactionLock(t *testing.T) {
 		t.Errorf("PrepareShutdown left the transaction lock on disk: stat err = %v", statErr)
 	}
 }
+
+// A signal landing after HoldLock has taken the transaction lock but before
+// it publishes the held lock used to be invisible to acquireLock entirely:
+// the shutdown check only ran on the scratchApplyLock (owned) path, so
+// HoldLock's second acquisition — scratchLock, the held lock — linked
+// .rdk/lock regardless of whether PrepareShutdown had already run. A real
+// SIGINT/SIGTERM landing in that window then raced os.Exit against HoldLock
+// ever returning to print the id: the handler could remove .rdk/apply.lock
+// and exit before rdk lock ever told its caller the repository was held,
+// leaving .rdk/lock on disk that nobody was told exists — a held lock that
+// blocks every later apply and that nobody has the id for.
+//
+// afterApplyLockHeldByHoldLock fires exactly in that gap — HoldLock already
+// holds the transaction lock, has not yet created the held lock — so firing
+// PrepareShutdown from inside it models the signal landing there without
+// needing a real, non-deterministic race between two goroutines. This is the
+// sequential half of the same argument
+// TestPrepareShutdownRefusesAFutureTransactionLockAcquisition makes for the
+// transaction lock: PrepareShutdown has unambiguously already run, under
+// lockMu, by the time the second acquireLock call checks shuttingDown, so
+// this is not a flaky race — it deterministically hits the window every
+// time this test runs.
+//
+// Fails without the fix: acquireLock's shuttingDown check used to run only
+// on the scratchApplyLock (owned) path, so the held lock's own
+// acquireLock(scratchLock, ...) call never consulted it at all —
+// PrepareShutdown here sets the flag and removes .rdk/apply.lock, and
+// HoldLock goes on to create .rdk/lock as if nothing had happened. Run
+// against that code, this test fails on the first assertion below: HoldLock
+// returns a nil error and a real id, and .rdk/lock exists on disk.
+func TestPrepareShutdownRefusesAHeldLockAcquisitionBetweenTheTwoLocks(t *testing.T) {
+	s, root := newTestStore(t)
+
+	afterApplyLockHeldByHoldLock = func() {
+		if err := s.PrepareShutdown(); err != nil {
+			t.Errorf("PrepareShutdown between the two acquisitions = %v, want nil", err)
+		}
+	}
+	t.Cleanup(func() { afterApplyLockHeldByHoldLock = nil })
+
+	if _, err := s.HoldLock("work"); !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("HoldLock err = %v, want ErrShuttingDown", err)
+	}
+	// The property that matters most: an interrupted rdk lock must never
+	// leave a held lock nobody was told about.
+	if _, statErr := os.Lstat(filepath.Join(root, ScratchDir, "lock")); !os.IsNotExist(statErr) {
+		t.Error("HoldLock published the held lock after PrepareShutdown had already run: .rdk/lock must not exist")
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, ScratchDir, "apply.lock")); !os.IsNotExist(statErr) {
+		t.Error("the transaction lock survived: PrepareShutdown's own release (or HoldLock's deferred release) should have removed it")
+	}
+}

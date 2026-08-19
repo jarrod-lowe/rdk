@@ -35,9 +35,9 @@ type Mem struct {
 	usingLockID string
 
 	// shuttingDown mirrors osStore's: once PrepareShutdown has been called,
-	// no further acquireLock call may publish a transaction lock. Mem has no
-	// second goroutine to race this against (see the struct's own doc
-	// comment), so there is no window here for the flag to close — but the
+	// no further acquireLock call may publish a lock, transaction or held.
+	// Mem has no second goroutine to race this against (see the struct's own
+	// doc comment), so there is no window here for the flag to close — but the
 	// two Store implementations must still agree on the rule itself, not
 	// just on osStore's end state, or a component test written against Mem
 	// could assert a Store contract osStore does not actually have.
@@ -160,12 +160,19 @@ func (m *Mem) acquireLock(file, message string) (LockInfo, error) {
 	// adopted the held lock via UseLock, so this running with usingLock true
 	// is the ordinary --with-lock path, not a bug to guard against.
 	//
-	// Mirrors osStore.acquireLock's shuttingDown check on the owned
-	// (scratchApplyLock) path only, for the same reason: the held lock is
-	// only ever created after this branch has already succeeded for the
-	// transaction lock protecting it, so refusing here already stops
-	// HoldLock before it gets there.
-	if file == scratchApplyLock && m.shuttingDown {
+	// Mirrors osStore.acquireLock's shuttingDown check for every file, not
+	// just scratchApplyLock. It used to be scoped to the transaction lock
+	// alone, on the reasoning that a refusal there already stops HoldLock
+	// before it reaches the held-lock acquisition — true only for the
+	// ordering where shutdown was recorded before the first acquisition ran.
+	// osStore's own fix (see its acquireLock doc comment) checks on every
+	// call because a shutdown recorded *between* the two acquisitions must
+	// also refuse the second; Mem has no second goroutine to race that
+	// ordering against (see the struct's own doc comment), but the two Store
+	// implementations must still agree on the rule itself, not just on
+	// osStore's end state — a component test written against Mem should not
+	// be able to assert a Store contract osStore does not actually have.
+	if m.shuttingDown {
 		return LockInfo{}, ErrShuttingDown
 	}
 	if _, ok := m.files[file]; ok {
@@ -256,12 +263,13 @@ func (m *Mem) ReleaseLock() error {
 }
 
 // PrepareShutdown mirrors osStore.PrepareShutdown: sets shuttingDown so no
-// further transaction lock can be published, then releases whatever this Mem
-// already holds. Mem has no second goroutine to race a caller against (see
-// the struct's own doc comment), so unlike osStore's version there is no
-// mutex-ordering argument to make here — the two Store implementations must
-// still agree on the rule and the sequence (flag first, then release), not
-// just the end state.
+// further lock, transaction or held, can be published, then releases
+// whatever transaction lock this Mem already holds — a held lock, same as
+// osStore's ReleaseLock, is never this call's to release. Mem has no second
+// goroutine to race a caller against (see the struct's own doc comment), so
+// unlike osStore's version there is no mutex-ordering argument to make here —
+// the two Store implementations must still agree on the rule and the
+// sequence (flag first, then release), not just the end state.
 func (m *Mem) PrepareShutdown() error {
 	m.shuttingDown = true
 	return m.ReleaseLock()
